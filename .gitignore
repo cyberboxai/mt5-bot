@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Bot runtime files (logs, daily state, kill switch)
+bot.log
+bot.log.*
+bot_state.json
+bot_state.json.tmp
+KILL
+
+# Local secrets, never commit
+.env

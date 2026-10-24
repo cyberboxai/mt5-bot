@@ -1,0 +1,30 @@
+{
+  "symbols": ["EURUSD"],
+  "timeframe": "M15",
+  "bars": 300,
+  "magic": 510001,
+
+  "risk_per_trade_pct": 0.5,
+  "max_daily_loss_pct": 2.0,
+  "max_open_positions_total": 3,
+
+  "max_spread_points": 20,
+  "deviation_points": 10,
+  "trading_hours_server": [7, 20],
+
+  "fast_ema": 20,
+  "slow_ema": 50,
+  "atr_period": 14,
+  "sl_atr_mult": 2.0,
+  "tp_atr_mult": 3.0,
+  "close_on_opposite": true,
+
+  "allow_live": false,
+  "dry_run": false,
+  "poll_seconds": 5,
+  "heartbeat_minutes": 30,
+  "kill_switch_file": "KILL",
+  "state_file": "bot_state.json",
+  "log_file": "bot.log",
+  "mt5_path": null
+}

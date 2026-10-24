@@ -1,0 +1,4 @@
+# Runtime dependencies (Windows, 64-bit Python 3.10 to 3.12).
+# MetaTrader5 5.0.5430+ ships wheels for cp310 to cp313 and works with numpy 2.x.
+MetaTrader5>=5.0.5430
+numpy>=1.26
