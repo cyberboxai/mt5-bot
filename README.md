@@ -1,51 +1,76 @@
-# Bot de negociação para MetaTrader 5 (Python, Windows)
+# Bot de negociação para MetaTrader 5, versão 2 (Python, Windows)
 
-Guia completo de instalação e operação do `mt5_bot.py`, um bot em Python que negoceia automaticamente através do terminal MetaTrader 5 (MT5) instalado no seu PC Windows. Foi pensado para a corretora STARTRADER, mas funciona com qualquer corretora MT5.
+Guia completo de instalação e operação do bot `mt5_bot.py`, que negoceia automaticamente através do terminal MetaTrader 5 (MT5) instalado no seu PC Windows. Foi pensado para a corretora STARTRADER, mas funciona com qualquer corretora MT5.
 
 ## Índice
 
-1. [O que é isto](#1-o-que-é-isto)
-2. [Requisitos](#2-requisitos)
-3. [Instalar o Python](#3-instalar-o-python)
-4. [Instalar o MT5 e entrar numa conta DEMO](#4-instalar-o-mt5-e-entrar-numa-conta-demo)
-5. [Preparar o MT5 para automação](#5-preparar-o-mt5-para-automação)
-6. [Instalar o projecto](#6-instalar-o-projecto)
-7. [Configurar o config.json](#7-configurar-o-configjson)
-8. [Primeira execução em modo dry-run](#8-primeira-execução-em-modo-dry-run)
-9. [Executar em demo com ordens reais](#9-executar-em-demo-com-ordens-reais)
-10. [Parar o bot](#10-parar-o-bot)
-11. [Execução sem supervisão](#11-execução-sem-supervisão)
-12. [Passar a conta real (só depois de validar)](#12-passar-a-conta-real-só-depois-de-validar)
-13. [Credenciais por variáveis de ambiente](#13-credenciais-por-variáveis-de-ambiente)
-14. [Substituir a estratégia](#14-substituir-a-estratégia)
-15. [Resolução de problemas](#15-resolução-de-problemas)
-16. [Executar os testes](#16-executar-os-testes)
-17. [Pressupostos e limitações](#17-pressupostos-e-limitações)
+1. [O que é isto e o que mudou na v2](#1-o-que-é-isto-e-o-que-mudou-na-v2)
+2. [Aviso de risco (leia primeiro)](#2-aviso-de-risco-leia-primeiro)
+3. [Requisitos](#3-requisitos)
+4. [Instalar o Python](#4-instalar-o-python)
+5. [Instalar o MT5 e entrar numa conta](#5-instalar-o-mt5-e-entrar-numa-conta)
+6. [Preparar o MT5 para automação](#6-preparar-o-mt5-para-automação)
+7. [Instalar o projecto](#7-instalar-o-projecto)
+8. [Selecção de conta: demo ou real](#8-selecção-de-conta-demo-ou-real)
+9. [Como funciona o motor adaptativo](#9-como-funciona-o-motor-adaptativo)
+10. [Referência completa do config.json](#10-referência-completa-do-configjson)
+11. [Primeira execução e fase de observação](#11-primeira-execução-e-fase-de-observação)
+12. [Execução sem supervisão](#12-execução-sem-supervisão)
+13. [Operações do dia a dia](#13-operações-do-dia-a-dia)
+14. [Adicionar uma estratégia e ajustar limites](#14-adicionar-uma-estratégia-e-ajustar-limites)
+15. [Credenciais por variáveis de ambiente](#15-credenciais-por-variáveis-de-ambiente)
+16. [Backtest e optimização manual](#16-backtest-e-optimização-manual)
+17. [Resolução de problemas](#17-resolução-de-problemas)
+18. [Executar os testes](#18-executar-os-testes)
+19. [Limitações e pressupostos](#19-limitações-e-pressupostos)
 
 ---
 
-## 1. O que é isto
+## 1. O que é isto e o que mudou na v2
 
-Um único ficheiro Python (`mt5_bot.py`) que:
+O bot liga-se ao terminal MT5 aberto no seu PC (pacote oficial `MetaTrader5`), lê velas fechadas, escolhe sozinho qual estratégia pode negociar e envia ordens a mercado **sempre com stop loss (SL) e take profit (TP)** no servidor da corretora.
 
-* liga-se ao terminal MT5 aberto no seu PC, através do pacote oficial `MetaTrader5`;
-* lê as velas (barras) já fechadas de cada símbolo configurado;
-* pede um sinal a uma função de estratégia substituível (`generate_signal`);
-* calcula o volume (lotes) para que a perda no stop loss seja uma percentagem fixa do capital;
-* envia ordens a mercado **sempre com stop loss (SL) e take profit (TP)** no servidor da corretora;
-* aplica protecções: limite de perda diária, interruptor de emergência (kill switch), filtro de spread, horário de negociação, número máximo de posições, reconexão automática e recusa de contas reais por omissão.
+O que se manteve da v1: volume calculado pelo risco, SL e TP em todas as ordens, `order_check` antes de cada envio, repetição em caso de requote, kill switch, reconexão automática, registo rotativo `bot.log`, limite de perda diária persistente e testes com um MT5 simulado.
 
-> ### AVISO DE RISCO (leia antes de continuar)
->
+O que mudou na v2:
+
+| Área | v1 | v2 |
+|---|---|---|
+| Contas | Recusava contas reais (`allow_live`). | Aceita demo **ou** real. Dinheiro real exige uma confirmação explícita, feita uma única vez (secção 8). |
+| Estratégia | Uma estratégia fixa (cruzamento de EMA). | Biblioteca de 7 estratégias com parâmetros limitados, optimização walk-forward, validação em sombra (shadow), promoção e despromoção automáticas, e `NoTrade` quando nada demonstra vantagem. |
+| Segurança | Limites no `config.json`. | Camada de risco separada com tectos rígidos no código (`mt5bot/limits.py`) que nenhuma configuração ou estratégia ultrapassa, disjuntor de drawdown e comportamentos proibidos testados. |
+| Autonomia | Arranque manual. | Supervisor com reinício automático, arranque com o Windows, abertura e reinício do terminal MT5, reconciliação com a corretora, recarga do `config.json`, ficheiro de estado `health.json`, relatórios diários e semanais e notificações Telegram opcionais. |
+| Estado | Um ficheiro `bot_state.json`. | Uma pasta por conta em `state\<servidor>_<login>\` com base de dados SQLite (diário de operações, registo de estratégias, decisões). |
+
+Estrutura do projecto:
+
+```
+mt5_bot.py              ponto de entrada (python mt5_bot.py ...)
+supervisor.py           supervisor que mantém o bot a correr
+config.json             configuração
+mt5bot\                 código: risk.py, limits.py, engine.py, optimizer.py, backtest.py, bot.py, ...
+mt5bot\strategies\      biblioteca de estratégias (um ficheiro por estratégia)
+tests\                  testes automáticos (pytest)
+start_bot.bat           arranca só o bot
+start_supervisor.bat    arranca o supervisor (recomendado para uso contínuo)
+install_autostart.bat   regista o arranque automático no Agendador de Tarefas
+uninstall_autostart.bat remove esse registo
+```
+
+---
+
+## 2. Aviso de risco (leia primeiro)
+
+> * **Nenhum software garante lucro.** Este bot também não. Pode perder dinheiro, incluindo todo o capital da conta.
 > * **A maioria dos investidores particulares que negoceiam CFD e forex perde dinheiro.** As próprias corretoras publicam percentagens de contas perdedoras, normalmente entre 70% e 80%.
-> * **A estratégia de exemplo (cruzamento de médias móveis EMA) NÃO tem vantagem comprovada.** Existe apenas para demonstrar a infra-estrutura. Não espere lucro dela.
-> * **Comece sempre numa conta DEMO.** O bot recusa arrancar numa conta real, a menos que active essa opção explicitamente.
-> * Automação não elimina riscos: falhas de internet, de energia, da corretora ou do próprio código podem causar perdas. O SL protege cada posição no servidor, mas pode haver deslizamento (slippage) e saltos de preço (gaps).
-> * Use apenas dinheiro que pode perder na totalidade. Este software é fornecido sem qualquer garantia.
+> * **Sistemas adaptativos podem sobre-optimizar (overfitting):** encontram padrões no passado que são apenas acaso e que não se repetem. A v2 foi desenhada para combater isso (validação fora da amostra, penalização por número de tentativas, validação em sombra), mas nenhuma técnica elimina este risco.
+> * **O objectivo do bot é maximizar a expectativa ajustada ao risco e aos custos, fora da amostra, e preservar o capital acima de tudo.** Quando nenhuma estratégia demonstra vantagem, a decisão correcta é **não negociar**. O bot pode ficar dias, semanas ou meses sem abrir operações. **Isso é intencional, não é uma avaria.**
+> * Resultados de backtest são estimativas. A execução real tem deslizamento (slippage), spreads variáveis, saltos de preço (gaps) e falhas de internet, energia ou da corretora.
+> * Comece numa conta **demo** durante várias semanas. Passe a real só com capital pequeno que pode perder na totalidade. Este software é fornecido sem qualquer garantia.
 
 ---
 
-## 2. Requisitos
+## 3. Requisitos
 
 | Requisito | Detalhe |
 |---|---|
@@ -53,16 +78,16 @@ Um único ficheiro Python (`mt5_bot.py`) que:
 | Python | 3.10, 3.11 ou 3.12, **64 bits**. Recomendado: 3.12. |
 | MetaTrader 5 | O terminal MT5 da STARTRADER, transferido do site oficial ou da Área de Cliente da corretora. |
 | Conta | Uma conta DEMO para começar (login, palavra-passe e nome do servidor). |
-| PC | Ligado em permanência enquanto o bot negoceia, com o terminal MT5 aberto e com sessão iniciada. |
+| PC | Ligado em permanência, com o terminal MT5 aberto e com sessão iniciada. 4 GB de RAM livres e alguns GB de disco para o histórico. |
 
-Verifique o Python (depois de o instalar, ver secção 3) numa janela `cmd`:
+Verifique o Python (depois de o instalar, secção 4) numa janela `cmd`:
 
-1. Liste as versões instaladas e os caminhos:
+1. Liste as versões instaladas:
    ```
    py -0p
    ```
-   **Sucesso:** aparece uma linha como `-V:3.12 *        C:\Users\SeuNome\AppData\Local\Programs\Python\Python312\python.exe`. Se aparecer `-32` no fim da versão (por exemplo `-V:3.12-32`), essa instalação é de 32 bits e não serve.
-2. Confirme que o `python` activo é de 64 bits:
+   **Sucesso:** aparece uma linha como `-V:3.12 *        C:\Users\SeuNome\AppData\Local\Programs\Python\Python312\python.exe`. Se aparecer `-32` no fim da versão, essa instalação é de 32 bits e não serve.
+2. Confirme os 64 bits:
    ```
    python -c "import struct; print(struct.calcsize('P')*8)"
    ```
@@ -70,364 +95,516 @@ Verifique o Python (depois de o instalar, ver secção 3) numa janela `cmd`:
 
 ---
 
-## 3. Instalar o Python
+## 4. Instalar o Python
 
-1. Abra https://www.python.org/downloads/windows/ e, na secção "Stable Releases", escolha a versão 3.12 mais recente e clique em **Windows installer (64-bit)**.
-2. Execute o instalador. No primeiro ecrã, **marque a caixa "Add python.exe to PATH"** (fica na parte de baixo da janela).
-3. Clique em **Install Now** e aguarde até aparecer "Setup was successful". Clique em **Close**.
-4. Abra uma **nova** janela `cmd` (tecla Windows, escreva `cmd`, Enter). As janelas abertas antes da instalação não vêem o novo PATH.
+1. Abra https://www.python.org/downloads/windows/ e, em "Stable Releases", escolha a versão 3.12 mais recente e clique em **Windows installer (64-bit)**.
+2. Execute o instalador. No primeiro ecrã, **marque "Add python.exe to PATH"**.
+3. Clique em **Install Now** e aguarde "Setup was successful". Clique em **Close**.
+4. Abra uma **nova** janela `cmd` (tecla Windows, escreva `cmd`, Enter).
 5. Verifique:
    ```
    py --version
-   ```
-   **Sucesso:** imprime `Python 3.12.x`.
-6. Verifique também o comando `python`:
-   ```
    python --version
    ```
-   **Sucesso:** imprime `Python 3.12.x`. Se em vez disso abrir a Microsoft Store, vá a **Definições > Aplicações > Definições avançadas de aplicações > Aliases de execução de aplicações** e desligue `python.exe` e `python3.exe`. Feche e reabra o `cmd`.
-7. Faça as duas verificações de 64 bits da secção 2.
+   **Sucesso:** ambos imprimem `Python 3.12.x`. Se `python` abrir a Microsoft Store, vá a **Definições > Aplicações > Definições avançadas de aplicações > Aliases de execução de aplicações**, desligue `python.exe` e `python3.exe`, e reabra o `cmd`.
 
 ---
 
-## 4. Instalar o MT5 e entrar numa conta DEMO
+## 5. Instalar o MT5 e entrar numa conta
 
-1. Transfira o MetaTrader 5 do site oficial da STARTRADER ou da sua Área de Cliente (não use cópias de outros sites). Execute o instalador e aceite as opções por omissão.
+1. Transfira o MetaTrader 5 do site oficial da STARTRADER ou da sua Área de Cliente. Execute o instalador com as opções por omissão.
    **Sucesso:** o MT5 abre e mostra gráficos.
-2. Se ainda não tem conta demo, crie-a na Área de Cliente da STARTRADER ou no próprio MT5 em **File > Open an Account**. Guarde o **login** (número), a **palavra-passe** e o **nome do servidor** que lhe forem atribuídos.
-3. No MT5 abra **File > Login to Trade Account**. Preencha:
-   * **Login:** o número da conta;
-   * **Password:** a palavra-passe de negociação (não a de investidor, que é só de leitura);
-   * **Server:** escolha o servidor da lista (normalmente o nome contém `Demo`);
-   * marque **Save password**, para o terminal voltar a entrar sozinho depois de reiniciar.
+2. Crie uma conta demo na Área de Cliente ou no MT5 em **File > Open an Account**. Guarde o **login**, a **palavra-passe** e o **nome do servidor**.
+3. No MT5 abra **File > Login to Trade Account**, preencha Login, Password (a de negociação, não a de investidor) e Server, marque **Save password** e clique em **OK**.
+4. Confirme a ligação: no canto inferior direito aparecem barras verdes e o ping em milissegundos; a barra de título mostra o número da conta e `Demo Account`.
 
-   Clique em **OK**.
-4. Confirme que a ligação está activa:
-   * no canto inferior direito da janela do MT5 aparece um indicador de ligação com barras verdes e o tempo de resposta (ping) em milissegundos. Se aparecer `No connection` ou `Invalid account`, a ligação falhou;
-   * a barra de título da janela mostra o número da conta, o nome do servidor e `Demo Account`;
-   * em **View > Navigator** (Ctrl+N), na pasta **Accounts**, a conta aparece com o ícone activo.
-5. Para saber o nome exacto do servidor: está no campo **Server** da janela de login, na barra de título do MT5, e também aparece no resultado do teste de ligação da secção 6.
-
-> **Dica:** se o MT5 estiver em português, os nomes dos menus mudam. Para seguir este guia à letra, mude a língua em **View > Languages > English** e reinicie o terminal.
+> **Dica:** para seguir este guia à letra, ponha o MT5 em inglês em **View > Languages > English** e reinicie-o.
 
 ---
 
-## 5. Preparar o MT5 para automação
+## 6. Preparar o MT5 para automação
 
-1. Abra **Tools > Options**, separador **Expert Advisors**:
+1. **Tools > Options**, separador **Expert Advisors**:
    * marque **Allow algorithmic trading**;
-   * se existir a opção **Disable algorithmic trading via external Python API**, **desmarque-a** (se estiver marcada, o Python não consegue negociar);
-   * recomendado: desmarque **Disable algorithmic trading when the account has been changed** se pretende trocar de conta sem ter de voltar a ligar o Algo Trading (o bot verifica a conta por si).
+   * se existir **Disable algorithmic trading via external Python API**, **desmarque-a**;
+   * recomendado: desmarque **Disable algorithmic trading when the account has been changed**.
 
    Clique em **OK**.
-2. Na barra de ferramentas, clique no botão **Algo Trading** (atalho Ctrl+E) até ficar **verde**. Vermelho significa desligado.
-   **Sucesso:** o botão está verde. Este estado é guardado e mantém-se depois de reiniciar o MT5.
-3. Abra **View > Market Watch** (Ctrl+M). Clique com o botão direito na lista e escolha **Show All** (ou **Symbols**, Ctrl+U, para pesquisar).
-4. Encontre o nome **exacto** do símbolo que quer negociar, incluindo sufixos. Exemplos: `EURUSD`, `EURUSD.m`, `EURUSD+`, `XAUUSD.s`. É esse texto, letra a letra, que vai em `symbols` no `config.json`.
-5. Clique com o botão direito no símbolo e escolha **Specification**. Aqui vê o tamanho do contrato, o volume mínimo, o passo de volume, o `Stops level` e os modos de execução. Útil para perceber porque é que uma ordem foi recusada.
-6. Leia a **hora do servidor**: o cabeçalho da janela Market Watch mostra a hora actual do servidor da corretora (por exemplo `Market Watch: 14:32:05`). Compare com a hora do seu PC para saber a diferença. A opção `trading_hours_server` usa **esta** hora, não a hora local.
-7. Confirme em **Tools > Options > Charts** que **Max bars in chart** é maior que o valor de `bars` no `config.json` (300 por omissão). `Unlimited` serve.
+2. Clique no botão **Algo Trading** (Ctrl+E) até ficar **verde**.
+3. **Tools > Options > Charts > Max bars in chart**: escolha **Unlimited** (ou pelo menos 100000). O optimizador pede cerca de 12 meses de velas; com um valor baixo recebe menos histórico.
+4. **View > Market Watch** (Ctrl+M), botão direito, **Show All**. Anote o nome exacto do símbolo, por exemplo `EURUSD` ou `EURUSD.m`. O bot detecta sufixos sozinho (secção 17), mas confirmar não custa.
+5. O cabeçalho do Market Watch mostra a **hora do servidor**. O bot detecta automaticamente a diferença para UTC a partir dos ticks; `trading_hours_server` usa a hora do servidor.
 
 ---
 
-## 6. Instalar o projecto
+## 7. Instalar o projecto
 
-1. Crie a pasta do projecto num `cmd`:
+1. Crie a pasta e entre nela:
    ```
    mkdir C:\mt5-bot
-   ```
-2. Copie para `C:\mt5-bot` os ficheiros `mt5_bot.py`, `config.json`, `requirements.txt`, `requirements-dev.txt`, `start_bot.bat`, `README.md` e a pasta `tests`.
-3. Entre na pasta:
-   ```
    cd /d C:\mt5-bot
    ```
-   **Sucesso:** o cursor mostra `C:\mt5-bot>`.
-4. Crie o ambiente virtual (isola as bibliotecas deste projecto):
+2. Copie para `C:\mt5-bot` todos os ficheiros e pastas do projecto (`mt5_bot.py`, `supervisor.py`, `config.json`, a pasta `mt5bot`, a pasta `tests`, os ficheiros `.bat` e `.ps1`, `requirements.txt`, `requirements-dev.txt`, `README.md`).
+3. Crie e active o ambiente virtual:
    ```
    py -3.12 -m venv .venv
-   ```
-   **Sucesso:** aparece a pasta `C:\mt5-bot\.venv`. Se usa outra versão suportada, troque `3.12` por `3.10` ou `3.11`.
-5. Active o ambiente virtual:
-   ```
    .venv\Scripts\activate
    ```
-   **Sucesso:** o cursor passa a `(.venv) C:\mt5-bot>`. Tem de activar o ambiente sempre que abrir um novo `cmd` para usar o bot à mão.
-6. Instale as dependências:
+   **Sucesso:** o cursor passa a `(.venv) C:\mt5-bot>`.
+4. Instale as dependências (só `MetaTrader5` e `numpy`; o resto é biblioteca padrão do Python):
    ```
    python -m pip install --upgrade pip
    pip install -r requirements.txt
    ```
    **Sucesso:** a última linha diz `Successfully installed MetaTrader5-... numpy-...`.
-7. Com o MT5 **aberto e com sessão iniciada**, faça o teste de ligação:
+5. Com o MT5 aberto e com sessão iniciada, teste a ligação:
    ```
    python -c "import MetaTrader5 as m; print(m.initialize(), m.account_info())"
    ```
-   **Sucesso:** imprime `True AccountInfo(login=..., trade_mode=0, ...)`. `trade_mode=0` significa conta demo; `2` significa conta real. Se imprimir `False None`, veja o erro com:
-   ```
-   python -c "import MetaTrader5 as m; print(m.initialize(), m.last_error())"
-   ```
-   e consulte a secção 15.
-8. Confirme que o terminal permite negociação algorítmica:
-   ```
-   python -c "import MetaTrader5 as m; m.initialize(); print(m.terminal_info().trade_allowed)"
-   ```
-   **Sucesso:** imprime `True`. Se imprimir `False`, volte à secção 5, passo 2.
+   **Sucesso:** imprime `True AccountInfo(login=..., trade_mode=0, ...)`. `trade_mode=0` é demo, `2` é real.
 
 ---
 
-## 7. Configurar o config.json
+## 8. Selecção de conta: demo ou real
 
-Abra `C:\mt5-bot\config.json` num editor de texto (Bloco de Notas serve). Regras do formato JSON: texto entre aspas duplas, `true`/`false`/`null` em minúsculas, sem vírgula depois do último item, e em caminhos do Windows cada `\` escreve-se `\\`.
+O bot negoceia na conta que estiver com sessão iniciada no terminal (ou na conta indicada pelas variáveis de ambiente da secção 15). Ao arrancar mostra uma faixa com o número da conta (mascarado no registo, por exemplo `***321`), o servidor, `DEMO` ou `REAL MONEY`, o capital, a moeda, a alavancagem e o tipo de conta (hedging ou netting).
 
-O bot valida tudo ao arrancar. Chaves desconhecidas (por exemplo um erro de escrita como `"symbol"`) são recusadas com uma mensagem a indicar o problema.
+### 8.1 A chave `account_mode`
 
-| Chave | Significado | Predefinição segura | Intervalo recomendado |
+| Valor | Efeito |
+|---|---|
+| `"any"` (omissão) | Aceita a conta que estiver no terminal, demo ou real. |
+| `"demo_only"` | Recusa contas reais (sai com o código 3). |
+| `"real_only"` | Recusa contas demo (sai com o código 3). |
+
+### 8.2 Confirmar dinheiro real (uma única vez, de propósito)
+
+Numa conta real, o bot só negoceia depois de uma confirmação explícita. Sem ela, mostra esta mensagem e sai com o código 3:
+
+```
+This terminal is logged in to a REAL MONEY account. The bot only trades real money after one deliberate confirmation...
+```
+
+Escolha **uma** das formas:
+
+1. Na linha de comandos (vale para essa execução):
+   ```
+   cd /d C:\mt5-bot
+   .venv\Scripts\activate
+   python mt5_bot.py --confirm-real-money
+   ```
+2. Ou de forma permanente no `config.json` (recomendado para arranque automático):
+   ```
+   "real_money_confirmed": true
+   ```
+
+Na primeira execução numa conta real aparece uma contagem decrescente de 10 segundos (`REAL MONEY trading starts in 10 s`). Ctrl+C durante a contagem cancela sem negociar. Para reinícios sem supervisão use `--no-countdown` (o supervisor já o acrescenta sozinho nos reinícios).
+
+**Porque é um passo deliberado:** uma predefinição escondida ou uma confirmação automática tornaria fácil arrancar em dinheiro real por engano (por exemplo depois de trocar de conta no terminal). Uma confirmação explícita, feita por si, é a protecção mais simples contra esse erro, e depois dela o bot não pede mais nada.
+
+### 8.3 Risco mais baixo em contas reais
+
+| Chave | Demo | Real | Tecto rígido no código |
 |---|---|---|---|
-| `symbols` | Lista de símbolos a negociar, com o nome exacto do Market Watch. | `["EURUSD"]` | 1 a 5 símbolos líquidos |
-| `timeframe` | Período das velas: `M1`, `M5`, `M15`, `M30`, `H1`, `H4`. | `"M15"` | `M15` a `H4` (períodos curtos sofrem mais com o spread) |
-| `bars` | Número de velas fechadas enviadas à estratégia. Mínimo: `3 * max(slow_ema, atr_period) + 2`. | `300` | 200 a 1000 |
-| `magic` | Número que identifica as ordens deste bot. O bot só mexe em posições com este número. | `510001` | Qualquer inteiro positivo, único por instância do bot |
-| `risk_per_trade_pct` | Percentagem do capital (equity) arriscada até ao SL em cada operação. | `0.5` | 0.25 a 1 (máximo aceite: 2) |
-| `max_daily_loss_pct` | Perda diária máxima, em % do capital no início do dia do servidor. Ao atingir, fecha as posições do bot e pára até ao dia seguinte. | `2.0` | 1 a 3 (máximo aceite: 10) |
-| `max_open_positions_total` | Máximo de posições do bot abertas em simultâneo, em todos os símbolos. | `3` | 1 a 5 |
-| `max_spread_points` | Spread máximo, em pontos, para abrir uma posição. Em EURUSD com 5 casas decimais, 10 pontos = 1 pip. | `20` | 1,5 a 3 vezes o spread típico do símbolo |
-| `deviation_points` | Desvio máximo de preço aceite na execução, em pontos. Entra no cálculo do volume (pior preço possível). | `10` | 5 a 30 |
-| `trading_hours_server` | Janela `[início, fim)` em horas do servidor. `[7, 20]` = das 07:00 às 19:59. Aceita janelas que atravessam a meia-noite, como `[22, 6]`. `[0, 24]` = sempre. | `[7, 20]` | Evite a hora de rollover (por volta das 00:00 do servidor), quando o spread alarga |
-| `fast_ema` | Período da EMA rápida (estratégia de exemplo). | `20` | 5 a 50, menor que `slow_ema` |
-| `slow_ema` | Período da EMA lenta (estratégia de exemplo). | `50` | 20 a 200 |
-| `atr_period` | Período do ATR (Wilder), usado para SL e TP. | `14` | 10 a 30 |
-| `sl_atr_mult` | Distância do SL = ATR x este valor. | `2.0` | 1 a 4 |
-| `tp_atr_mult` | Distância do TP = ATR x este valor. | `3.0` | 1 a 6 |
-| `close_on_opposite` | Se `true`, um sinal contrário fecha a posição do bot nesse símbolo (e abre a nova, se os filtros deixarem). | `true` | `true` ou `false` |
-| `allow_live` | Permite arrancar numa conta real. | `false` | Mantenha `false` até concluir a secção 12 |
-| `dry_run` | Faz tudo, incluindo `order_check`, mas nunca envia ordens. Equivale a `--dry-run`. | `false` | `true` nos primeiros dias |
-| `poll_seconds` | Intervalo entre ciclos do bot, em segundos. | `5` | 2 a 30 |
-| `heartbeat_minutes` | Intervalo entre mensagens de estado (heartbeat) no registo. | `30` | 5 a 60 |
-| `kill_switch_file` | Nome do ficheiro que, se existir na pasta do bot, fecha as posições do bot e termina. | `"KILL"` | Manter |
-| `state_file` | Ficheiro JSON com o capital de início do dia e o estado de paragem. | `"bot_state.json"` | Manter |
-| `log_file` | Ficheiro de registo (rotativo: 2 MB x 5 ficheiros). | `"bot.log"` | Manter |
-| `mt5_path` | Caminho completo para `terminal64.exe`. Só é necessário se tiver vários terminais MT5 instalados. | `null` | Exemplo: `"C:\\Program Files\\NomeDaPasta\\terminal64.exe"` |
+| Risco por operação | `risk_per_trade_pct_demo` = 0.5% | `risk_per_trade_pct_real` = 0.25% | 2.0% |
+| Perda diária máxima | `max_daily_loss_pct_demo` = 2.0% | `max_daily_loss_pct_real` = 1.5% | 5.0% |
 
-Para encontrar o caminho do `terminal64.exe`: clique com o botão direito no atalho do MT5, escolha **Propriedades** e copie o campo **Destino**.
+### 8.4 Estado separado por conta
+
+Cada conta tem a sua pasta `state\<servidor>_<login>\`, por exemplo `state\STARTRADER-Demo_12345678\`. Lá ficam:
+
+* `registry.sqlite`: diário de operações (reais e em sombra), estratégias, resultados de optimização, decisões e capital;
+* `risk_state.json`: capital do início do dia e pico de capital;
+* `RESUME_REQUIRED.txt`: só existe se o disjuntor de drawdown disparou;
+* `optimizer.log`: registo das optimizações em segundo plano.
+
+O histórico da demo **nunca** influencia as decisões da conta real e vice-versa. Os relatórios também ficam separados em `reports\<servidor>_<login>\`.
+
+### 8.5 Contas hedging e netting
+
+O bot detecta o tipo de conta (`margin_mode`):
+
+* **hedging:** pode haver várias posições no mesmo símbolo; o bot fecha a sua posição pelo número (ticket);
+* **netting:** há uma única posição por símbolo; o bot fecha com uma ordem oposta do mesmo volume, altera SL/TP com `TRADE_ACTION_SLTP` e **não abre** se já existir uma posição de outra origem (manual ou outro robô) nesse símbolo.
 
 ---
 
-## 8. Primeira execução em modo dry-run
+## 9. Como funciona o motor adaptativo
 
-No modo dry-run o bot faz todo o trabalho (ligação, verificações, sinais, cálculo do volume e `order_check` na corretora), mas **nunca envia ordens**.
+Em linguagem simples: o bot tem uma biblioteca de estratégias revistas, testa-as em dados que não usou para as afinar, põe as melhores a "negociar a fingir" (em sombra) com dados ao vivo e só deixa uma negociar a sério quando passou todos os testes. Se essa estratégia piorar, é afastada de imediato. Se nenhuma passar, o bot fica de fora.
 
-1. Com o MT5 aberto, ligado e com o Algo Trading verde, abra um `cmd`:
-   ```
-   cd /d C:\mt5-bot
-   .venv\Scripts\activate
-   python mt5_bot.py --dry-run
-   ```
-2. **Sucesso:** aparecem linhas como estas (valores ilustrativos):
-   ```
-   2025-10-13 09:00:01,102 INFO     mt5_bot 1.0.0 starting in DRY RUN mode
-   2025-10-13 09:00:01,103 INFO     Connecting to MT5 terminal (path=auto-detect, credentials from environment=no)
-   2025-10-13 09:00:01,220 INFO     Connected: account ***321 on NomeDoServidor-Demo (DEMO, USD), equity 10000.00 USD, mode=DRY RUN (no orders will be sent)
-   2025-10-13 09:00:01,221 INFO     Config: symbols=EURUSD timeframe=M15 risk=0.50% daily_loss=2.00% magic=510001
-   2025-10-13 09:00:01,222 INFO     Bot running (poll every 5s). Create the file KILL to stop.
-   2025-10-13 09:00:01,230 INFO     New server day 2025-10-13: start equity 10000.00
-   2025-10-13 09:00:01,231 INFO     Heartbeat: equity 10000.00 USD, balance 10000.00, bot positions 0, halted=False, day start equity 10000.00
-   2025-10-13 09:00:01,240 INFO     EURUSD: last closed bar 2025-10-13 09:45 server recorded; waiting for the next one
-   ```
-   e, quando surgir um sinal:
-   ```
-   2025-10-13 13:00:03,511 INFO     EURUSD: BUY signal on bar 2025-10-13 12:45 server (ATR 0.001200)
-   2025-10-13 13:00:03,530 INFO     DRY RUN: would send BUY EURUSD 0.20 lots at 1.1001 SL 1.09771 TP 1.10369 (order_check OK)
-   ```
-   O número de conta aparece mascarado (`***321`) de propósito. Na primeira volta o bot só regista a última vela fechada e espera pela seguinte; é normal não acontecer nada durante um período de vela (15 minutos em M15).
-3. Deixe-o a correr **pelo menos 2 a 3 dias de mercado** (de segunda a sexta). O cruzamento de médias é raro: pode haver só alguns sinais por semana.
-4. Verifique o `bot.log` (fica em `C:\mt5-bot`). Noutro `cmd`:
-   * ver as ordens que teriam sido enviadas:
-     ```
-     findstr /C:"DRY RUN" bot.log
-     ```
-   * ver avisos e erros:
-     ```
-     findstr /C:"WARNING" /C:"ERROR" /C:"CRITICAL" bot.log
-     ```
-   * acompanhar o registo em tempo real:
-     ```
-     powershell -Command "Get-Content bot.log -Wait -Tail 30"
-     ```
-5. O que procurar:
-   * linhas `Heartbeat` com a regularidade configurada (o bot está vivo);
-   * linhas `DRY RUN: would send ... (order_check OK)`: a corretora aceitaria a ordem;
-   * linhas `order_check rejected the order: retcode=...`: há um problema a corrigir (ver secção 15);
-   * linhas `spread ... > max` ou `outside trading window`: os filtros estão a funcionar; se surgirem sempre, ajuste `max_spread_points` ou `trading_hours_server`;
-   * nenhuma linha `ERROR` ou `Traceback` sem explicação.
-6. Pare com **Ctrl+C**.
+```
+ Biblioteca de estratégias (código revisto, parâmetros com limites)
+   ema_cross | donchian | rsi_reversion | bollinger | session_breakout
+   volfilter_ema_cross | volfilter_donchian | NoTrade
+            |
+            v
+ Optimizador (processo separado, prioridade baixa, semanal ao fim de semana)
+   amostra aleatória de parâmetros dentro dos limites
+            |
+            v
+ Walk-forward: treino 3 meses -> teste 1 mês nunca visto -> avança 1 mês ...
+            |
+            v
+ Portões de aceitação (todos obrigatórios, fora da amostra, com custos)
+   >= 100 operações | expectativa > 0 e limite inferior bootstrap 90% > 0
+   profit factor >= 1.3 | drawdown <= 12R | lucro em >= 60% das janelas
+   Sharpe deflacionado >= 0.90 (penaliza o número de tentativas)
+   vizinhos dos parâmetros também aceitáveis (sem picos isolados)
+            |
+     passou? ---- não ----> NoTrade (não negociar)
+            | sim
+            v
+ Desafiantes em SOMBRA: sinais e execuções virtuais com dados ao vivo, sem ordens
+            |
+            v
+ Promoção a CAMPEÃO se: portões + >= 30 operações em sombra (ou >= 14 dias com >= 10)
+   + sombra positiva e coerente com o backtest + supera o campeão em >= 15%
+   + passaram >= 7 dias desde a última troca
+            |
+            v
+ CAMPEÃO: a única estratégia que envia ordens reais (sempre via camada de risco)
+            |
+ degradação? (drawdown acima do orçamento, expectativa recente claramente
+              negativa, sequência de perdas improvável)
+            | sim
+            v
+ DESPROMOÇÃO imediata -> próximo candidato validado ou NoTrade
+   -> nova optimização -> notificação
+```
 
----
+Pontos importantes:
 
-## 9. Executar em demo com ordens reais
-
-1. Confirme que `"dry_run": false` no `config.json` e que está numa conta **demo**.
-2. Arranque sem `--dry-run`:
-   ```
-   cd /d C:\mt5-bot
-   .venv\Scripts\activate
-   python mt5_bot.py
-   ```
-   **Sucesso:** a linha `Connected:` termina em `mode=LIVE ORDERS` e mostra `(DEMO, ...)`. Quando houver uma entrada aparece:
-   ```
-   EURUSD: opened BUY 0.20 lots at 1.1001 SL 1.09771 TP 1.10369 (order ..., deal ...)
-   ```
-3. Ver as operações do bot no MT5:
-   * **View > Toolbox** (Ctrl+T), separador **Trade**: posições abertas. Confirme que as colunas **S / L** e **T / P** estão preenchidas e que o comentário é `mt5_bot` (se a coluna Comment não estiver visível, clique com o botão direito no cabeçalho da tabela e active-a). A corretora pode alterar o comentário, por exemplo quando o SL é atingido.
-   * Separador **History**: clique com o botão direito, escolha **Positions** para ver posições completas e escolha o período (por exemplo **Last 3 Months**). No mesmo menu, **Report** exporta um relatório (as opções podem variar com a versão do terminal).
-   * O MT5 não mostra o número magic nas tabelas. Para listar só as posições abertas deste bot:
-     ```
-     python -c "import MetaTrader5 as m; m.initialize(); print([(p.ticket, p.symbol, p.volume, p.sl, p.tp) for p in (m.positions_get() or []) if p.magic == 510001])"
-     ```
-   * Resultado líquido acumulado das operações do bot (lucro + comissões + swaps):
-     ```
-     python -c "import MetaTrader5 as m, datetime as d; m.initialize(); ds = m.history_deals_get(d.datetime(2020, 1, 1), d.datetime.now() + d.timedelta(days=2)) or []; print(round(sum(x.profit + x.commission + x.swap for x in ds if x.magic == 510001), 2))"
-     ```
-     Troque `510001` pelo seu `magic` se o alterou. Compare o resultado com o separador History.
-4. **Validação recomendada: 2 a 3 meses em demo**, sem mexer nos parâmetros a meio. Registe semanalmente:
-   * número de operações (com menos de 50 a 100 operações as conclusões são fracas);
-   * taxa de acerto e relação ganho médio / perda média;
-   * profit factor (ganhos brutos / perdas brutas) e expectativa por operação;
-   * drawdown máximo e maior sequência de perdas;
-   * custos: spread, comissões e swaps;
-   * deslizamento: diferença entre o preço pedido e o executado;
-   * dias em que o limite diário foi atingido, desconexões e erros no `bot.log`;
-   * comparação com o que esperava de um backtest feito antes.
+* **Camada de risco:** as estratégias só propõem uma direcção (compra ou venda) e uma volatilidade (ATR). O módulo `mt5bot/risk.py` decide se a operação pode abrir e com que volume. O mesmo código é usado no backtest, na sombra e em real, por isso os três não divergem.
+* **Comportamentos proibidos (no código e nos testes):** martingale, aumentar o volume depois de uma perda, juntar posições em perda (averaging down), grelhas, ordens sem SL e TP, remover ou alargar um SL, negociar com spread ou deslizamento acima do limite, negociar em janelas de notícias (se o filtro estiver activo).
+* **Nada de código gerado em tempo real:** o motor só escolhe entre estratégias e valores de parâmetros definidos no código. Não usa `eval`, `exec` nem descarrega código.
+* **Trocas não abandonam posições:** uma posição aberta mantém o seu SL e TP e continua gerida pela estratégia que a abriu (incluindo o fecho por sinal contrário). A nova campeã só faz novas entradas.
+* **Arranque a frio:** sem campeã, o bot fica em **modo de observação**: recolhe dados, optimiza, negoceia em sombra e só envia ordens depois da primeira promoção.
+* **Custos realistas no backtest:** entrada na abertura da vela seguinte, spread de cada vela, deslizamento configurável, comissão por lote, swap negativo por noite, e, quando o SL e o TP são tocados na mesma vela, assume-se que o SL foi atingido primeiro (pessimista).
 
 ---
 
-## 10. Parar o bot
+## 10. Referência completa do config.json
 
-| Método | Como | O que acontece às posições |
+Regras do formato JSON: texto entre aspas duplas, `true`/`false`/`null` em minúsculas, sem vírgula depois do último item, e em caminhos do Windows cada `\` escreve-se `\\`. O bot valida tudo ao arrancar e em cada recarga; chaves desconhecidas são recusadas com uma mensagem clara. As chaves da v1 que foram removidas (`allow_live`, `risk_per_trade_pct`, `max_daily_loss_pct`, `fast_ema`, `slow_ema`, `atr_period`, `sl_atr_mult`, `tp_atr_mult`, `state_file`) dão um erro que diz o que as substitui.
+
+O `config.json` que acompanha o projecto lista as chaves mais usadas; as restantes usam o valor por omissão desta tabela. "Tecto" é o máximo rígido do código: o bot recusa valores acima dele.
+
+### 10.1 Mercado e conta
+
+| Chave | Significado | Omissão | Intervalo seguro | Tecto |
+|---|---|---|---|---|
+| `symbols` | Símbolos a negociar (o bot detecta sufixos como `.m`). | `["EURUSD"]` | 1 a 5 símbolos líquidos | |
+| `timeframe` | Período das velas: `M1`, `M5`, `M15`, `M30`, `H1`, `H4`. | `"M15"` | `M15` a `H1` | |
+| `bars` | Velas fechadas enviadas às estratégias em tempo real. | `1000` | 1000 a 2000 | 20000 |
+| `history_months` | Meses de histórico para a optimização. | `12` | 12 a 24 | 60 |
+| `magic` | Número que identifica as ordens deste bot. Só mexe em posições com este número. | `510001` | Único por instância | |
+| `account_mode` | `any`, `demo_only` ou `real_only` (secção 8). | `"any"` | | |
+| `real_money_confirmed` | Confirmação permanente para contas reais. | `false` | | |
+
+### 10.2 Risco (camada de risco)
+
+| Chave | Significado | Omissão | Intervalo seguro | Tecto |
+|---|---|---|---|---|
+| `risk_per_trade_pct_demo` | % do capital arriscada até ao SL (demo), comissão incluída. | `0.5` | 0.25 a 1 | 2.0 |
+| `risk_per_trade_pct_real` | Idem, contas reais. | `0.25` | 0.1 a 0.5 | 2.0 |
+| `max_daily_loss_pct_demo` | Perda diária máxima (dia do servidor). Ao atingir: fecha posições do bot e pára até ao dia seguinte. | `2.0` | 1 a 3 | 5.0 |
+| `max_daily_loss_pct_real` | Idem, contas reais. | `1.5` | 1 a 2 | 5.0 |
+| `max_open_positions_total` | Máximo de posições do bot em simultâneo. | `3` | 1 a 3 | 5 |
+| `max_total_open_risk_pct` | Soma do risco até ao SL de todas as posições abertas. | `2.0` | 1 a 2 | 4.0 |
+| `max_symbol_exposure_x` | Exposição nocional por símbolo, em múltiplos do capital. | `5.0` | 2 a 5 | 10.0 |
+| `max_drawdown_from_peak_pct` | Disjuntor: queda do capital face ao pico que fecha tudo e exige intervenção humana (secção 13). | `12.0` | 8 a 15 | 20.0 |
+
+### 10.3 Execução, filtros e custos
+
+| Chave | Significado | Omissão | Intervalo seguro |
+|---|---|---|---|
+| `max_spread_points` | Spread máximo para abrir (10 pontos = 1 pip em EURUSD). | `20` | 1,5 a 3 vezes o spread típico |
+| `deviation_points` | Desvio de preço aceite na execução. Entra no cálculo do volume. | `10` | 5 a 30 |
+| `max_slippage_points` | Deslizamento acima do qual novas entradas nesse símbolo ficam em pausa. | `20` | 10 a 30 |
+| `slippage_pause_minutes` | Duração dessa pausa. | `60` | 30 a 240 |
+| `trading_hours_server` | Janela `[início, fim)` em horas do servidor para novas entradas. `[0, 24]` = sempre. | `[7, 20]` | Evite o rollover (cerca das 00:00 do servidor) |
+| `close_on_opposite` | Um sinal contrário da estratégia que abriu a posição fecha-a. | `true` | |
+| `commission_per_lot` | Comissão por lote, ida e volta, na moeda da conta. `null` = detectar no histórico de negócios. | `null` | |
+| `commission_fallback_per_lot` | Valor usado se não houver histórico para detectar (pessimista). | `7.0` | 0 em contas só com spread |
+| `backtest_slippage_points` | Deslizamento assumido no backtest e na sombra. | `2.0` | 1 a 5 |
+| `news_filter_enabled` | Bloqueia entradas perto de notícias do ficheiro `news_file`. | `false` | |
+| `news_file` | CSV com colunas `time_utc,currency,impact,title`. | `"news.csv"` | |
+| `news_minutes_before` / `news_minutes_after` | Janela de bloqueio à volta de cada notícia. | `30` / `30` | 15 a 60 |
+
+### 10.4 Motor adaptativo
+
+| Chave | Significado | Omissão | Intervalo seguro |
+|---|---|---|---|
+| `enabled_strategies` | Lista de estratégias activas. `null` = todas. | `null` | |
+| `trials_per_strategy` | Conjuntos de parâmetros testados por estratégia. | `30` | 20 a 60 |
+| `max_trials_per_cycle` | Limite total de tentativas por ciclo (entra na penalização). | `300` | 100 a 500 |
+| `optimizer_workers` | Processos paralelos do optimizador. | `1` | 1 a (núcleos - 1) |
+| `optimizer_seed` | Semente: o mesmo histórico dá sempre o mesmo resultado. | `12345` | |
+| `wf_train_months` / `wf_test_months` / `wf_step_months` | Janelas walk-forward. | `3` / `1` / `1` | |
+| `min_oos_trades` | Operações mínimas fora da amostra. | `100` | 100 a 300 |
+| `min_profit_factor` | Profit factor mínimo fora da amostra. | `1.3` | 1.2 a 1.6 |
+| `max_oos_drawdown_r` | Drawdown máximo fora da amostra, em R (1R = risco de uma operação). | `12.0` | 8 a 15 |
+| `min_window_win_ratio` | Fracção mínima de janelas de teste com lucro. | `0.6` | 0.55 a 0.75 |
+| `bootstrap_confidence` / `bootstrap_samples` | Intervalo bootstrap da expectativa por operação. | `0.90` / `2000` | |
+| `min_deflated_sharpe` | Probabilidade mínima de o Sharpe ser melhor do que o melhor acaso esperado para o número de tentativas. **O portão mais exigente.** | `0.90` | 0.80 a 0.95 |
+| `min_neighbor_pass_ratio` | Fracção de parâmetros vizinhos que também têm de ser aceitáveis. | `0.6` | 0.5 a 0.8 |
+| `max_challengers` | Desafiantes em sombra por símbolo. | `3` | 2 a 5 |
+| `min_shadow_trades` | Operações em sombra para poder ser promovido. | `30` | 30 a 60 |
+| `min_shadow_days` / `min_shadow_trades_floor` | Alternativa: este número de dias com pelo menos este número de operações. | `14` / `10` | |
+| `promotion_margin` | Histerese: quanto o desafiante tem de superar o campeão. | `0.15` | 0.1 a 0.3 |
+| `switch_cooldown_days` | Dias mínimos entre trocas de campeão. | `7` | 7 a 14 |
+| `bootstrap_days` | Dias mínimos de observação antes da primeira promoção (também `--bootstrap-days`). | `null` | |
+| `degrade_window_trades` / `degrade_min_trades` / `degrade_ucb_z` | Despromove se o limite superior da expectativa das últimas operações for negativo. | `30` / `10` / `1.645` | |
+| `degrade_dd_multiple` / `degrade_max_dd_r` | Orçamento de drawdown: o menor de (múltiplo x drawdown fora da amostra) e este limite em R. | `2.0` / `10.0` | |
+| `degrade_streak_alpha` | Despromove se uma sequência de perdas tiver probabilidade abaixo deste valor. | `0.01` | 0.005 a 0.02 |
+| `reoptimize_every_days` | Ciclo completo de optimização (feito ao fim de semana). | `7` | 7 |
+
+### 10.5 Operação
+
+| Chave | Significado | Omissão |
 |---|---|---|
-| **Ctrl+C** (ou Ctrl+Break) | Na janela do bot. | O bot termina de forma ordenada (`Stop requested ...`). As posições **ficam abertas**, protegidas pelo SL e TP no servidor. |
-| **Kill switch** | Noutro `cmd`: `cd /d C:\mt5-bot` e depois `type nul > KILL` | Em poucos segundos (até `poll_seconds`) o bot **fecha todas as posições com o seu magic** (não toca nas outras) e termina com código 0. |
-| Fechar a janela (X) ou desligar o PC | Não recomendado. | O processo é terminado à força. As posições ficam abertas com SL e TP no servidor. |
+| `dry_run` | Faz tudo, incluindo `order_check`, mas nunca envia ordens. Igual a `--dry-run`. | `false` |
+| `poll_seconds` | Intervalo entre ciclos com o mercado activo. | `5` |
+| `closed_market_poll_seconds` | Intervalo com o mercado fechado (fim de semana, feriados). | `60` |
+| `heartbeat_minutes` | Intervalo das mensagens `Heartbeat` e da linha de estado no registo. | `30` |
+| `stale_tick_minutes` | Minutos sem ticks para considerar o mercado parado. | `5` |
+| `terminal_restart_enabled` / `terminal_freeze_minutes` | Reinicia o terminal se não houver ticks durante este tempo em horário de mercado (só se todas as posições tiverem SL e TP). | `true` / `10` |
+| `holidays` | Feriados (datas do servidor `"AAAA-MM-DD"`) em que o mercado não abre. | `[]` |
+| `config_reload_seconds` | De quanto em quanto tempo o `config.json` é relido. | `60` |
+| `telegram_enabled` | Notificações Telegram (secção 12.6). | `false` |
+| `kill_switch_file` | Ficheiro de paragem de emergência. | `"KILL"` |
+| `state_root` / `reports_dir` / `health_file` / `log_file` | Pastas e ficheiros de estado, relatórios, saúde e registo. | `"state"` / `"reports"` / `"health.json"` / `"bot.log"` |
+| `mt5_path` | Caminho do `terminal64.exe`. `null` = usar o terminal aberto ou procurar em Program Files (prefere pastas com "STARTRADER"). | `null` |
+| `mt5_init_timeout_ms` | Tempo de espera do arranque do terminal. | `60000` |
 
-Depois de usar o kill switch, o ficheiro `KILL` **fica na pasta de propósito**: enquanto existir, o bot fecha as posições e sai sempre que arrancar (útil se tiver o arranque automático configurado). Para voltar a usar o bot:
+**Recarga automática:** o bot relê o `config.json` a cada minuto. Se o novo ficheiro for inválido, mantém a configuração anterior e escreve o motivo no `bot.log`. As chaves de segurança só podem ser **apertadas** em funcionamento (por exemplo baixar o risco); para as alargar, ou para mudar `symbols`, `timeframe`, `magic`, `account_mode`, `real_money_confirmed`, pastas ou `mt5_path`, reinicie o bot. Os tectos de `mt5bot/limits.py` só mudam alterando o código.
+
+---
+
+## 11. Primeira execução e fase de observação
+
+### 11.1 Arrancar em demo, primeiro em dry-run
+
 ```
 cd /d C:\mt5-bot
-del KILL
+.venv\Scripts\activate
+python mt5_bot.py --dry-run
 ```
 
-Com o bot parado, as posições abertas continuam protegidas pelo SL e TP, mas deixam de ter fecho por sinal contrário e o limite de perda diária deixa de ser vigiado.
+**Sucesso:** aparecem linhas como estas (valores ilustrativos):
+
+```
+INFO     ========================================================================
+INFO       ACCOUNT ***321 on STARTRADER-Demo: DEMO
+INFO       equity 10000.00 USD, leverage 1:500, hedging account
+INFO       risk per trade 0.50%, daily loss limit 2.00%, drawdown breaker 12.0% from peak
+INFO       mode: DRY RUN (no orders will be sent)
+INFO     Reconciliation: 0 bot position(s) open, 0 recovered into the journal, 0 repaired, 0 pending order(s)
+INFO     EURUSD: cached 26112 bars of history for optimisation
+INFO     Optimisation process started (low priority): cold start: no optimisation results yet
+INFO     EURUSD: OBSERVATION: collecting data; first optimisation running. No orders until a candidate is promoted.
+```
+
+### 11.2 O que esperar nos primeiros dias
+
+| Quando | O que acontece | Linha de estado |
+|---|---|---|
+| Minuto 0 | O bot guarda 12 meses de velas e lança a primeira optimização em segundo plano (1 a 3 minutos por símbolo num PC normal). | `OBSERVATION: collecting data; first optimisation running` |
+| Minutos depois | Se nenhuma estratégia passou os portões, fica em `NoTrade` até ao próximo ciclo semanal. | `NO TRADE: no candidate passed the gates in run N; standing aside by design` |
+| Dias 1 a 14+ | Se houver sobreviventes, negoceiam em sombra. | `OBSERVATION: best challenger donchian(...): shadow 12/30 trades, 5.2/14 days, mean +0.210R` |
+| Primeira promoção | Com 30 operações em sombra (ou 14 dias com pelo menos 10) coerentes com o backtest. Normalmente **2 a 6 semanas**, e **pode nunca acontecer**. | `champion donchian(...) trading` |
+
+É normal o bot não abrir nenhuma operação durante semanas. Com `--bootstrap-days 21` (ou `"bootstrap_days": 21`) obriga a pelo menos 21 dias de observação antes da primeira promoção.
+
+### 11.3 Caminho recomendado
+
+1. Uma semana em **demo com `--dry-run`**: confirme que não há erros e veja as decisões em `--status` e `--history`.
+2. **Várias semanas em demo sem dry-run** (de preferência até ver uma promoção e algumas operações): compare o comportamento real com o que o `--history` justificou.
+3. Só depois, **conta real com capital pequeno**, com `real_money_confirmed` (secção 8.2). O estado da conta real começa do zero (pastas separadas): volta a passar pela observação.
+
+### 11.4 Ler o estado
+
+* Estado actual (lê o `health.json`, actualizado a cada minuto):
+  ```
+  python mt5_bot.py --status
+  ```
+  **Sucesso:** mostra conta, capital, pico, drawdown, posições, paragens activas, campeão por símbolo, linha de estado e progresso de cada desafiante. Se o ficheiro tiver mais de 5 minutos, avisa que o bot pode não estar a correr.
+* Registo de decisões (optimizações, promoções, despromoções, rollbacks), com motivo e métricas:
+  ```
+  python mt5_bot.py --history
+  ```
+  Exemplo:
+  ```
+  #7     2026-11-09 06:10 UTC  EURUSD     PROMOTE      NoTrade -> donchian(channel=60, sl_mult=2.0, tp_mult=3.5)
+         reason: gates passed (OOS score 1.234); 31 shadow trades over 16.0 days, mean +0.280R ...
+  ```
+* Relatórios diários e semanais em `reports\<servidor>_<login>\`: `daily_AAAA-MM-DD.txt` (resumo: operações, taxa de acerto, expectativa, profit factor, drawdown, campeão e porquê), `..._trades.csv` e `..._equity.csv`. Os semanais são gerados às segundas-feiras.
+* Registo completo: `bot.log` (rotativo, 2 MB x 5). Útil:
+  ```
+  findstr /C:"PROMOTED" /C:"DEMOTED" /C:"CRITICAL" /C:"ERROR" bot.log
+  powershell -Command "Get-Content bot.log -Wait -Tail 30"
+  ```
 
 ---
 
-## 11. Execução sem supervisão
+## 12. Execução sem supervisão
 
-### 11.1 Testar o start_bot.bat
+### 12.1 O supervisor
 
-1. Faça duplo clique em `C:\mt5-bot\start_bot.bat`.
-   **Sucesso:** abre uma janela preta com as mesmas linhas de registo da secção 8. O `.bat` entra na pasta, activa o `.venv` e arranca o bot. Se o bot terminar com erro, a janela fica aberta com `Press any key to continue . . .` para poder ler a mensagem.
-2. Pode passar opções, por exemplo num `cmd`: `C:\mt5-bot\start_bot.bat --dry-run`.
+O supervisor arranca o bot como processo filho e reinicia-o se ele terminar por erro, com espera crescente (15 s, 30 s, 60 s... até 5 minutos). Se houver 5 falhas em 30 minutos, pára de propósito (disjuntor de reinícios), notifica e deixa as posições protegidas pelo SL/TP no servidor. Não reinicia depois de saídas deliberadas: código 0 (Ctrl+C, kill switch) e código 3 (regra de segurança, conta não autorizada).
 
-### 11.2 Abrir o MT5 ao iniciar sessão no Windows
+```
+cd /d C:\mt5-bot
+start_supervisor.bat
+```
 
-1. Prima **Windows+R**, escreva `shell:startup` e prima Enter. Abre a pasta de arranque.
-2. Noutra janela do Explorador, encontre o atalho do MT5 (por exemplo no ambiente de trabalho), clique com o botão direito, **Copiar**, e na pasta de arranque clique com o botão direito, **Colar atalho**.
-3. Garanta que marcou **Save password** no login (secção 4) e que o botão Algo Trading fica verde ao reabrir.
+Para contas reais com arranque automático, use `"real_money_confirmed": true` no `config.json` (ou `start_supervisor.bat --confirm-real-money`). O registo do supervisor fica em `supervisor.log`.
 
-### 11.3 Agendador de Tarefas (arranque do bot ao iniciar sessão)
+### 12.2 Arranque automático com o Windows
 
-1. Prima **Windows+R**, escreva `taskschd.msc` e prima Enter.
-2. No painel direito, clique em **Create Task...** (não use "Create Basic Task").
-3. Separador **General**:
-   * **Name:** `MT5 Bot`;
-   * escolha **Run only when user is logged on** (o MT5 corre na sua sessão do Windows e o bot precisa de falar com ele).
-4. Separador **Triggers** > **New...**:
-   * **Begin the task:** `At log on`;
-   * **Specific user:** o seu utilizador;
-   * em **Advanced settings**, marque **Delay task for:** e escolha `1 minute` (dá tempo ao MT5 para abrir e ligar; aumente para 2 ou 5 minutos se o arranque falhar);
-   * confirme que **Enabled** está marcado. **OK**.
-5. Separador **Actions** > **New...**:
-   * **Action:** `Start a program`;
-   * **Program/script:** `C:\mt5-bot\start_bot.bat`
-   * **Start in (optional):** `C:\mt5-bot` (sem aspas e sem barra no fim). **OK**.
-6. Separador **Conditions**: desmarque **Start the task only if the computer is on AC power**.
-7. Separador **Settings**:
-   * desmarque **Stop the task if it runs longer than:**;
-   * em **If the task is already running, then the following rule applies:** escolha `Do not start a new instance`. **OK**.
-8. Teste: na lista de tarefas, clique com o botão direito em **MT5 Bot** > **Run**.
-   **Sucesso:** abre a janela do bot com o registo normal.
+1. Faça duplo clique em `C:\mt5-bot\install_autostart.bat` (ou num `cmd`: `cd /d C:\mt5-bot` e `install_autostart.bat`).
+   **Sucesso:** aparece `Task 'MT5 Bot Supervisor' registered.` com o programa, a pasta de início (`Start in: C:\mt5-bot`) e o gatilho (ao iniciar sessão, com 1 minuto de atraso).
+2. Teste já:
+   ```
+   schtasks /Run /TN "MT5 Bot Supervisor"
+   ```
+   **Sucesso:** abre a janela do supervisor e depois a do bot.
+3. Opções: `install_autostart.bat -DelayMinutes 3` (mais tempo para o MT5 ligar) ou `install_autostart.bat -BotArgs "--dry-run"`.
+4. Para remover: `uninstall_autostart.bat`.
 
-O Agendador só arranca a tarefa quando inicia sessão. Se o PC reiniciar sozinho (por exemplo por uma actualização), o bot só volta depois de iniciar sessão. O início de sessão automático no Windows (`netplwiz`) resolve isso, mas reduz a segurança do PC: qualquer pessoa com acesso físico entra na sua conta. Decida conscientemente.
+**Alternativa manual (Agendador de Tarefas):** `taskschd.msc` > **Create Task...**; **General**: nome `MT5 Bot Supervisor`, **Run only when user is logged on**; **Triggers**: **At log on**, o seu utilizador, **Delay task for: 1 minute**; **Actions**: **Start a program**, Program `C:\mt5-bot\start_supervisor.bat`, **Start in** `C:\mt5-bot`; **Conditions**: desmarque **Start the task only if the computer is on AC power**; **Settings**: desmarque **Stop the task if it runs longer than**, escolha **Do not start a new instance**.
 
-### 11.4 Impedir suspensão e hibernação
+A tarefa corre na sua sessão do Windows (é aí que o MT5 corre). Depois de um reinício do PC, só arranca quando a sessão iniciar. O início de sessão automático (`netplwiz`) resolve isso, mas qualquer pessoa com acesso físico entra na sua conta. Decida conscientemente.
 
-1. **Definições > Sistema > Energia e bateria** (Windows 11) ou **Definições > Sistema > Energia e suspensão** (Windows 10): em suspensão, quando ligado à corrente, escolha **Nunca**. Desligar só o ecrã não faz mal.
-2. Ou, num `cmd` aberto como administrador (botão direito em **Linha de Comandos** > **Executar como administrador**):
+### 12.3 O terminal MT5
+
+* Se o MT5 não estiver aberto, o bot abre-o sozinho (usa `mt5_path` ou procura `terminal64.exe` em Program Files, preferindo pastas com "STARTRADER") e espera até 60 s que ligue à corretora. Marque **Save password** no login para o terminal entrar sozinho.
+* Se o terminal ficar "congelado" (sem ticks durante 10 minutos em horário de mercado, com ligação aparentemente activa), o bot fecha esse terminal e volta a abri-lo, **só** se todas as posições do bot tiverem SL e TP. No máximo uma vez a cada 30 minutos, com espera crescente.
+* Recomendado: também copie o atalho do MT5 para a pasta de arranque (Windows+R, `shell:startup`).
+
+### 12.4 Energia e actualizações do Windows
+
+1. Impedir suspensão e hibernação, num `cmd` como administrador:
    ```
    powercfg /change standby-timeout-ac 0
    powercfg /change hibernate-timeout-ac 0
    powercfg /hibernate off
    ```
    **Sucesso:** os comandos terminam sem mensagens.
+2. **Definições > Windows Update > Opções avançadas > Horas de atividade:** cubra o seu horário de negociação.
+3. Use uma **UPS** para o PC e o router e, se possível, uma internet de reserva (router 4G). O bot reconecta-se sozinho (5 s até 120 s) e, com o supervisor e o arranque automático, recupera de reinícios.
 
-### 11.5 Windows Update
+### 12.5 Ficheiro de saúde
 
-1. **Definições > Windows Update > Opções avançadas > Horas de atividade:** escolha **Manualmente** e cubra o seu horário de negociação (máximo 18 horas). O Windows evita reiniciar dentro dessa janela.
-2. Antes de períodos importantes, pode usar **Pausar atualizações**. Não desligue as actualizações de segurança por tempo indefinido.
+O `health.json` (na pasta do projecto) é reescrito a cada minuto com: hora do último ciclo, hora do último tick, capital, posições abertas, campeão por símbolo, paragens activas e estado do optimizador. Pode ser lido por uma ferramenta de monitorização externa. `python mt5_bot.py --status` mostra-o formatado.
 
-### 11.6 Energia e internet
+### 12.6 Notificações Telegram (opcional)
 
-* Use uma **UPS** (unidade de alimentação ininterrupta) para o PC e o router: cortes de energia são frequentes e um corte desliga tudo.
-* Tenha uma **internet de reserva** (por exemplo um router 4G com comutação automática, ou partilha de dados do telemóvel). O bot reconecta-se sozinho, com espera crescente de 5 s até 120 s.
-* Mesmo assim, verifique o `bot.log` e o MT5 pelo menos uma vez por dia. Em alternativa, considere um servidor virtual Windows (VPS) perto do servidor da corretora.
+1. No Telegram, fale com **@BotFather**, envie `/newbot` e siga as instruções. Guarde o **token** (algo como `123456789:AA...`).
+2. Envie qualquer mensagem ao seu novo bot. Depois abra no navegador (troque `<TOKEN>`):
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   e copie o número em `"chat":{"id":...}`. Esse é o **chat id**.
+3. Grave os dois valores como variáveis de ambiente (nunca em ficheiros do projecto):
+   ```
+   setx TELEGRAM_BOT_TOKEN "123456789:AA-o-seu-token"
+   setx TELEGRAM_CHAT_ID "123456789"
+   ```
+   **Sucesso:** `SUCCESS: Specified value was saved.` (ou `ÊXITO: ...`).
+4. No `config.json`: `"telegram_enabled": true`. Feche e abra um **novo** `cmd` e reinicie o bot.
+
+Mensagens enviadas: arranque e paragem (incluindo se a conta é REAL), promoções e despromoções com motivo, resumo diário, disjuntor de drawdown, limite diário, kill switch, terminal reiniciado, deslizamento excessivo, erros repetidos e o disjuntor de reinícios do supervisor. O token nunca é escrito no registo.
 
 ---
 
-## 12. Passar a conta real (só depois de validar)
+## 13. Operações do dia a dia
 
-Lista de verificação. Só avance se puder marcar todos os pontos:
+| Quero... | Como | O que acontece às posições |
+|---|---|---|
+| Parar com calma | **Ctrl+C** na janela do bot (ou do supervisor). | Ficam abertas, protegidas por SL/TP no servidor. |
+| Parar e fechar tudo (emergência) | `cd /d C:\mt5-bot` e `type nul > KILL` | O bot fecha **as suas** posições (não toca nas outras) e termina. O supervisor não o reinicia. |
+| Voltar a usar depois do kill switch | `del KILL` e arranque de novo. | Enquanto o `KILL` existir, o bot fecha as posições e sai sempre que arrancar. |
+| Pausar novas entradas sem parar | `"dry_run": true` no `config.json` (recarga automática). | As posições existentes continuam com SL/TP e gestão normal. |
+| Desfazer uma troca de estratégia | `python mt5_bot.py --history`, escolha o número da decisão que instalou o campeão pretendido e `python mt5_bot.py --rollback 7` | O bot em funcionamento adopta-o na vela seguinte. Fica registado como `ROLLBACK`. |
+| Retomar depois do disjuntor de drawdown | Leia `state\<conta>\RESUME_REQUIRED.txt`, perceba o que aconteceu e depois `python mt5_bot.py --resume` (ou apague esse ficheiro). | O pico de capital recomeça no capital desse momento. |
 
-- [ ] 2 a 3 meses em demo, com as métricas da secção 9 registadas e aceitáveis.
-- [ ] Percebe o significado de todas as linhas do `bot.log` e não há erros por explicar.
-- [ ] Testou o kill switch, o Ctrl+C e o limite de perda diária em demo.
-- [ ] Testou um reinício do PC e uma falha de internet (desligar o router) e o bot recuperou.
-- [ ] Sabe que spreads, comissões e execução numa conta real podem ser diferentes da demo.
-- [ ] Usa na conta real o mesmo tipo de conta (e os mesmos nomes de símbolos) que validou em demo, ou corrigiu `symbols`.
-- [ ] Vai usar apenas capital que pode perder na totalidade.
+Com várias contas com estado, os comandos `--history`, `--rollback` e `--resume` usam a conta registada no `health.json`. Para escolher outra: `--account STARTRADER-Demo_12345678`.
 
-Passos:
+**O disjuntor de drawdown:** se o capital cair mais de `max_drawdown_from_peak_pct` (12% por omissão) face ao pico registado, o bot fecha todas as suas posições, deixa de abrir novas, notifica e cria `RESUME_REQUIRED.txt`. Nem um novo dia, nem um reinício, nem uma estratégia o desligam: é o único ponto em que uma pessoa tem de intervir, de propósito. Depósitos e levantamentos são detectados e não contam como lucro nem como drawdown.
 
-1. Deposite um **montante pequeno**.
-2. **Teste um levantamento cedo**: peça o levantamento de uma pequena parte, para confirmar que o processo funciona e quanto tempo demora, antes de aumentar o capital.
-3. No `config.json`:
-   * mude `"allow_live": false` para `"allow_live": true`;
-   * **reduza o risco**: por exemplo `"risk_per_trade_pct": 0.25` e `"max_daily_loss_pct": 1.0`.
-4. Entre na conta real no MT5 (**File > Login to Trade Account**).
-5. Primeiro, um dia em dry-run na conta real:
-   ```
-   python mt5_bot.py --dry-run
-   ```
-   **Sucesso:** a linha `Connected:` mostra `(REAL, ...)` e `mode=DRY RUN`.
-6. Depois, arranque normalmente (`python mt5_bot.py` ou `start_bot.bat`). Acompanhe de perto nas primeiras semanas.
-
-Se o terminal mudar de conta enquanto o bot corre, o bot pára com o código 3 por segurança.
+**O limite diário:** ao perder `max_daily_loss_pct_*` desde o início do dia do servidor, fecha as posições do bot e pára até ao dia seguinte (recomeça sozinho).
 
 ---
 
-## 13. Credenciais por variáveis de ambiente
+## 14. Adicionar uma estratégia e ajustar limites
 
-**Por omissão não precisa de nada disto:** o bot usa a conta que já tem sessão iniciada no terminal. As variáveis de ambiente servem para o bot iniciar sessão numa conta específica.
+### 14.1 Uma estratégia nova é um ficheiro
 
-1. Num `cmd` (substitua os valores; mantenha as aspas):
+1. Crie `mt5bot\strategies\a_minha.py`:
+
+```python
+"""Exemplo: rompimento de N velas confirmado pela EMA. Sem vantagem comprovada."""
+
+import numpy as np
+
+from .. import indicators
+from .base import Param, Params, Strategy, crosses_above, crosses_below, sides_from
+from .registry import register
+
+
+@register
+class AMinha(Strategy):
+    name = "a_minha"
+    description = "Rompimento de N velas na direcção da EMA longa."
+    param_space = (
+        Param.int_range("lookback", 20, 60, 10),
+        Param.int_range("trend_ema", 100, 200, 50),
+        Param.float_range("sl_mult", 1.5, 3.0, 0.5),
+        Param.float_range("tp_mult", 2.0, 4.0, 0.5),
+    )
+
+    def warmup_bars(self, params: Params) -> int:
+        return 3 * int(params["trend_ema"]) + 2
+
+    def compute(self, bars: np.ndarray, params: Params) -> np.ndarray:
+        close = np.asarray(bars["close"], dtype=float)
+        trend = indicators.ema(close, int(params["trend_ema"]))
+        upper = indicators.rolling_max_prev(bars["high"], int(params["lookback"]))
+        lower = indicators.rolling_min_prev(bars["low"], int(params["lookback"]))
+        with np.errstate(invalid="ignore"):
+            buy = crosses_above(close, upper) & (close > trend)
+            sell = crosses_below(close, lower) & (close < trend)
+        return sides_from(buy, sell)
+```
+
+2. Regras do contrato: `compute` recebe **só velas fechadas** e devolve, para cada vela, `+1` (compra), `-1` (venda) ou `0`; o valor da vela `i` só pode usar dados até `i` (sem olhar para o futuro); nada de rede, ficheiros ou ordens. SL e TP são `ATR(14) x sl_mult` e `ATR(14) x tp_mult`, e tudo o resto (volume, filtros, limites) é da camada de risco.
+3. Corra os testes. Os testes de contrato em `tests\test_strategies.py` (determinismo, ausência de lookahead, limites de parâmetros) passam a correr automaticamente para a nova estratégia. No fim desse ficheiro há um modelo para um teste específico.
+   ```
+   pytest -q tests\test_strategies.py
+   ```
+4. A estratégia entra no próximo ciclo de optimização (se `enabled_strategies` for `null` ou a incluir).
+
+### 14.2 Ajustar limites de parâmetros com segurança
+
+* Mantenha poucos valores por parâmetro. Cada valor extra aumenta o número de combinações, a penalização por tentativas e o risco de sobre-optimização.
+* Prefira limites com significado (por exemplo períodos que cobrem de uma sessão a uma semana) a intervalos enormes.
+* `sl_mult` e `tp_mult` têm de ficar dentro dos limites rígidos de `mt5bot\limits.py` (0.5 a 6 e 0.5 a 10); os testes falham se não ficarem.
+* Depois de alterar, corra `pytest -q` e `python mt5_bot.py --backtest --offline` para ver o efeito nos portões, sem promover nada.
+
+---
+
+## 15. Credenciais por variáveis de ambiente
+
+**Por omissão não precisa disto:** o bot usa a conta já com sessão iniciada no terminal. As variáveis servem para o bot entrar numa conta específica.
+
+1. Num `cmd`:
    ```
    setx MT5_LOGIN "12345678"
    setx MT5_PASSWORD "a-sua-palavra-passe"
-   setx MT5_SERVER "NomeDoServidor-Demo"
+   setx MT5_SERVER "STARTRADER-Demo"
    ```
-   **Sucesso:** cada comando responde `SUCCESS: Specified value was saved.` (ou `ÊXITO: ...` num Windows em português).
-2. Feche e abra um **novo** `cmd` (o `setx` não altera a janela actual). Verifique, sem mostrar a palavra-passe:
-   ```
-   echo %MT5_LOGIN% %MT5_SERVER%
-   ```
-3. Tem de definir as **três** variáveis ou nenhuma. Se só existir parte delas, o bot recusa arrancar.
+2. Feche e abra um **novo** `cmd`. Verifique sem mostrar a palavra-passe: `echo %MT5_LOGIN% %MT5_SERVER%`.
+3. Defina as **três** ou nenhuma; só uma parte faz o bot recusar arrancar.
 4. Para remover:
    ```
    reg delete HKCU\Environment /v MT5_LOGIN /f
@@ -435,118 +612,75 @@ Se o terminal mudar de conta enquanto o bot corre, o bot pára com o código 3 p
    reg delete HKCU\Environment /v MT5_SERVER /f
    ```
 
-Porque não pôr a palavra-passe no `config.json` ou noutro ficheiro do projecto: os ficheiros são copiados, enviados por e-mail, guardados em cópias de segurança e partilhados (por exemplo num repositório Git) com facilidade, e a palavra-passe vai junto. O bot nunca escreve a palavra-passe no registo e mascara o número de conta.
-
-Limitações honestas: o `setx` guarda os valores **em texto simples** no registo do Windows do seu utilizador (`HKCU\Environment`), legível por qualquer programa que corra com a sua conta. Proteja a sua conta do Windows com palavra-passe. Se a palavra-passe da corretora tiver caracteres especiais do `cmd` (`%`, `^`, `&`, `"`, `<`, `>`, `|`), o `setx` pode gravá-la mal; nesse caso, prefira usar a sessão já iniciada no terminal.
+O `setx` guarda os valores em texto simples no registo do Windows do seu utilizador. Proteja a sua conta do Windows. Nunca ponha palavras-passe ou tokens no `config.json` nem noutros ficheiros do projecto: o bot nunca os lê de ficheiros e nunca os escreve no registo.
 
 ---
 
-## 14. Substituir a estratégia
+## 16. Backtest e optimização manual
 
-O resto do bot não depende da estratégia: só chama a função `generate_signal` uma vez por cada nova vela fechada de cada símbolo.
+Nenhum destes comandos envia ordens nem altera o campeão por si só.
 
-### 14.1 Contrato
-
-```python
-def generate_signal(closed_bars: np.ndarray, cfg: Config) -> Optional[Signal]:
-```
-
-* **Entrada `closed_bars`:** array estruturado do numpy, devolvido pelo MT5, com **apenas velas fechadas**, da mais antiga para a mais recente (`closed_bars[-1]` é a última vela fechada). A vela em formação nunca é incluída. Tem até `bars` velas.
-* **Entrada `cfg`:** a configuração (só de leitura).
-* **Saída:** `Signal("BUY", atr)`, `Signal("SELL", atr)` ou `None`. `atr` é uma distância de referência **em preço** (por exemplo `0.0012` em EURUSD): o SL fica a `atr * sl_atr_mult` e o TP a `atr * tp_atr_mult` do preço de entrada. Tem de ser positivo.
-* **Regras:** não envie ordens, não leia ficheiros nem a rede, não use dados futuros, seja rápida e determinística. O volume, o SL, o TP e todos os filtros são tratados pelo bot.
-
-Campos de cada vela:
-
-| Campo | Tipo | Significado |
-|---|---|---|
-| `time` | inteiro | Abertura da vela, em segundos, na hora do servidor da corretora |
-| `open` | decimal | Preço de abertura (bid) |
-| `high` | decimal | Máximo |
-| `low` | decimal | Mínimo |
-| `close` | decimal | Fecho |
-| `tick_volume` | inteiro | Número de ticks na vela |
-| `spread` | inteiro | Spread em pontos |
-| `real_volume` | inteiro | Volume negociado real (em forex e CFD costuma ser 0) |
-
-Acesso: `closed_bars["close"]` devolve um array com todos os fechos; `closed_bars["high"][-1]` é o máximo da última vela fechada.
-
-### 14.2 Exemplo mínimo
-
-Substitua a função `generate_signal` no `mt5_bot.py` por, por exemplo, um rompimento de 20 velas (também **sem vantagem comprovada**):
-
-```python
-def generate_signal(closed_bars: np.ndarray, cfg: Config) -> Optional[Signal]:
-    """20-bar breakout. Example only: no proven edge."""
-    lookback = 20
-    if len(closed_bars) < max(lookback, cfg.atr_period) + 2:
-        return None
-    high = closed_bars["high"]
-    low = closed_bars["low"]
-    close = closed_bars["close"]
-    last_atr = float(atr(high, low, close, cfg.atr_period)[-1])
-    if not np.isfinite(last_atr) or last_atr <= 0:
-        return None
-    if close[-1] > high[-lookback - 1:-1].max():
-        return Signal("BUY", last_atr)
-    if close[-1] < low[-lookback - 1:-1].min():
-        return Signal("SELL", last_atr)
-    return None
-```
-
-Notas:
-
-* As chaves `fast_ema` e `slow_ema` continuam a ser validadas mesmo que a sua estratégia não as use. Para novos parâmetros, acrescente campos à classe `Config` e regras em `validate()`.
-* Os testes da estratégia de exemplo em `tests/test_bot.py` (classe `TestStrategy`) vão falhar; substitua-os por testes da sua estratégia.
-* **Faça backtest antes de usar**, com dados fora da amostra (out-of-sample): optimize os parâmetros num período e avalie-os noutro período que não usou, incluindo spread, comissões e swaps. O Strategy Tester do MT5 só testa Expert Advisors em MQL5, não código Python; pode obter histórico com `mt5.copy_rates_range` e simular a sua função. Desconfie de resultados demasiado bons: geralmente indicam sobre-optimização (overfitting).
+* Relatório walk-forward fora da amostra de todas as estratégias, com o motivo de cada recusa (liga-se ao MT5 para actualizar o histórico):
+  ```
+  python mt5_bot.py --backtest
+  ```
+  Com `--offline` usa só o histórico já guardado. O relatório fica também em `reports\<conta>\backtest_*.txt`.
+* Uma estratégia com parâmetros fixos sobre todo o histórico (resultado **dentro da amostra**, não é validação):
+  ```
+  python mt5_bot.py --backtest --offline --strategy donchian --params "{\"channel\": 50, \"sl_mult\": 2.0, \"tp_mult\": 3.0}"
+  ```
+* Um ciclo de optimização agora (os resultados ficam no registo e um bot em funcionamento adopta os sobreviventes como desafiantes em sombra):
+  ```
+  python mt5_bot.py --optimize-once
+  ```
 
 ---
 
-## 15. Resolução de problemas
+## 17. Resolução de problemas
 
 | Sintoma / mensagem | Causa provável | Solução |
 |---|---|---|
-| `mt5.initialize() failed: (-10003, 'IPC initialize failed, ...')` | MT5 fechado ou ainda a arrancar; Python de 32 bits; vários terminais instalados; MT5 e Python a correr com permissões diferentes (um como administrador e o outro não). | Abra o MT5 e espere que ligue. Confirme 64 bits (secção 2). Defina `mt5_path`. Corra os dois com o mesmo nível de permissões. |
-| `mt5.initialize() failed: (-6, 'Terminal: Authorization failed')` | Credenciais erradas nas variáveis de ambiente. | Corrija `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` (secção 13) ou remova-as. |
-| `Algo Trading is disabled in the terminal` | Botão Algo Trading vermelho ou opção desligada. | Secção 5, passos 1 e 2. |
-| `Trading is not allowed on this account` | Sessão iniciada com a palavra-passe de investidor (só leitura). | Volte a entrar com a palavra-passe de negociação. |
-| `Symbol 'EURUSD' not found` | O nome do símbolo tem sufixo ou não existe nessa conta. | Secção 5, passos 3 e 4; copie o nome exacto para `symbols`. |
-| `Refusing to trade: this is a REAL account and allow_live is false` | Sessão iniciada numa conta real. | Entre na conta demo. Só mude `allow_live` depois da secção 12. |
-| `Configuration error: ...` | Erro no `config.json` (chave desconhecida, valor fora do intervalo, JSON inválido). | Leia a mensagem: diz qual a chave e o problema. Veja a secção 7. |
-| `State file ... is unreadable or corrupt` | O `bot_state.json` foi editado ou danificado. | Abra o ficheiro e corrija-o, ou apague-o aceitando que o limite diário recomeça a partir do capital actual. |
-| `order_check rejected the order: retcode=... comment=...` | A corretora recusaria a ordem. | Veja o código na tabela seguinte e o texto do comentário. |
-| `no rate data` | Histórico do símbolo ainda não carregado. | Abra um gráfico desse símbolo e período no MT5 e aguarde. Verifique **Max bars in chart** (secção 5, passo 7). |
-| `minimum volume 0.01 would risk ... > allowed ...; skipping` | Com o capital e o SL actuais, até o lote mínimo arriscaria mais do que o permitido. | Comportamento correcto (o bot nunca arredonda para cima). Aumente o capital da demo ou reduza `sl_atr_mult`, ou aceite menos operações. |
-| Nunca abre operações | `dry_run` a `true`; sinais raros; fora do horário; spread acima do limite; volume abaixo do mínimo; limite diário atingido (`halted=True`); já existe posição do bot nesse símbolo. | Procure a razão no registo: `findstr /C:"skipping" /C:"signal" /C:"halt" bot.log`. Lembre-se de que depois de arrancar o bot espera pela vela seguinte. |
-| O bot pára durante a noite | Suspensão ou hibernação do PC; reinício pelo Windows Update; MT5 fechado; kill switch presente; troca de conta (código 3). | Secções 11.4 e 11.5. Veja as últimas linhas do `bot.log` e o código de saída na janela. |
-| `Terminal disconnected ...; reconnecting in 5s` | Perda de internet ou MT5 fechado. | O bot tenta de novo sozinho (5 s, 10 s, 20 s... até 120 s). Se persistir, verifique a internet e o MT5. |
+| Não abre nenhuma operação | **Modo de observação** (sem campeão ainda), **NoTrade** (nada passou os portões), `dry_run` activo, fora de `trading_hours_server`, spread alto, paragem diária ou de drawdown activa, já existe posição do bot nesse símbolo, lote mínimo arriscaria demais. | `python mt5_bot.py --status` mostra a linha de estado e as paragens. Depois `findstr /C:"OBSERVATION" /C:"NO TRADE" /C:"rejected" /C:"no trade:" bot.log`. Na maior parte dos casos é o comportamento pretendido. |
+| `REAL MONEY account ... one deliberate confirmation` (código 3) | Conta real sem confirmação. | Secção 8.2. |
+| `account_mode is "demo_only" but ...` (código 3) | A conta não corresponde ao `account_mode`. | Mude de conta no terminal ou ajuste `account_mode`. |
+| `mt5.initialize() failed: (-10003, 'IPC initialize failed ...')` | MT5 fechado ou a arrancar; Python de 32 bits; vários terminais; permissões diferentes (um como administrador). | Abra o MT5 e espere que ligue. Confirme 64 bits. Defina `mt5_path`. Corra os dois com o mesmo nível de permissões. |
+| O terminal não abre sozinho | `terminal64.exe` instalado fora de Program Files ou várias instalações. | Defina `"mt5_path": "C:\\Program Files\\NOME DA PASTA\\terminal64.exe"` (botão direito no atalho do MT5 > Propriedades > Destino). |
+| `Symbol 'EURUSD' not found (also tried broker suffixes)` | O símbolo tem outro nome ou não existe nessa conta. | Market Watch > Show All; copie o nome exacto para `symbols`. Se houver vários sufixos possíveis, escreva o nome completo (por exemplo `EURUSD.m`). |
+| `Symbol EURUSD resolved to broker name EURUSD.m` | Informativo: o sufixo foi detectado. | Nada a fazer. |
+| Horas erradas nas entradas ou `trading_hours_server` "não funciona" | A janela usa a hora do **servidor**, não a do PC. | Veja `Broker server time offset detected: UTC+2.00 h` no `bot.log` e a hora no cabeçalho do Market Watch. Ajuste a janela à hora do servidor. Com o mercado fechado o desvio não é detectável e o bot usa UTC+2 até chegarem ticks. |
+| `no history returned ... Max bars in chart` | Histórico insuficiente para a optimização. | Secção 6, passo 3; abra um gráfico do símbolo nesse período para o terminal carregar histórico. |
+| `cannot compute exposure (order_calc_margin unavailable)` | O terminal não calculou a margem. | Verifique a ligação; o bot recusa entrar até conseguir medir a exposição (falha em segurança). |
+| `State file ... is unreadable or corrupt` | `risk_state.json` foi editado ou danificado. | Corrija-o ou apague-o aceitando que o limite diário e o pico recomeçam do capital actual. |
+| `Restart circuit breaker` no `supervisor.log` | O bot falhou 5 vezes em 30 minutos. | Veja o fim do `bot.log`, corrija a causa e arranque de novo `start_supervisor.bat`. |
+| `config.json changed but is invalid; keeping the previous config` | Erro de escrita no ficheiro. | A mensagem diz a chave e o problema; corrija. O bot continua com a configuração anterior. |
 
 Códigos de retorno (retcode) mais comuns:
 
 | Código | Nome | Significado e o que fazer |
 |---|---|---|
-| 10004 | Requote | O preço mudou. O bot tenta de novo até 3 vezes com preço actualizado. |
-| 10006 | Request rejected | A corretora recusou o pedido. Leia o comentário; tente mais tarde ou contacte o suporte. |
-| 10014 | Invalid volume | Volume fora do mínimo/máximo/passo do símbolo. Veja **Specification** do símbolo. |
-| 10015 | Invalid price | Preço inválido, muitas vezes por mercado muito rápido ou símbolo sem cotação. |
-| 10016 | Invalid stops | SL ou TP demasiado perto do preço (`Stops level`). O bot já verifica; se acontecer, aumente `sl_atr_mult`/`tp_atr_mult`. |
-| 10018 | Market is closed | Mercado fechado (fim de semana, feriado, sessão do símbolo). Ajuste `trading_hours_server`. |
-| 10019 | No money | Margem insuficiente. Reduza o risco ou o número de posições, ou aumente o capital. |
-| 10027 | AutoTrading disabled by client | Algo Trading desligado no terminal. Secção 5, passos 1 e 2. |
-| 10030 | Unsupported filling mode | Modo de preenchimento não suportado. O bot escolhe IOC, FOK ou RETURN conforme o símbolo; se persistir, reporte o valor de `filling_mode` do símbolo à corretora. |
+| 10004 | Requote | O preço mudou. O bot repete até 3 vezes com preço novo. |
+| 10006 | Request rejected | A corretora recusou. Leia o comentário; se persistir, contacte o suporte. |
+| 10014 | Invalid volume | Volume fora do mínimo, máximo ou passo do símbolo. Veja **Specification**. |
+| 10015 | Invalid price | Preço inválido, muitas vezes mercado muito rápido ou símbolo sem cotação. |
+| 10016 | Invalid stops | SL/TP perto demais do preço. O bot já respeita o `Stops level`; se acontecer, a corretora alterou-o. |
+| 10018 | Market is closed | Mercado fechado. O bot espera 15 minutos antes de tentar de novo nesse símbolo. |
+| 10019 | No money | Margem insuficiente. Reduza o risco ou o número de posições. |
+| 10027 | AutoTrading disabled by client | Algo Trading desligado no terminal (secção 6). |
+| 10030 | Unsupported filling mode | O bot escolhe IOC, FOK ou RETURN conforme o símbolo; se persistir, reporte o `filling_mode` à corretora. |
 
-Códigos de saída do bot (aparecem na janela do `start_bot.bat`):
+Códigos de saída do bot:
 
 | Código | Significado |
 |---|---|
-| 0 | Saída normal (Ctrl+C ou kill switch com todas as posições fechadas). |
-| 1 | Erro inesperado, ou kill switch sem conseguir fechar todas as posições (ficam protegidas por SL/TP). |
-| 2 | Falha no arranque (configuração, ligação, Algo Trading, conta real recusada, símbolo inexistente). |
-| 3 | Paragem de segurança em execução (o terminal passou para uma conta real não autorizada ou para outra conta). |
+| 0 | Saída normal (Ctrl+C, kill switch com posições fechadas, contagem cancelada). |
+| 1 | Erro inesperado, ou kill switch sem conseguir fechar tudo (as posições ficam com SL/TP). O supervisor reinicia. |
+| 2 | Falha no arranque (configuração, ligação, Algo Trading, símbolo). O supervisor reinicia com espera. |
+| 3 | Paragem de segurança: conta real sem confirmação, `account_mode` errado, troca de conta ou de tipo de conta durante a execução. O supervisor **não** reinicia. |
+| 4 | (supervisor) Disjuntor de reinícios. |
 
 ---
 
-## 16. Executar os testes
+## 18. Executar os testes
 
 Os testes substituem o pacote `MetaTrader5` por uma versão falsa, por isso **nunca** tocam no terminal nem na conta, e correm também em Linux ou macOS.
 
@@ -557,32 +691,39 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-**Sucesso:** a última linha diz `133 passed in ...s`.
+**Sucesso:** a última linha diz `342 passed in ...` (cerca de 3 a 5 minutos; o teste de passeio aleatório corre a optimização completa em muitas sementes).
+
+O que é verificado, entre outros: política de contas (demo, real, confirmação, código 3, pastas separadas), tectos de risco e todos os comportamentos proibidos, disjuntor de drawdown e `--resume`, ausência de lookahead em todas as estratégias, P&L calculado à mão com spread, comissão e a regra pessimista, **NoTrade em dados de passeio aleatório em praticamente todas as sementes** (mesmo sem custos), descoberta de uma vantagem injectada, promoção com sombra, histerese e cooldown, despromoção, reconciliação e reparação de SL, supervisor e o seu disjuntor, escrita atómica, recarga do `config.json`, e uma simulação ponta a ponta (observação, optimização, promoção, operações, despromoção e nova optimização).
 
 ---
 
-## 17. Pressupostos e limitações
+## 19. Limitações e pressupostos
 
-**Pressupostos**
+**Não verificado sem um terminal MT5 real em Windows** (o código foi desenvolvido e testado em Linux com um MT5 simulado):
 
-* O código foi desenvolvido e testado num ambiente **sem Windows e sem terminal MT5 real**, com um MT5 simulado nos testes. A lógica pura e o comportamento do bot estão testados, mas a interacção real com o terminal e com a corretora **não foi verificada**: valide em dry-run e depois em demo antes de confiar no bot.
-* Os nomes de menus deste guia são os da interface do MT5 em inglês e do Windows em inglês ou português; podem variar ligeiramente com a versão.
-* O `order_check` do MT5 devolve `retcode` 0 quando a ordem é válida (o bot aceita também 10009).
-* As horas das velas e dos ticks do MT5 estão na hora do servidor da corretora. O bot usa a hora do último tick para decidir o horário de negociação e o "dia" do limite de perda diária.
-* O dia do limite de perda diária é o **dia do servidor da corretora**, não o dia local nem UTC. Escolha deliberada: é o dia que a corretora usa para swaps e extractos diários e não depende do fuso horário do PC.
-* As contas do tipo "contest" são tratadas como demo.
-* Python 3.10 a 3.12, 64 bits. O pacote `MetaTrader5` publica também versões para 3.13 e 3.14, mas não são o alvo deste projecto. Os testes foram executados em Python 3.12.
-* Requisitos mínimos: `MetaTrader5>=5.0.5430` (Novembro de 2025) e `numpy>=1.26`.
+* a interacção real com o terminal e a corretora: abertura automática do `terminal64.exe` via `initialize(path=...)`, reinício de um terminal congelado (PowerShell `Stop-Process` filtrado pelo caminho exacto), nomes e valores dos campos devolvidos pela STARTRADER (`trade_tick_value_loss`, `swap_mode`, `margin_mode`, comissões nos negócios);
+* os scripts `install_autostart.ps1`/`.bat` e `start_supervisor.bat` (escritos para Windows 10/11 e PowerShell 5.1, não executados);
+* a baixa prioridade do processo de optimização no Windows (`BELOW_NORMAL_PRIORITY_CLASS`);
+* o caminho de instalação por omissão do MT5 da STARTRADER: o bot procura qualquer pasta de Program Files com `terminal64.exe` e prefere as que contêm "STARTRADER". Se não encontrar, defina `mt5_path`.
 
-**Limitações**
+**Pressupostos e escolhas deliberadas:**
 
-* **Risco por operação:** o volume é calculado com `order_calc_profit` a partir do pior preço de entrada permitido por `deviation_points`. Mesmo assim, a perda real pode exceder o risco configurado por causa de: deslizamento no SL (o SL é executado a mercado), saltos de preço ao fim de semana ou em notícias, alteração da taxa de conversão para a moeda da conta e **comissões**, que o `order_calc_profit` não inclui (em contas com comissão por lote, some-a mentalmente ao risco).
-* **Limite de perda diária:** usa o capital (equity) de **toda a conta**, incluindo operações manuais ou de outros robôs. A base é o capital na primeira vez que o bot vê esse dia do servidor; se arrancar a meio do dia, a base é o capital nesse momento. A perda mede-se face a essa base, não face ao máximo do dia.
-* Com o mercado fechado (sem ticks novos), o "dia" não muda até chegar um tick novo.
-* O horário só se aplica a entradas. As posições podem ficar abertas durante a noite e o fim de semana (swaps, spreads largos no rollover).
-* Uma posição por símbolo por bot. Não corra duas instâncias com o mesmo `magic`; use um `magic` diferente para cada pasta/configuração.
-* Em contas **netting** (uma posição por símbolo na conta), operações manuais no mesmo símbolo misturam-se com as do bot. Use contas **hedging** ou não negoceie manualmente esses símbolos.
-* Depois de arrancar (ou reiniciar), o bot espera pela vela seguinte antes de agir; um sinal que ocorra durante a paragem perde-se.
-* O arranque exige o Algo Trading ligado mesmo em dry-run, para validar a configuração final.
+* As velas do MT5 são preços BID. No backtest a compra paga o spread completo da vela (equivale a meio spread de cada lado do preço médio) e as saídas de vendas usam o ASK (BID + spread da vela).
+* Walk-forward: cada janela de teste fica com as operações **abertas** nela (a saída é resolvida nas velas seguintes); no treino só contam operações abertas **e fechadas** dentro da janela de treino, para que nenhum dado de teste influencie a escolha dos parâmetros.
+* A penalização por tentativas usa o Sharpe deflacionado (Bailey e López de Prado) com o número total de tentativas do ciclo, embora a escolha dos parâmetros seja feita só no treino: é deliberadamente conservador. Com `min_deflated_sharpe` = 0.90 e os restantes portões, é provável que, em dados reais de forex, o bot fique muitas vezes em `NoTrade`. Baixar para 0.80 aceita mais candidatos e mais risco de sobre-optimização.
+* `min_shadow_trades` **ou** `min_shadow_days`: a regra dos dias exige ainda `min_shadow_trades_floor` (10) operações, para não promover com 2 operações em 14 dias.
+* O cooldown de 7 dias conta a partir da última troca (promoção, despromoção ou rollback); a primeira promoção não espera. As despromoções nunca esperam.
+* A sombra calcula os sinais sobre as últimas `bars` velas (1000); indicadores recursivos (EMA) iniciados nessa janela podem diferir minimamente dos do backtest sobre 12 meses.
+* O "dia" dos limites diários é o dia do servidor da corretora. O drawdown e o limite diário usam o capital de **toda a conta** (inclui operações manuais ou de outros robôs).
+* A API Python do MT5 não fornece o horário de sessões de cada símbolo nem um calendário económico: o mercado é considerado aberto quando há ticks a mudar, com fins de semana e `holidays` para a detecção de terminal congelado; o filtro de notícias usa um CSV mantido por si.
+* Swaps positivos são ignorados (pessimista); modos de swap diferentes de "pontos" e "moeda do depósito" contam como zero.
+* Comissões: detectadas no histórico de negócios da conta; sem histórico usa 7 por lote (pessimista). Em contas só com spread defina `"commission_per_lot": 0`.
+* Contas "contest" são tratadas como demo. Python 3.10 a 3.12, 64 bits, `MetaTrader5>=5.0.5430`, `numpy>=1.26`.
+
+**Limitações:**
+
+* Backtests e resultados em sombra são estimativas. O deslizamento real no SL, gaps de fim de semana e notícias, alterações de spread e de execução da corretora podem fazer uma perda real exceder 1R.
+* A qualidade dos dados do terminal (velas em falta, spreads registados) afecta a optimização.
+* A latência de um PC em casa é maior do que a de um servidor junto da corretora; estratégias de períodos curtos sofrem mais.
+* Uma posição por símbolo por bot. Não corra duas instâncias com o mesmo `magic`.
 * Fechar a janela do bot à força não permite uma saída ordenada; prefira Ctrl+C ou o kill switch. As posições continuam protegidas por SL/TP.
-* A estratégia de exemplo não tem vantagem comprovada e serve apenas para demonstração.

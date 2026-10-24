@@ -1,0 +1,144 @@
+"""Daily and weekly plain-text and CSV reports, plus the health file."""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+import numpy as np
+
+from .backtest import longest_losing_streak, max_drawdown, profit_factor
+from .persistence import atomic_write_json, atomic_write_text
+from .registry import Registry, TradeRow
+
+
+def trade_stats(rows: Sequence[TradeRow]) -> dict[str, float]:
+    closed = [r for r in rows if r.status == "closed" and r.r is not None]
+    rs = np.array([r.r for r in closed], dtype=float)
+    pnl = np.array([r.pnl or 0.0 for r in closed], dtype=float)
+    n = len(closed)
+    return {
+        "trades": n,
+        "win_rate": float((rs > 0).mean()) if n else 0.0,
+        "expectancy_r": float(rs.mean()) if n else 0.0,
+        "profit_factor": profit_factor(rs) if n else 0.0,
+        "net_pnl": float(pnl.sum()) if n else 0.0,
+        "max_drawdown_r": max_drawdown(np.cumsum(rs)) if n else 0.0,
+        "max_drawdown_money": max_drawdown(np.cumsum(pnl)) if n else 0.0,
+        "longest_losing_streak": longest_losing_streak(rs.tolist()),
+    }
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def write_report(registry: Registry, out_dir: Path, label: str, since: float, until: float,
+                 account_desc: str, symbols: Sequence[str]) -> Path:
+    """Write <label>.txt, <label>_trades.csv and <label>_equity.csv. Returns the .txt path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    live = [r for r in registry.trades(mode="live", status="closed") if since <= (r.close_ts or 0) < until]
+    shadow = [r for r in registry.trades(mode="shadow", status="closed") if since <= (r.close_ts or 0) < until]
+    points = [p for p in registry.equity_points(since) if p["ts"] < until]
+    stats = trade_stats(live)
+    shadow_stats = trade_stats(shadow)
+
+    lines = [
+        f"MT5 bot report {label}",
+        f"Account: {account_desc}",
+        f"Period: {_fmt_ts(since)} to {_fmt_ts(until)}",
+        "",
+        "LIVE TRADES (closed in the period)",
+        f"  trades: {stats['trades']}",
+        f"  win rate: {stats['win_rate']:.1%}",
+        f"  expectancy: {stats['expectancy_r']:+.3f} R per trade",
+        f"  profit factor: {stats['profit_factor']:.2f}",
+        f"  net P&L: {stats['net_pnl']:.2f}",
+        f"  max drawdown: {stats['max_drawdown_r']:.2f} R ({stats['max_drawdown_money']:.2f})",
+        f"  longest losing streak: {stats['longest_losing_streak']}",
+        "",
+        f"SHADOW TRADES: {shadow_stats['trades']} closed, expectancy {shadow_stats['expectancy_r']:+.3f} R",
+        "",
+    ]
+    if points:
+        first, last = points[0], points[-1]
+        lines.append(f"EQUITY: {first['equity']:.2f} -> {last['equity']:.2f} ({len(points)} snapshots)")
+        lines.append("")
+    lines.append("CHAMPIONS")
+    for symbol in symbols:
+        champ = registry.champion(symbol)
+        lines.append(f"  {symbol}: {champ.describe()} since {_fmt_ts(registry.champion_since(symbol))}")
+        last = next((p for p in registry.promotions(200) if p["symbol"] == symbol
+                     and p["action"] in ("promote", "demote", "rollback")), None)
+        if last is not None:
+            lines.append(f"    why (#{last['id']} {last['action']}): {last['reason']}")
+        else:
+            lines.append("    why: no candidate has passed every gate yet (observation mode)")
+    lines.append("")
+    lines.append("This report describes past results only. It is not a forecast and does not guarantee profit.")
+    txt = out_dir / f"{label}.txt"
+    atomic_write_text(txt, "\n".join(lines) + "\n")
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "mode", "symbol", "param_set_id", "side", "open_utc", "close_utc", "entry", "exit", "sl",
+                     "tp", "volume", "risk_money", "pnl", "r", "ticket", "exit_reason"])
+    for r in live + shadow:
+        writer.writerow([r.id, r.mode, r.symbol, r.param_set_id, r.side, _fmt_ts(r.open_ts), _fmt_ts(r.close_ts),
+                         r.entry, r.exit, r.sl, r.tp, r.volume, r.risk_money, r.pnl, r.r, r.ticket, r.exit_reason])
+    atomic_write_text(out_dir / f"{label}_trades.csv", buf.getvalue())
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["utc", "equity", "balance", "peak", "open_positions"])
+    for p in points:
+        writer.writerow([_fmt_ts(p["ts"]), p["equity"], p["balance"], p["peak"], p["open_positions"]])
+    atomic_write_text(out_dir / f"{label}_equity.csv", buf.getvalue())
+    return txt
+
+
+def write_health(path: Path, payload: dict[str, Any]) -> None:
+    payload = dict(payload)
+    payload["written_utc"] = _fmt_ts(time.time())
+    atomic_write_json(path, payload)
+
+
+def format_health(payload: dict[str, Any]) -> str:
+    """Human-readable --status output."""
+    lines = [
+        f"Health file written: {payload.get('written_utc', '?')}",
+        f"Account: {payload.get('account', '?')}  ({payload.get('account_type', '?')})",
+        f"State folder: {payload.get('state_dir', '?')}",
+        f"Equity: {payload.get('equity', '?')}  peak: {payload.get('peak_equity', '?')}  "
+        f"drawdown: {payload.get('drawdown_pct', '?')}%",
+        f"Open bot positions: {payload.get('open_positions', '?')}",
+        f"Halted: {payload.get('halted') or 'no'}",
+        f"Last loop: {payload.get('last_loop_utc', '?')}   last tick: {payload.get('last_tick_server', '?')}",
+        f"Mode: {'DRY RUN' if payload.get('dry_run') else 'LIVE ORDERS'}",
+        "",
+    ]
+    for symbol, info in (payload.get("symbols") or {}).items():
+        lines.append(f"{symbol}: champion {info.get('champion')}  market {info.get('market')}")
+        lines.append(f"    {info.get('status_line', '')}")
+        perf = info.get("champion_performance") or {}
+        if perf:
+            lines.append(f"    since promotion: live {perf['live_trades']} trades, expectancy "
+                         f"{perf['live_expectancy_r']}R vs out-of-sample {perf['oos_expectancy_r']}R; "
+                         f"shadow {perf['shadow_trades']} trades")
+        for ch in info.get("challengers", []):
+            lines.append(f"    challenger {ch['candidate']}: shadow {ch['shadow_trades']} trades / "
+                         f"{ch['shadow_days']} days, mean {ch['shadow_expectancy_r']:+.3f}R, "
+                         f"evidence {'ok' if ch['enough_evidence'] else 'collecting'}, "
+                         f"consistent {'yes' if ch['consistent'] else 'no'}")
+    opt = payload.get("optimizer") or {}
+    if opt:
+        lines.append("")
+        lines.append(f"Optimizer: {json.dumps(opt, sort_keys=True)}")
+    return "\n".join(lines)
