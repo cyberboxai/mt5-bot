@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from .backtest import CostModel
-from .optimizer import OptimizationResult, OptimizerSettings, optimize_symbol
+from .optimizer import OptimizationResult, OptimizerSettings, hypothesis_params, optimize_symbol
 from .registry import Registry
 from .risk import SymbolSpec
 
@@ -82,6 +82,8 @@ def run_cycle(cfg: Any, registry: Registry, trigger: str, symbols: Optional[Sequ
     risk_pct = cfg.risk_per_trade_pct(is_real)
     equity = float(registry.get_kv("equity") or 10_000.0)
     settings = OptimizerSettings.from_config(cfg, risk_pct, equity)
+    hypotheses = json.loads(registry.get_kv("research_hypotheses") or "[]")
+    extra = hypothesis_params(hypotheses)
     out: list[tuple[str, int, Optional[OptimizationResult]]] = []
     for symbol in symbols:
         run_id = registry.start_run(symbol, trigger)
@@ -97,7 +99,8 @@ def run_cycle(cfg: Any, registry: Registry, trigger: str, symbols: Optional[Sequ
             if len(bars) < 500 or int(bars["time"][-1]) - int(bars["time"][0]) < needed:
                 raise RuntimeError(f"only {len(bars)} cached bars for {symbol}; not enough history for walk-forward")
             result = optimize_symbol(symbol, bars, spec, cost_model(cfg, spec_row[1]), settings,
-                                     cfg.strategy_names(), workers or cfg.optimizer_workers, lower_priority)
+                                     cfg.strategy_names(), workers or cfg.optimizer_workers, lower_priority,
+                                     extra_params=extra)
             registry.finish_run(run_id, result)
             best = result.best
             log.info("%s: optimisation run %d finished in %.0fs, %d trials, best: %s", symbol, run_id,
@@ -108,6 +111,12 @@ def run_cycle(cfg: Any, registry: Registry, trigger: str, symbols: Optional[Sequ
             log.exception("%s: optimisation run %d failed", symbol, run_id)
             registry.fail_run(run_id, f"{type(exc).__name__}: {exc}")
             out.append((symbol, run_id, None))
+    if hypotheses:
+        registry.set_kv("research_hypotheses", "[]")
+        for symbol, run_id, _result in out:
+            registry.log_event(symbol, "research", f"{len(hypotheses)} research hypothesis(es) evaluated in run "
+                               f"{run_id} through the normal walk-forward gates",
+                               {"hypotheses": hypotheses[:20], "run_id": run_id})
     registry.set_kv("last_cycle_finished", str(registry.now()))
     return out
 

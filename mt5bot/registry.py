@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -206,21 +207,70 @@ class TradeRow:
     extra: dict
 
 
+class _Rows:
+    """A fully fetched result, so the connection lock is never held while a caller iterates."""
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self._rows = cursor.fetchall() if cursor.description is not None else []
+        self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+        self._next = 0
+
+    def fetchone(self) -> Any:
+        if self._next >= len(self._rows):
+            return None
+        row = self._rows[self._next]
+        self._next += 1
+        return row
+
+    def fetchall(self) -> list:
+        rows, self._next = self._rows[self._next:], len(self._rows)
+        return rows
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.fetchall())
+
+
+class SerializedConnection:
+    """One sqlite3 connection shared by several threads (the trading loop and the team's
+    supervised agents): every statement runs under a re-entrant lock."""
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, sql: str, args: Sequence[Any] = ()) -> _Rows:
+        with self._lock:
+            return _Rows(self._conn.execute(sql, args))
+
+    def executemany(self, sql: str, rows: Any) -> _Rows:
+        with self._lock:
+            return _Rows(self._conn.executemany(sql, rows))
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
 class Registry:
     # Production: WAL journal. The test suite sets this to False because switching a
     # database to WAL costs a slow fsync on some disks; a dedicated test covers WAL.
     durable = True
+    # Simulation only (a separate process with synthetic data): WAL without fsync per commit.
+    fast_writes = False
 
     def __init__(self, path: Path, clock: Any = time.time) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
-        self.conn = sqlite3.connect(str(self.path), timeout=30, isolation_level=None, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        raw = sqlite3.connect(str(self.path), timeout=30, isolation_level=None, check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self.conn = SerializedConnection(raw, self._lock)
         if self.durable:
             self.conn.execute("PRAGMA journal_mode=WAL")
             # WAL + NORMAL: a power cut can lose the last commit but can never corrupt the database.
-            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA synchronous=OFF" if self.fast_writes else "PRAGMA synchronous=NORMAL")
         else:
             self.conn.execute("PRAGMA synchronous=OFF")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -241,15 +291,16 @@ class Registry:
         return float(self._clock())
 
     @contextmanager
-    def tx(self) -> Iterator[sqlite3.Connection]:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-        except BaseException:
-            self.conn.execute("ROLLBACK")
-            raise
-        else:
-            self.conn.execute("COMMIT")
+    def tx(self) -> Iterator[SerializedConnection]:
+        with self._lock:  # the whole transaction is one critical section
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+            else:
+                self.conn.execute("COMMIT")
 
     # ---- kv
 
@@ -436,7 +487,9 @@ class Registry:
                         json.loads(row["extra_json"] or "{}"))
 
     def trades(self, mode: Optional[str] = None, param_set_id: Optional[int] = None, status: Optional[str] = None,
-               symbol: Optional[str] = None, since: Optional[float] = None) -> list[TradeRow]:
+               symbol: Optional[str] = None, since: Optional[float] = None,
+               limit: Optional[int] = None) -> list[TradeRow]:
+        """Matching trades in id order; ``limit`` keeps only the most recent ones."""
         sql = "SELECT * FROM trades WHERE 1 = 1"
         args: list[Any] = []
         for column, value in (("mode", mode), ("param_set_id", param_set_id), ("status", status), ("symbol", symbol)):
@@ -446,6 +499,10 @@ class Registry:
         if since is not None:
             sql += " AND open_ts >= ?"
             args.append(since)
+        if limit is not None:
+            sql += " ORDER BY id DESC LIMIT ?"
+            args.append(int(limit))
+            return [self._trade(r) for r in reversed(list(self.conn.execute(sql, args)))]
         sql += " ORDER BY id"
         return [self._trade(r) for r in self.conn.execute(sql, args)]
 

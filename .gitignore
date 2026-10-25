@@ -24,3 +24,10 @@ health.json.tmp
 supervisor.log
 supervisor.log.*
 optimizer.log
+
+# v3 runtime files: panel log, simulation and demo state
+panel.log
+panel.log.*
+state_sim/
+state_demo/
+simulation.log

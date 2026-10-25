@@ -41,6 +41,7 @@ def random_walk_results() -> list[dict]:
     return _pool_map(cases)
 
 
+@pytest.mark.slow
 def test_random_walk_returns_notrade_in_nearly_all_seeds(random_walk_results: list[dict]) -> None:
     zero_cost = [r for r in random_walk_results if r["seed"] < 100]
     passed = [r for r in zero_cost if r["best"] is not None]
@@ -50,11 +51,13 @@ def test_random_walk_returns_notrade_in_nearly_all_seeds(random_walk_results: li
     assert all(r["trials"] > 0 for r in zero_cost)
 
 
+@pytest.mark.slow
 def test_random_walk_with_costs_returns_notrade(random_walk_results: list[dict]) -> None:
     costly = [r for r in random_walk_results if r["seed"] >= 100]
     assert all(r["best"] is None for r in costly)
 
 
+@pytest.mark.slow
 def test_injected_edge_is_found() -> None:
     results = _pool_map([(seed, 0.15, False) for seed in range(3)])
     for r in results:

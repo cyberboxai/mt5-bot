@@ -104,10 +104,10 @@ def write_report(registry: Registry, out_dir: Path, label: str, since: float, un
     return txt
 
 
-def write_health(path: Path, payload: dict[str, Any]) -> None:
+def write_health(path: Path, payload: dict[str, Any], durable: bool = True) -> None:
     payload = dict(payload)
     payload["written_utc"] = _fmt_ts(time.time())
-    atomic_write_json(path, payload)
+    atomic_write_json(path, payload, durable)
 
 
 def format_health(payload: dict[str, Any]) -> str:
@@ -142,3 +142,66 @@ def format_health(payload: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"Optimizer: {json.dumps(opt, sort_keys=True)}")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ HTML report (v3)
+
+
+def _esc(value: Any) -> str:
+    import html
+
+    return html.escape(str(value), quote=True)
+
+
+def write_html_report(registry: Registry, office: Any, out_dir: Path, label: str, since: float, until: float,
+                      account_desc: str, symbols: Sequence[str]) -> Path:
+    """Self-contained HTML summary (PT-PT) for the Reporter: trades, decisions, team and advisor."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    live = [r for r in registry.trades(mode="live", status="closed") if since <= (r.close_ts or 0) < until]
+    shadow = [r for r in registry.trades(mode="shadow", status="closed") if since <= (r.close_ts or 0) < until]
+    stats, shadow_stats = trade_stats(live), trade_stats(shadow)
+    decisions = office.dossiers(limit=5000, since_ts=since) if office is not None else []
+    decisions = [d for d in decisions if d["ts"] < until]
+    entered = sum(1 for d in decisions if d["final_action"] == "enter")
+    ablation = office.latest_ablation() if office is not None else None
+    verdict = (ablation or {}).get("payload", {}).get("verdict", "sem dados suficientes")
+    spent = 0.0
+    if office is not None:
+        spent = sum(float(c["cost_usd"]) for c in office.advisor_calls(5000, since_ts=since) if c["ts"] < until)
+    rows = "".join(
+        f"<tr><td>{_esc(r.symbol)}</td><td>{_esc(r.side)}</td><td>{_fmt_ts(r.open_ts)}</td><td>{_fmt_ts(r.close_ts)}"
+        f"</td><td>{r.r:+.2f}</td><td>{(r.pnl or 0):.2f}</td><td>{_esc(r.exit_reason or '')}</td></tr>"
+        for r in live)
+    champions = "".join(f"<li>{_esc(s)}: {_esc(registry.champion(s).describe())}</li>" for s in symbols)
+    text = f"""<!doctype html>
+<html lang="pt-PT"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CYBERBOX Trading Office - relatório {_esc(label)}</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;color:#14202b;background:#f6f8fa}}
+h1{{font-size:22px}} h2{{font-size:17px;margin-top:28px}} table{{border-collapse:collapse;width:100%;background:#fff}}
+td,th{{border:1px solid #d0d7de;padding:6px 8px;text-align:left;font-size:13px}} th{{background:#eaeef2}}
+.kpi{{display:inline-block;margin:6px 16px 6px 0;padding:10px 14px;background:#fff;border:1px solid #d0d7de;border-radius:8px}}
+.note{{font-size:12px;color:#57606a;margin-top:28px}}
+</style></head><body>
+<h1>CYBERBOX Trading Office: relatório {_esc(label)}</h1>
+<p>Conta: {_esc(account_desc)} &middot; Período: {_fmt_ts(since)} a {_fmt_ts(until)}</p>
+<h2>Trades reais fechados</h2>
+<div class="kpi">Trades: {stats['trades']}</div><div class="kpi">Taxa de acerto: {stats['win_rate']:.1%}</div>
+<div class="kpi">Expectativa: {stats['expectancy_r']:+.3f} R</div><div class="kpi">P&amp;L líquido: {stats['net_pnl']:.2f}</div>
+<div class="kpi">Drawdown máx.: {stats['max_drawdown_r']:.2f} R</div>
+<table><tr><th>Símbolo</th><th>Lado</th><th>Abertura</th><th>Fecho</th><th>R</th><th>P&amp;L</th><th>Motivo</th></tr>
+{rows or '<tr><td colspan="7">Sem trades reais fechados no período.</td></tr>'}</table>
+<h2>Trades sombra (validação)</h2>
+<p>{shadow_stats['trades']} fechados, expectativa {shadow_stats['expectancy_r']:+.3f} R.</p>
+<h2>Equipa de especialistas</h2>
+<p>{len(decisions)} reuniões de decisão, {entered} entradas. Ablação: {_esc(verdict)}.</p>
+<h2>Conselheiro Claude</h2>
+<p>Custo estimado no período: {spent:.4f} USD.</p>
+<h2>Campeões</h2><ul>{champions}</ul>
+<p class="note">Este relatório descreve apenas resultados passados. Não é uma previsão e não garante lucro.
+A equipa e o conselheiro só podem reduzir o tamanho base; o bot pode decidir não negociar.</p>
+</body></html>
+"""
+    path = out_dir / f"{label}.html"
+    atomic_write_text(path, text)
+    return path

@@ -81,9 +81,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mt5bot.backtest import CostModel  # noqa: E402  (imported after the stub is installed)
 from mt5bot.config import Config  # noqa: E402
 from mt5bot.risk import SymbolSpec  # noqa: E402
+from mt5bot.officedb import OfficeStore  # noqa: E402
 from mt5bot.registry import Registry  # noqa: E402
 
 Registry.durable = False  # see Registry.durable; test_autonomy covers the WAL mode
+OfficeStore.durable = False
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption("--runslow", action="store_true", default=False,
+                     help="also run the long tests marked @pytest.mark.slow")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: long-running test, skipped unless --runslow is given")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--runslow"):
+        return
+    skip = pytest.mark.skip(reason="slow test: run with pytest --runslow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
 
 RATES_DTYPE = np.dtype(
     [
@@ -397,11 +417,17 @@ def make_bot(fake_mt5: FakeMT5, make_cfg, waits: list[float], tmp_path: Path):
     def factory(cfg: Optional[Config] = None, source: Any = "default", env: Optional[dict] = None,
                 **kwargs: Any) -> Bot:
         bot_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in ("confirm_real_money", "monotonic", "utc_now",
-                                                                       "spawn", "globber", "terminal_killer")}
+                                                                       "spawn", "globber", "terminal_killer",
+                                                                       "advisor", "no_claude")}
+        if isinstance(kwargs.get("team"), bool):  # Bot(team=False) switches the team off; a dict is config
+            bot_kwargs["team"] = kwargs.pop("team")
+        if "team_mode" in kwargs:
+            kwargs["team"] = {"team_mode": kwargs.pop("team_mode")}
         cfg = cfg or make_cfg(**kwargs)
         signal_source = FixedSource() if source == "default" else source
+        bot_kwargs.setdefault("globber", lambda pattern: [])
         bot = Bot(cfg, api=fake_mt5, wait=waits.append, env=env or {}, signal_source=signal_source,
-                  config_path=str(tmp_path / "config.json"), globber=lambda pattern: [], **bot_kwargs)
+                  config_path=str(tmp_path / "config.json"), **bot_kwargs)
         created.append(bot)
         return bot
 
