@@ -50,5 +50,9 @@
   "reports_dir": "reports",
   "health_file": "health.json",
   "log_file": "bot.log",
-  "mt5_path": null
+  "mt5_path": null,
+
+  "team": {"team_mode": "auto"},
+  "claude": {"enabled": false, "max_calls_per_hour": 20, "max_daily_cost_usd": 0.5, "latency_budget_ms": 1500},
+  "panel": {"enabled": true, "host": "127.0.0.1", "port": 8765, "control_actions_enabled": false}
 }

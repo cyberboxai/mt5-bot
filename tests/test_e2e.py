@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 
 from conftest import FakeMT5, synthetic_bars
 from mt5bot.bot import Bot
@@ -84,6 +85,7 @@ class InlineProcess:
         return 0
 
 
+@pytest.mark.slow
 def test_bootstrap_promotion_live_trading_and_demotion(tmp_path: Path) -> None:
     history = synthetic_bars(24 * 365, seed=201, trend=0.15)
     cfg = Config.from_dict({

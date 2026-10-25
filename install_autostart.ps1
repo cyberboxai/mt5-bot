@@ -5,8 +5,12 @@
 param(
     [string]$TaskName = "MT5 Bot Supervisor",
     [string]$BotArgs = "",
-    [int]$DelayMinutes = 1
+    [int]$DelayMinutes = 1,
+    [switch]$NoPanel
 )
+# The supervisor also starts the CYBERBOX panel (python -m panel) when "panel.enabled" is true
+# in config.json (the default). -NoPanel starts only the bot.
+if ($NoPanel) { $BotArgs = ("$BotArgs --no-panel").Trim() }
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -42,4 +46,5 @@ Write-Host "Task '$TaskName' registered."
 Write-Host "  Program : $Launcher $BotArgs"
 Write-Host "  Start in: $ProjectDir"
 Write-Host "  Trigger : at logon of $User, delayed $DelayMinutes minute(s)"
+if ($NoPanel) { Write-Host "  Panel   : not started (-NoPanel)" } else { Write-Host "  Panel   : started by the supervisor when panel.enabled is true (http://127.0.0.1:8765/)" }
 Write-Host "Test it now with: schtasks /Run /TN `"$TaskName`""

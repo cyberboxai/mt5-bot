@@ -7,10 +7,13 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from . import limits
+from .config_blocks import (BLOCKS, ClaudeConfig, NewsConfig, NotificationsConfig, PanelConfig, TeamConfig,
+                            parse_block)
 
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4")
 TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
@@ -32,7 +35,7 @@ REMOVED_KEYS = {
 # Keys whose change needs a restart: identity, account policy and storage locations.
 RESTART_KEYS = frozenset({
     "symbols", "timeframe", "magic", "account_mode", "real_money_confirmed", "state_root",
-    "reports_dir", "health_file", "log_file", "mt5_path", "kill_switch_file",
+    "reports_dir", "health_file", "log_file", "mt5_path", "kill_switch_file", "panel",
 })
 
 # Safety keys may be hot reloaded only in the stricter direction; loosening needs a restart.
@@ -178,6 +181,13 @@ class Config:
     mt5_path: Optional[str] = None
     mt5_init_timeout_ms: int = 60000
 
+    # ---- v3 blocks (see config_blocks.py): optional advisor, team, news, panel, notifications
+    claude: ClaudeConfig = dc_field(default_factory=ClaudeConfig)
+    team: TeamConfig = dc_field(default_factory=TeamConfig)
+    news: NewsConfig = dc_field(default_factory=NewsConfig)
+    panel: PanelConfig = dc_field(default_factory=PanelConfig)
+    notifications: NotificationsConfig = dc_field(default_factory=NotificationsConfig)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Config":
         if not isinstance(data, Mapping):
@@ -197,6 +207,9 @@ class Config:
         for key in ("symbols", "trading_hours_server", "enabled_strategies", "holidays"):
             if isinstance(values.get(key), list):
                 values[key] = tuple(values[key])
+        for block in BLOCKS:
+            if block in values:
+                values[block] = parse_block(block, values[block])
         cfg = cls(**values)
         cfg.validate()
         return cfg
@@ -304,6 +317,11 @@ class Config:
         if self.mt5_path is not None:
             _check_text("mt5_path", self.mt5_path)
         _check_int("mt5_init_timeout_ms", self.mt5_init_timeout_ms, minimum=1000, maximum=600000)
+        for block, cls in BLOCKS.items():
+            value = getattr(self, block)
+            if not isinstance(value, cls):
+                raise ValueError(f"{block} must be a JSON object")
+            value.validate()
 
     def _validate_engine(self) -> None:
         from .strategies import library_names
@@ -370,6 +388,27 @@ def in_trading_hours(hour: int, window: tuple[int, int]) -> bool:
     if start < end:
         return start <= hour < end
     return hour >= start or hour < end
+
+
+def apply_overrides(cfg: Config, overrides: Mapping[str, Any]) -> Config:
+    """Apply CLI overrides. Keys are field names, or ``block.field`` for the v3 blocks
+    (for example ``claude.enabled`` or ``team.team_mode``), so a hot reload keeps the rest
+    of a block from the file while the override still wins."""
+    top: dict[str, Any] = {}
+    nested: dict[str, dict[str, Any]] = {}
+    for key, value in overrides.items():
+        if "." in key:
+            block, name = key.split(".", 1)
+            if block not in BLOCKS:
+                raise ValueError(f"unknown config block in override {key!r}")
+            nested.setdefault(block, {})[name] = value
+        else:
+            top[key] = value
+    for block, values in nested.items():
+        top[block] = dataclasses.replace(getattr(cfg, block), **values)
+    merged = dataclasses.replace(cfg, **top) if top else cfg
+    merged.validate()
+    return merged
 
 
 def reload_decision(old: Config, new: Config) -> tuple[Config, list[str]]:

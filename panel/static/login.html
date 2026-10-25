@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="pt-PT" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CYBERBOX Trading Office</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script type="module" src="/static/js/login.js"></script>
+</head>
+<body>
+  <main class="login">
+    <section class="card">
+      <h1>CYBERBOX Trading Office</h1>
+      <p class="small muted">Acesso remoto: introduza o token do painel (variável de ambiente MT5BOT_PANEL_TOKEN no PC do bot).
+        Prefira um túnel SSH ou uma VPN em vez de expor a porta.</p>
+      <form id="login-form">
+        <label class="small" for="token">Token do painel</label>
+        <input id="token" type="password" autocomplete="current-password" required>
+        <p class="small" id="login-msg" aria-live="polite"></p>
+        <button class="btn primary" type="submit">Entrar</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

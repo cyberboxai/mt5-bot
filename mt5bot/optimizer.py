@@ -161,13 +161,19 @@ def _neighbor_ok(trades: Sequence[Trade]) -> bool:
 
 
 def evaluate_strategy(strategy: Strategy, bars: np.ndarray, spec: SymbolSpec, costs: CostModel,
-                      settings: OptimizerSettings, trials: int, total_trials: int, symbol: str) -> CandidateResult:
+                      settings: OptimizerSettings, trials: int, total_trials: int, symbol: str,
+                      extra_params: Sequence[dict] = ()) -> CandidateResult:
     """Walk-forward evaluation of one strategy family. Pure function of its inputs (deterministic)."""
     gates = settings.gates
     times = bars["time"].astype(np.int64)
     windows = walk_forward_windows(times, settings.train_months, settings.test_months, settings.step_months)
     rng = np.random.default_rng([settings.seed, zlib.crc32(strategy.name.encode()), zlib.crc32(symbol.encode())])
     param_sets = strategy.sample_params(rng, trials)
+    # Research hypotheses (vetted grid values) join the SAME walk-forward and gates; they are
+    # counted in total_trials, so the multiple-testing penalty grows with them.
+    for extra in extra_params:
+        if extra not in param_sets:
+            param_sets.append(extra)
     reasons: list[str] = []
     if not windows or not param_sets:
         return CandidateResult(strategy.name, strategy.default_params(), False,
@@ -274,9 +280,9 @@ def evaluate_strategy(strategy: Strategy, bars: np.ndarray, spec: SymbolSpec, co
 
 
 def _task(args: tuple) -> CandidateResult:
-    name, bars, spec, costs, settings, trials, total, symbol = args
+    name, bars, spec, costs, settings, trials, total, symbol, extra = args
     _lower_priority()
-    return evaluate_strategy(strategy_lib.get(name), bars, spec, costs, settings, trials, total, symbol)
+    return evaluate_strategy(strategy_lib.get(name), bars, spec, costs, settings, trials, total, symbol, extra)
 
 
 _PRIORITY_LOWERED = False
@@ -301,6 +307,36 @@ def _lower_priority() -> None:
         log.debug("could not lower process priority", exc_info=True)
 
 
+def valid_extra_params(name: str, candidates: Sequence[dict]) -> list[dict]:
+    """Only parameter sets that are exactly on the strategy's grid and valid; others are dropped."""
+    strategy = strategy_lib.get(name)
+    out: list[dict] = []
+    for params in candidates:
+        try:
+            canon = strategy.validate_params(params)
+        except ValueError:
+            continue
+        if canon not in out:
+            out.append(canon)
+    return out
+
+
+def hypothesis_params(hypotheses: Sequence[dict]) -> dict[str, list[dict]]:
+    """Turn (strategy, param, value) hypotheses into full parameter sets around the grid middle."""
+    out: dict[str, list[dict]] = {}
+    for h in hypotheses:
+        try:
+            strategy = strategy_lib.get(str(h.get("strategy")))
+            params = strategy.default_params()
+        except (KeyError, RuntimeError):
+            continue
+        if h.get("param") not in params:
+            continue
+        params[h["param"]] = h.get("value")
+        out.setdefault(strategy.name, []).append(params)
+    return out
+
+
 def trial_plan(names: Sequence[str], settings: OptimizerSettings) -> dict[str, int]:
     """Trials per strategy, capped so the cycle total never exceeds ``max_trials_per_cycle``."""
     if not names:
@@ -311,14 +347,16 @@ def trial_plan(names: Sequence[str], settings: OptimizerSettings) -> dict[str, i
 
 def optimize_symbol(symbol: str, bars: np.ndarray, spec: SymbolSpec, costs: CostModel,
                     settings: OptimizerSettings, strategy_names: Sequence[str], workers: int = 1,
-                    lower_priority: bool = False) -> OptimizationResult:
+                    lower_priority: bool = False,
+                    extra_params: Optional[Any] = None) -> OptimizationResult:
     """Evaluate every enabled strategy family on one symbol. Survivors first, by score."""
     started = time.monotonic()
     if lower_priority:
         _lower_priority()
     plan = trial_plan(strategy_names, settings)
-    total = sum(plan.values())
-    tasks = [(name, bars, spec, costs, settings, plan[name], total, symbol) for name in strategy_names]
+    extras = {name: valid_extra_params(name, (extra_params or {}).get(name, ())) for name in strategy_names}
+    total = sum(plan.values()) + sum(len(v) for v in extras.values())
+    tasks = [(name, bars, spec, costs, settings, plan[name], total, symbol, extras[name]) for name in strategy_names]
     if workers > 1 and len(tasks) > 1:
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=min(workers, len(tasks))) as pool:

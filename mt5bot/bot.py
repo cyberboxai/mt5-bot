@@ -6,7 +6,6 @@ SL and TP, so protection lives on the broker server even if this process or the 
 
 from __future__ import annotations
 
-import dataclasses
 import glob
 import json
 import logging
@@ -14,14 +13,15 @@ import math
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from . import __version__, indicators
-from .config import Config, in_trading_hours, reload_decision
+from . import __version__, indicators, limits
+from .config import Config, apply_overrides, in_trading_hours, reload_decision
 from .cycle import OptimizerScheduler, cost_model
 from .engine import AdaptiveEngine, EngineSettings, EntryIntent
 from .market import ServerClock, fmt_server_time, is_weekend, market_expected_open, server_datetime
@@ -66,8 +66,31 @@ REAL_MONEY_HELP = (
 )
 
 
+PAUSE_MARKER = "PAUSE_ENTRIES"
+
+
 class StartupError(RuntimeError):
     """The bot cannot start safely; the message tells the user what to fix (exit code 2)."""
+
+
+@dataclass(frozen=True)
+class EntryOutcome:
+    """What happened to one entry attempt. ``risk_allowed`` is None when the attempt stopped
+    before the risk layer (no quote, market closed, outside trading hours...)."""
+
+    risk_allowed: Optional[bool]
+    reason: str
+    sent: bool = False
+    ok: bool = False
+    volume: float = 0.0
+    price: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+    slippage_points: float = 0.0
+    ticket: Optional[int] = None
+    dry_run: bool = False
+    base_volume: float = 0.0
+    risk_pct: float = 0.0
 
 
 class AccountPolicyError(RuntimeError):
@@ -145,6 +168,10 @@ class Bot:
         globber: Callable[[str], list[str]] = glob.glob,
         terminal_killer: Callable[[str], bool] = kill_terminal,
         cli_overrides: Optional[dict[str, Any]] = None,
+        team: bool = True,
+        advisor: Any = None,
+        no_claude: bool = False,
+        durable_files: bool = True,
     ) -> None:
         if api is None:
             try:
@@ -199,6 +226,20 @@ class Bot:
         self.engine: Optional[AdaptiveEngine] = None
         self.scheduler: Optional[OptimizerScheduler] = None
         self.state_dir: Optional[Path] = None
+        # v3: optional specialist team and advisor. The deterministic core never depends on them.
+        self._durable_files = durable_files
+        self._team_enabled = team
+        self._advisor_override = advisor
+        self._no_claude = no_claude
+        self.team: Any = None
+        self.advisor: Any = None
+        self.office: Any = None
+        self._closes: dict[str, np.ndarray] = {}
+        self._guardian_freeze: Optional[str] = None
+        self._entries_while_halted = 0
+        self._pause_path: Optional[Path] = None
+        self._loop_ms = 0.0
+        self._mt5_latency_ms = 0.0
         self._success_codes = {self.mt5.TRADE_RETCODE_DONE, self.mt5.TRADE_RETCODE_PLACED,
                                self.mt5.TRADE_RETCODE_DONE_PARTIAL}
         self._retry_codes = {self.mt5.TRADE_RETCODE_REQUOTE, self.mt5.TRADE_RETCODE_PRICE_CHANGED,
@@ -328,11 +369,51 @@ class Bot:
         self.registry.set_kv("equity", str(float(acc.equity)))
         if self.cfg.news_filter_enabled:
             self._load_news()
+        self._pause_path = self.state_dir / PAUSE_MARKER
+        self._start_team()
 
         self.banner(acc)
         self.reconcile()
         self.notifier.send(f"Bot {__version__} started on {'REAL' if self.is_real else 'DEMO'} account "
                            f"{mask(acc.login)} ({acc.server}), equity {acc.equity:.2f} {acc.currency}")
+
+    def _notify_advisor(self, text: str) -> None:
+        """Advisor outage notifications, if ``notifications.advisor_state`` (read at send time: reloadable)."""
+        if self.cfg.notifications.advisor_state:
+            self.notifier.send(text)
+
+    def _start_team(self) -> None:
+        """Build the optional advisor and the specialist team. A failure here never stops trading."""
+        if not self._team_enabled:
+            return
+        try:
+            from .advisor import build_advisor
+            from .officedb import OfficeStore, office_path
+            from .team.runtime import TeamRuntime
+            from .teambridge import menu_lookup as _menu_lookup
+            from .teambridge import strategy_menu as _strategy_menu
+
+            self.office = OfficeStore(office_path(self.state_dir), clock=self._utc_now)
+            self.advisor = self._advisor_override or build_advisor(
+                self.cfg, store=self.office, env=self._env, notify=self._notify_advisor, no_claude=self._no_claude,
+                strategy_menu=_strategy_menu, menu_lookup=_menu_lookup)
+            self.team = TeamRuntime(self.cfg, self.state_dir, self.registry, self.advisor, self.notifier.send,
+                                    clock=self._utc_now, monotonic=self._monotonic, store=self.office)
+            if self.cfg.claude.enabled and not self._no_claude:
+                log.info("Claude advisor: %s", self.advisor.snapshot().get("state"))
+        except Exception:  # noqa: BLE001 - the team is optional; the deterministic core must keep running
+            log.exception("The specialist team could not start; trading continues on the deterministic v2 path")
+            self.team = None
+
+    def _entry_block_reason(self) -> Optional[str]:
+        """Why NEW entries are blocked right now (positions are never closed for these reasons)."""
+        if self.guard is not None and self.guard.halted_reason:
+            return self.guard.halted_reason
+        if self._pause_path is not None and self._pause_path.exists():
+            return "new entries paused from the panel (PAUSE_ENTRIES marker in the state folder)"
+        if self._guardian_freeze:
+            return f"Guardian freeze: {self._guardian_freeze}"
+        return None
 
     @property
     def real_money_confirmed(self) -> bool:
@@ -396,6 +477,16 @@ class Bot:
             log.debug("mt5.shutdown() raised", exc_info=True)
 
     def close(self) -> None:
+        if self.advisor is not None:
+            self.advisor.close()
+            self.advisor = None
+        if self.team is not None:
+            try:
+                self.team.close()
+            except Exception:  # noqa: BLE001 - best effort during exit
+                log.debug("team close failed", exc_info=True)
+            self.team = None
+            self.office = None
         if self.registry is not None:
             self.registry.close()
 
@@ -461,6 +552,7 @@ class Bot:
     def run_once(self) -> Optional[int]:
         """One loop iteration. Returns an exit code when the bot must exit, else None."""
         assert self.guard is not None and self.risk is not None and self.registry is not None
+        loop_started = time.perf_counter()
         self._last_loop_utc = self._utc_now()
         if self._kill_path.exists():
             log.warning("Kill switch file %s found: closing all bot positions and exiting.", self._kill_path)
@@ -510,6 +602,7 @@ class Bot:
                 self.notifier.send(f"{symbol}: repeated processing error ({type(exc).__name__}); see bot.log",
                                    key=f"error-{symbol}")
         self._next_wait = self.cfg.poll_seconds if any_fresh else self.cfg.closed_market_poll_seconds
+        self._loop_ms = (time.perf_counter() - loop_started) * 1000.0
         return None
 
     def _observe_ticks(self) -> bool:
@@ -533,7 +626,9 @@ class Bot:
         return any_fresh
 
     def _ensure_connected(self) -> bool:
+        started = time.perf_counter()
         term = self.mt5.terminal_info()
+        self._mt5_latency_ms = (time.perf_counter() - started) * 1000.0
         if term is not None and term.connected:
             if self._reconnect_delay is not None:
                 log.info("Terminal connection restored.")
@@ -660,13 +755,54 @@ class Bot:
             self.protect_positions(positions, acc)
             self._track_closed_live_trades(positions)
             self.registry.snapshot_equity(acc.equity, acc.balance, self.guard.state.peak_equity, len(positions))
+            self._run_guardian(acc)
         self._check_terminal_freeze(positions)
+        if self.team is not None:
+            try:
+                self.team.housekeeping(float(self._utc_now()), self._bot_status(acc, positions, server_now))
+            except Exception:  # noqa: BLE001 - the team must never break the trading loop
+                log.exception("Team housekeeping failed; trading continues")
         if self.scheduler is not None:
             try:
                 self.scheduler.maybe_launch(weekend=is_weekend(server_now) and not any(self._market_state.values()))
             except Exception:  # noqa: BLE001 - the optimiser must never break trading
                 log.exception("Could not schedule optimisation")
         self._write_health(acc, positions)
+
+    def _run_guardian(self, acc: Any) -> None:
+        """Independent invariant watchdog. If it cannot run, new entries are frozen (fail closed)."""
+        if self.team is None:
+            self._guardian_freeze = None
+            return
+        from . import teambridge
+
+        try:
+            positions = self._bot_positions()  # after repairs
+            report = self.team.guardian_check(teambridge.guardian_snapshot(self, positions, acc))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Guardian check failed; freezing new entries until it works again")
+            self._guardian_freeze = f"Guardian unavailable ({type(exc).__name__})"
+            return
+        if report.freeze_reason != self._guardian_freeze:
+            if report.freeze_reason:
+                log.warning("Guardian froze new entries: %s", report.freeze_reason)
+            else:
+                log.info("Guardian lifted the entry freeze: all invariants hold again")
+        self._guardian_freeze = report.freeze_reason
+        if report.kill_reason and not self._kill_path.exists():
+            log.critical("Guardian triggered the kill switch: %s", report.kill_reason)
+            self.notifier.send(f"Guardian triggered the kill switch: {report.kill_reason}")
+            try:
+                self._kill_path.write_text(f"Guardian: {report.kill_reason}\n", encoding="utf-8")
+            except OSError as exc:
+                log.error("Could not create the kill switch file %s: %s", self._kill_path, exc)
+
+    def _bot_status(self, acc: Any, positions: Optional[list[Any]], server_now: float) -> dict[str, Any]:
+        latest = self.clock.latest_tick_time
+        return {"loop_ms": round(self._loop_ms, 2), "mt5_latency_ms": round(self._mt5_latency_ms, 3),
+                "tick_age_s": round(max(0.0, server_now - latest), 1) if latest else None,
+                "connected": self._reconnect_delay is None, "open_positions": len(positions or []),
+                "weekend": is_weekend(server_now) and not any(self._market_state.values())}
 
     def _check_cash_flow(self) -> None:
         getter = getattr(self.mt5, "history_deals_get", None)
@@ -751,9 +887,14 @@ class Bot:
             "symbols": symbols,
             "optimizer": {"running": bool(self.scheduler and self.scheduler.running()),
                           "last_cycle_finished": self.registry.get_kv("last_cycle_finished")},
+            "entry_block": self._entry_block_reason(),
+            "team": self.team.snapshot() if self.team is not None else {"effective_mode": "baseline",
+                                                                         "mode_reason": "team not running"},
+            "advisor": {k: v for k, v in (self.advisor.snapshot() if self.advisor is not None else
+                                          {"state": "DISABLED"}).items() if k != "history"},
         }
         try:
-            write_health(Path(self.cfg.health_file), payload)
+            write_health(Path(self.cfg.health_file), payload, self._durable_files)
         except OSError as exc:
             log.warning("Could not write %s: %s", self.cfg.health_file, exc)
 
@@ -778,6 +919,14 @@ class Bot:
             if server_datetime(server_now).weekday() == 0:
                 write_report(self.registry, out, f"weekly_{prev_day}", day_start_utc - 7 * 86400, day_start_utc,
                              desc, list(self.symbols.values()))
+            if self.team is not None and self.cfg.notifications.daily_html_report:
+                from .reports import write_html_report
+
+                path = write_html_report(self.registry, self.office, out, f"daily_{prev_day}", day_start_utc - 86400,
+                                         day_start_utc, desc, list(self.symbols.values()))
+                reporter = self.team.agents.get("reporter")
+                if reporter is not None:
+                    reporter.reported(f"daily_{prev_day}", path.name)
         except OSError as exc:
             log.warning("Could not write reports: %s", exc)
 
@@ -809,7 +958,11 @@ class Bot:
             self.notifier.send(f"Invalid config.json ignored: {exc}", key="bad-config")
             return False
         if self._overrides:
-            new = dataclasses.replace(new, **self._overrides)
+            try:
+                new = apply_overrides(new, self._overrides)
+            except ValueError as exc:
+                log.error("config.json reload rejected (command-line overrides): %s", exc)
+                return False
         try:
             merged, notes = reload_decision(self.cfg, new)
         except ValueError as exc:
@@ -826,6 +979,10 @@ class Bot:
                 self.scheduler.cfg = merged
             if merged.news_filter_enabled:
                 self._load_news()
+            if self.advisor is not None:
+                self.advisor.update_config(merged.claude)
+            if self.team is not None:
+                self.team.update_config(merged)
             log.info("Config reloaded from %s", self.config_path)
         return True
 
@@ -849,11 +1006,14 @@ class Bot:
         if previous is not None and bar_time == previous:
             return
         spec = self.specs.get(symbol) or self._refresh_spec(symbol)
+        self._closes[symbol] = np.asarray(closed["close"][-(self.cfg.team.correlation_lookback_bars + 1):],
+                                          dtype=float)
         intent = self._signal_source.on_bar(symbol, closed, spec, self._costs(symbol), float(acc.equity),
                                             self.risk.risk_pct)
         if previous is None:
             log.info("%s: last closed bar %s recorded; waiting for the next one", symbol, fmt_server_time(bar_time))
             return
+        self._team_observe(symbol, acc, closed)
 
         positions = self._bot_positions(symbol)
         if self.cfg.close_on_opposite:
@@ -872,7 +1032,40 @@ class Bot:
         sig = intent.signal
         log.info("%s: %s signal from %s on bar %s (ATR %.6f)", symbol, sig.side, intent.description,
                  fmt_server_time(bar_time), sig.atr)
-        self._try_open(symbol, intent, acc)
+        self._enter(symbol, intent, acc, closed)
+
+    def _team_observe(self, symbol: str, acc: Any, closed: np.ndarray) -> None:
+        """New bar: let the team scan the market and manage open positions. Never raises."""
+        if self.team is None:
+            return
+        from . import teambridge
+
+        try:
+            self.team.observe_bar(teambridge.decision_context(self, symbol, None, acc, closed, purpose="observe"))
+        except Exception:  # noqa: BLE001 - observation is optional
+            log.debug("%s: team observation failed", symbol, exc_info=True)
+        try:
+            teambridge.manage_positions(self, symbol, acc, closed)
+        except Exception:  # noqa: BLE001 - management is optional; SL/TP keep protecting the positions
+            log.exception("%s: position management failed; positions keep their SL/TP", symbol)
+
+    def _enter(self, symbol: str, intent: EntryIntent, acc: Any, closed: np.ndarray) -> None:
+        """Route a champion proposal through the team's decision protocol, or straight to the
+        risk layer when there is no team. If the team fails BEFORE submitting, the
+        deterministic v2 path takes over; it can never submit twice."""
+        if self.team is None:
+            self._try_open(symbol, intent, acc)
+            return
+        from . import teambridge
+
+        gateway = teambridge.BotGateway(self, symbol, intent, acc)
+        try:
+            ctx = teambridge.decision_context(self, symbol, intent, acc, closed)
+            self.team.decide(ctx, gateway)
+        except Exception:  # noqa: BLE001 - fail open to the deterministic core, never to a crash
+            log.exception("%s: team decision failed; falling back to the deterministic path", symbol)
+            if not gateway.submitted:
+                self._try_open(symbol, intent, acc)
 
     def _side_of(self, position: Any) -> str:
         return "BUY" if position.type == self.mt5.POSITION_TYPE_BUY else "SELL"
@@ -922,34 +1115,58 @@ class Bot:
             return None
         return float(margin) * leverage
 
-    def _try_open(self, symbol: str, intent: EntryIntent, acc: Any) -> bool:
+    def _try_open(self, symbol: str, intent: EntryIntent, acc: Any, multiplier: float = 1.0,
+                  dossier_id: Optional[str] = None, preview: bool = False) -> EntryOutcome:
+        """Plan, gate and (unless ``preview``) send one entry.
+
+        ``multiplier`` (the team's and the advisor's combined verdict) can only SHRINK the
+        fixed-fraction risk: it is clamped to [0, 1] here again, so no caller can raise the
+        size above the deterministic base. Every hard rule of the risk layer still applies.
+        """
+        try:
+            multiplier = float(multiplier)
+        except (TypeError, ValueError):
+            multiplier = 0.0
+        multiplier = min(max(multiplier, 0.0), limits.MAX_SIZE_MULTIPLIER) if math.isfinite(multiplier) else 0.0
+
+        def note(reason: str, allowed: Optional[bool] = None, level: int = logging.INFO, **extra: Any) -> EntryOutcome:
+            if not preview:
+                log.log(level, "%s: %s", symbol, reason)
+            return EntryOutcome(allowed, reason, **extra)
+
         sig = intent.signal
         info = self.mt5.symbol_info(symbol)
         tick = self.mt5.symbol_info_tick(symbol)
         if info is None or tick is None or info.point <= 0 or tick.bid <= 0 or tick.ask <= 0:
-            log.warning("%s: no symbol info or valid tick (%s); skipping", symbol, self._last_error())
-            return False
+            return note(f"no symbol info or valid tick ({self._last_error()}); skipping", level=logging.WARNING)
         if self._closed_until.get(symbol, 0) > self._monotonic():
-            log.info("%s: market reported closed recently; skipping", symbol)
-            return False
+            return note("market reported closed recently; skipping")
         if info.trade_mode != self.mt5.SYMBOL_TRADE_MODE_FULL:
-            log.info("%s: trading mode is restricted (trade_mode=%s); skipping", symbol, info.trade_mode)
-            return False
+            return note(f"trading mode is restricted (trade_mode={info.trade_mode}); skipping")
         hour = server_datetime(tick.time).hour
         if not in_trading_hours(hour, self.cfg.trading_hours_server):
-            log.info("%s: server hour %02d outside trading window %s; skipping", symbol, hour,
-                     list(self.cfg.trading_hours_server))
-            return False
+            return note(f"server hour {hour:02d} outside trading window {list(self.cfg.trading_hours_server)}; "
+                        "skipping")
+        if multiplier <= 0:
+            return note("size multiplier is zero: no trade", allowed=False)
         spec = SymbolSpec.from_info(info)
         self.specs[symbol] = spec
         spread_points = (tick.ask - tick.bid) / info.point
         price = tick.ask if sig.side == "BUY" else tick.bid
-        result = plan_trade(sig.side, sig.atr, sig.sl_mult or 2.0, sig.tp_mult or 3.0, price, spread_points, spec,
-                            float(acc.equity), self.risk.risk_pct, self.commission.get(symbol, 0.0),
-                            self.cfg.deviation_points, self._loss_per_lot_fn(symbol))
+
+        def plan_for(risk_pct: float) -> Any:
+            return plan_trade(sig.side, sig.atr, sig.sl_mult or 2.0, sig.tp_mult or 3.0, price, spread_points, spec,
+                              float(acc.equity), risk_pct, self.commission.get(symbol, 0.0),
+                              self.cfg.deviation_points, self._loss_per_lot_fn(symbol))
+
+        base = plan_for(self.risk.risk_pct)
+        result = base if multiplier >= 1.0 else plan_for(self.risk.risk_pct * multiplier)
+        base_volume = base.plan.volume if base.plan is not None else 0.0
         if result.plan is None:
-            log.info("%s: no trade: %s", symbol, result.reason)
-            return False
+            reason = result.reason
+            if base.plan is not None:
+                reason = f"reduced size (x{multiplier:.2f}) is below the minimum volume: {reason}"
+            return note(f"no trade: {reason}", allowed=False, base_volume=base_volume)
         plan = result.plan
         positions = self._bot_positions()
         news = None
@@ -961,16 +1178,17 @@ class Bot:
             bot_positions=self._open_risks(positions, float(acc.equity)),
             symbol_has_foreign_netting_position=self._foreign_netting_position(symbol),
             notional_money=self._notional(symbol, sig.side, plan.volume, price, acc),
-            halted_reason=self.guard.halted_reason, news_blocked=news,
+            halted_reason=self._entry_block_reason(), news_blocked=news,
             slippage_paused=self._slippage_pause.get(symbol, 0) > self._monotonic(),
         )
         if ctx.notional_money is None:
-            log.warning("%s: cannot compute exposure (order_calc_margin unavailable); skipping (fail closed)", symbol)
-            return False
+            return note("cannot compute exposure (order_calc_margin unavailable); skipping (fail closed)",
+                        allowed=False, level=logging.WARNING, base_volume=base_volume)
         allowed, reason = self.risk.approve_entry(ctx)
         if not allowed:
-            log.info("%s: entry rejected by the risk layer: %s", symbol, reason)
-            return False
+            return note(f"entry rejected by the risk layer: {reason}", allowed=False, base_volume=base_volume)
+        if preview:
+            return EntryOutcome(True, "ok", volume=plan.volume, base_volume=base_volume, risk_pct=plan.risk_pct)
         filling = select_filling_mode(info.filling_mode, self.mt5)
 
         def build(t: Any) -> dict[str, Any]:
@@ -980,25 +1198,28 @@ class Bot:
         try:
             validate_open_request(request, plan)
         except RiskViolation as exc:
-            log.error("%s: request blocked by the risk layer: %s", symbol, exc)
-            return False
+            return note(f"request blocked by the risk layer: {exc}", allowed=False, level=logging.ERROR)
         check = self.mt5.order_check(request)
         if check is None:
-            log.warning("%s: order_check returned nothing (%s); skipping", symbol, self._last_error())
-            return False
+            return note(f"order_check returned nothing ({self._last_error()}); skipping", allowed=True,
+                        level=logging.WARNING)
         if check.retcode not in (0, self.mt5.TRADE_RETCODE_DONE):
-            log.warning("%s: order_check rejected the order: retcode=%s comment=%s", symbol, check.retcode,
-                        check.comment)
             if check.retcode == self._market_closed_code:
                 self._closed_until[symbol] = self._monotonic() + MARKET_CLOSED_BACKOFF_SECONDS
-            return False
+            return note(f"order_check rejected the order: retcode={check.retcode} comment={check.comment}",
+                        allowed=True, level=logging.WARNING)
         if self.cfg.dry_run:
-            log.info("DRY RUN: would send %s %s %.2f lots at %s SL %s TP %s (order_check OK, risk %.2f)",
-                     sig.side, symbol, plan.volume, request["price"], request["sl"], request["tp"], plan.planned_risk)
-            return True
+            log.info("DRY RUN: would send %s %s %.2f lots at %s SL %s TP %s (order_check OK, risk %.2f, x%.2f)",
+                     sig.side, symbol, plan.volume, request["price"], request["sl"], request["tp"], plan.planned_risk,
+                     multiplier)
+            return EntryOutcome(True, "dry run: order_check OK, not sent", sent=False, ok=True, volume=plan.volume,
+                                price=float(request["price"]), sl=float(request["sl"]), tp=float(request["tp"]),
+                                dry_run=True, base_volume=base_volume, risk_pct=plan.risk_pct)
+        if self.guard.halted_reason:
+            self._entries_while_halted += 1  # defence in depth: the Guardian treats this as a kill condition
         sent = self._send_with_retry(build, tick, symbol, plan)
         if sent is None:
-            return False
+            return EntryOutcome(True, "order_send failed (see log)", sent=True, ok=False, base_volume=base_volume)
         res, final_request = sent
         slippage = abs(float(res.price) - float(final_request["price"])) / info.point if res.price else 0.0
         if slippage > self.cfg.max_slippage_points:
@@ -1008,14 +1229,19 @@ class Bot:
             self.notifier.send(f"{symbol}: slippage {slippage:.1f} points; entries paused", key=f"slip-{symbol}")
         volume = float(res.volume or plan.volume)
         risk_money = plan.loss_per_lot * volume
+        extra = {"deal": getattr(res, "deal", None), "strategy": intent.strategy, "slippage_points": slippage}
+        if dossier_id:
+            extra.update(dossier_id=dossier_id, size_multiplier=round(multiplier, 6))
         self.registry.open_trade("live", symbol, intent.param_set_id, sig.side, float(res.price or request["price"]),
                                  final_request["sl"], final_request["tp"], volume, risk_money, ticket=int(res.order),
-                                 open_bar_time=self._last_bar.get(symbol),
-                                 extra={"deal": getattr(res, "deal", None), "strategy": intent.strategy,
-                                        "slippage_points": slippage})
-        log.info("%s: opened %s %.2f lots at %s SL %s TP %s (order %s, deal %s, risk %.2f)", symbol, sig.side,
-                 volume, res.price, final_request["sl"], final_request["tp"], res.order, res.deal, risk_money)
-        return True
+                                 open_bar_time=self._last_bar.get(symbol), extra=extra)
+        log.info("%s: opened %s %.2f lots at %s SL %s TP %s (order %s, deal %s, risk %.2f, size x%.2f)", symbol,
+                 sig.side, volume, res.price, final_request["sl"], final_request["tp"], res.order, res.deal, risk_money,
+                 multiplier)
+        return EntryOutcome(True, "opened", sent=True, ok=True, volume=volume,
+                            price=float(res.price or request["price"]), sl=float(final_request["sl"]),
+                            tp=float(final_request["tp"]), slippage_points=slippage, ticket=int(res.order),
+                            base_volume=base_volume, risk_pct=plan.risk_pct)
 
     def _open_request(self, symbol: str, plan: TradePlan, info: Any, tick: Any, filling: int) -> dict[str, Any]:
         point, digits = info.point, info.digits
@@ -1197,12 +1423,21 @@ class Bot:
             r = pnl / row.risk_money if row.risk_money > 0 else 0.0
             self.registry.close_trade(row.id, exit_price, pnl, r, "closed at broker")
             log.info("%s: position %s closed at %s, P&L %.2f (%.2fR)", row.symbol, row.ticket, exit_price, pnl, r)
+            if self.team is not None:
+                from .team.events import TradeClosed
+
+                self.team.bus.publish(TradeClosed("live", round(r, 4), round(pnl, 2), r > 0, "closed at broker"),
+                                      agent="performance_analyst", symbol=row.symbol,
+                                      correlation_id=(row.extra or {}).get("dossier_id"),
+                                      severity="notice")
 
     # ------------------------------------------------------------------ closing
 
-    def _close_position(self, position: Any, reason: str) -> bool:
+    def _close_position(self, position: Any, reason: str, volume: Optional[float] = None) -> bool:
+        """Close a bot position (or ``volume`` lots of it, for a partial close)."""
         if position.magic != self.cfg.magic:  # defence in depth: never touch foreign positions
             return False
+        close_volume = float(position.volume) if volume is None else min(float(volume), float(position.volume))
         symbol = position.symbol
         info = self.mt5.symbol_info(symbol)
         tick = self.mt5.symbol_info_tick(symbol)
@@ -1217,7 +1452,7 @@ class Bot:
             request = {
                 "action": self.mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
-                "volume": position.volume,
+                "volume": close_volume,
                 "type": self.mt5.ORDER_TYPE_SELL if is_buy else self.mt5.ORDER_TYPE_BUY,
                 "price": t.bid if is_buy else t.ask,
                 "deviation": self.cfg.deviation_points,
@@ -1233,7 +1468,7 @@ class Bot:
 
         if self.cfg.dry_run:
             log.info("DRY RUN: would close position %s (%s %.2f %s) because: %s", position.ticket,
-                     "BUY" if is_buy else "SELL", position.volume, symbol, reason)
+                     "BUY" if is_buy else "SELL", close_volume, symbol, reason)
             return True
         result = self._send_with_retry(build, tick, symbol)
         if result is None:

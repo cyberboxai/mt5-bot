@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import logging
 import logging.handlers
@@ -15,10 +14,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__
+from .advisor.redact import RedactingFormatter
 from . import strategies as strategy_lib
 from .backtest import compute_metrics, simulate
 from .bot import (EXIT_ERROR, EXIT_OK, EXIT_SAFETY_STOP, EXIT_STARTUP, AccountPolicyError, Bot, StartupError, mask)
-from .config import Config
+from .config import Config, apply_overrides
 from .cycle import CycleLock, cost_model, resolved_symbols, run_cycle
 from .engine import AdaptiveEngine, EngineSettings
 from .optimizer import OptimizerSettings, optimize_symbol
@@ -36,8 +36,12 @@ HEALTH_STALE_SECONDS = 300
 
 
 def setup_logging(log_file: Optional[str]) -> None:
-    """Rotating UTF-8 file log (optional) plus a console handler that never crashes on encoding."""
-    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
+    """Rotating UTF-8 file log (optional) plus a console handler that never crashes on encoding.
+
+    Every handler redacts secrets (API keys, tokens, passwords) from the final text,
+    including exception tracebacks.
+    """
+    formatter = RedactingFormatter("%(asctime)s %(levelname)-8s %(message)s")
     log.handlers.clear()
     if log_file:
         path = Path(log_file)
@@ -63,8 +67,15 @@ def setup_logging(log_file: Optional[str]) -> None:
 
 
 def install_signal_handlers(bot: Bot) -> None:
+    install_signal_handlers_for(bot.request_stop)
+
+
+def install_signal_handlers_for(stop: Any) -> None:
     def handler(signum: int, _frame: Any) -> None:
-        bot.request_stop(signum)
+        try:
+            stop(signum)
+        except TypeError:
+            stop()
 
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):  # SIGBREAK = Ctrl+Break / console close on Windows
         sig = getattr(signal, name, None)
@@ -77,7 +88,8 @@ def install_signal_handlers(bot: Bot) -> None:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MetaTrader 5 trading bot v2 (adaptive, supervised).")
+    parser = argparse.ArgumentParser(description="MetaTrader 5 trading bot v3 (adaptive core, optional specialist "
+                                                 "team and Claude advisor, supervised).")
     parser.add_argument("--config", default="config.json", help="path to config.json (default: %(default)s)")
     parser.add_argument("--dry-run", action="store_true", help="run everything but never send orders")
     parser.add_argument("--confirm-real-money", action="store_true",
@@ -85,6 +97,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-countdown", action="store_true", help="skip the 10 s real-money countdown")
     parser.add_argument("--bootstrap-days", type=float, default=None,
                         help="minimum days of observation before the first promotion")
+    parser.add_argument("--no-claude", action="store_true",
+                        help="run without the optional Claude advisor (the bot is complete without it)")
+    parser.add_argument("--team-mode", choices=("auto", "full", "baseline"), default=None,
+                        help="override team.team_mode: auto (evidence decides), full (team) or baseline (v2 core)")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--status", action="store_true", help="print health.json and the champions")
     actions.add_argument("--history", action="store_true", help="print the decision log")
@@ -92,6 +108,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     actions.add_argument("--resume", action="store_true", help="clear the drawdown circuit breaker")
     actions.add_argument("--backtest", action="store_true", help="walk-forward report (or one strategy with --strategy)")
     actions.add_argument("--optimize-once", action="store_true", help="run one optimisation cycle and exit")
+    actions.add_argument("--set-claude-key", action="store_true",
+                         help="store the Claude API key in the Windows Credential Manager (hidden prompt)")
+    actions.add_argument("--simulate", action="store_true",
+                         help="run the real bot and team on a synthetic market (no MT5, no broker, no API key)")
+    actions.add_argument("--ablation-report", action="store_true",
+                         help="print the team's value-added report (ablation) and the team-vs-baseline verdict")
+    actions.add_argument("--reset-team-weights", action="store_true",
+                         help="reset learned agent weights, calibration and performance benching (audited)")
+    parser.add_argument("--sim-bars", type=int, default=None, help="with --simulate: stop after N bars")
+    parser.add_argument("--sim-speed", type=float, default=2.0, help="with --simulate: bars per second (0 = max)")
+    parser.add_argument("--sim-seed", type=int, default=7, help="with --simulate: random seed of the market")
+    parser.add_argument("--sim-state", default="state_sim", help="with --simulate: state folder (default %(default)s)")
+    parser.add_argument("--sim-fast-forward", type=int, default=0,
+                        help="with --simulate: run the first N bars at full speed")
+    parser.add_argument("--sim-advisor", choices=("simulated", "none", "claude"), default="simulated",
+                        help="with --simulate: advisor to use (default: a rule-based simulated one, no API)")
     parser.add_argument("--offline", action="store_true", help="use only the cached data (no MT5 connection)")
     parser.add_argument("--state-dir", help="account state folder for offline commands")
     parser.add_argument("--account", help="state folder name (<server>_<login>) for offline commands")
@@ -308,6 +340,65 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
             bot.shutdown()
 
 
+def _office(cfg: Config, args: argparse.Namespace) -> Any:
+    from .officedb import OfficeStore, office_path
+
+    path = office_path(resolve_state_dir(cfg, args))
+    if not path.exists():
+        raise ValueError(f"{path} not found: the v3 team has not run for this account yet")
+    return OfficeStore(path)
+
+
+def cmd_ablation_report(cfg: Config, args: argparse.Namespace) -> int:
+    from .team.ablation import ablation_report
+    from .team.ensemble import EnsembleSettings
+    from .team.roster import GATES, VOTERS
+
+    store = _office(cfg, args)
+    try:
+        report = ablation_report(store.resolved_dossiers(), EnsembleSettings.from_config(cfg.team),
+                                 list(VOTERS) + list(GATES), cfg.team.ablation_confidence, cfg.team.ablation_min_samples)
+    finally:
+        store.close()
+    lines = [f"Team ablation report: {report['n']} resolved decisions (minimum {report['min_samples']})",
+             f"Verdict: {report['verdict']}", ""]
+    for name in ("baseline", "team", "team_without_advisor"):
+        m = report.get(name) or {}
+        if m:
+            lines.append(f"  {name:<22} n {m['n']:>5}  trades {m['trades']:>5}  total {m['total_r']:+9.2f}R  "
+                         f"sharpe/proposal {m['sharpe']:+.4f}  max DD {m['max_drawdown_r']:.2f}R")
+    if report.get("team_vs_baseline_ci"):
+        lo, hi = report["team_vs_baseline_ci"]
+        lines.append(f"  team - baseline Sharpe, {cfg.team.ablation_confidence:.0%} interval: [{lo:+.4f}, {hi:+.4f}]")
+    lines.append("")
+    lines.append("Value added per agent (Sharpe of the team with the agent minus without it):")
+    for agent, entry in sorted((report.get("agents") or {}).items(), key=lambda kv: -kv[1]["value_added_sharpe"]):
+        ci = entry.get("ci") or [None, None]
+        ci_text = f"[{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci[0] is not None else "n/a"
+        lines.append(f"  {agent:<24} {entry['value_added_sharpe']:+.4f}  interval {ci_text}  n {entry['n']}")
+    advisor = report.get("advisor") or {}
+    if advisor:
+        lines.append(f"  {'claude advisor':<24} {advisor.get('value_added_sharpe', 0):+.4f}  reviews "
+                     f"{advisor.get('reviews', 0)}")
+    lines.append("")
+    lines.append("Past results only; no forecast and no guarantee of profit.")
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_reset_team_weights(cfg: Config, args: argparse.Namespace) -> int:
+    store = _office(cfg, args)
+    try:
+        store.reset_weights()
+        store.set_kv("perf_benched", "[]")
+        store.add_control_audit("reset_team_weights", "cli", True, "learned weights, calibration and benching reset")
+    finally:
+        store.close()
+    print("Team weights, calibration and performance benching reset to uniform. A running bot keeps its in-memory "
+          "weights until it restarts.")
+    return EXIT_OK
+
+
 def countdown(bot: Bot, seconds: int = COUNTDOWN_SECONDS) -> bool:
     """Real-money banner. Returns False if a stop was requested during the countdown."""
     for remaining in range(seconds, 0, -1):
@@ -322,7 +413,8 @@ def run_bot(cfg: Config, args: argparse.Namespace, overrides: dict[str, Any]) ->
     setup_logging(cfg.log_file)
     log.info("mt5_bot %s starting%s", __version__, " in DRY RUN mode" if cfg.dry_run else "")
     try:
-        bot = Bot(cfg, config_path=args.config, confirm_real_money=args.confirm_real_money, cli_overrides=overrides)
+        bot = Bot(cfg, config_path=args.config, confirm_real_money=args.confirm_real_money, cli_overrides=overrides,
+                  no_claude=args.no_claude)
     except (StartupError, ValueError) as exc:
         log.error("Startup failed: %s", exc)
         return EXIT_STARTUP
@@ -358,15 +450,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return EXIT_STARTUP
+    if args.set_claude_key:
+        from .advisor.keys import set_key_interactive
+
+        return set_key_interactive()
     overrides: dict[str, Any] = {}
     if args.dry_run:
         overrides["dry_run"] = True
     if args.bootstrap_days is not None:
         overrides["bootstrap_days"] = args.bootstrap_days
+    if args.no_claude:
+        overrides["claude.enabled"] = False
+    if args.team_mode is not None:
+        overrides["team.team_mode"] = args.team_mode
     if overrides:
         try:
-            cfg = dataclasses.replace(cfg, **overrides)
-            cfg.validate()
+            cfg = apply_overrides(cfg, overrides)
         except ValueError as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return EXIT_STARTUP
@@ -379,6 +478,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             return cmd_rollback(cfg, args)
         if args.resume:
             return cmd_resume(cfg, args)
+        if args.ablation_report:
+            return cmd_ablation_report(cfg, args)
+        if args.reset_team_weights:
+            return cmd_reset_team_weights(cfg, args)
+        if args.simulate:
+            from .sim.runner import main_simulate
+
+            return main_simulate(cfg, args)
         if args.optimize_once or args.backtest:
             # Offline runs are child processes of the live bot: console only, to avoid two writers on bot.log.
             setup_logging(None if args.offline else cfg.log_file)

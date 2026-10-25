@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-PT" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CYBERBOX Trading Office</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+  <a class="skip" href="#view">Saltar para o conteúdo</a>
+  <header class="topbar">
+    <a class="wordmark" href="#/office" aria-label="CYBERBOX Trading Office">
+      <svg viewBox="0 0 40 40" aria-hidden="true">
+        <path d="M20 3 L35 11 L35 29 L20 37 L5 29 L5 11 Z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/>
+        <path d="M5 11 L20 19 L35 11 M20 19 L20 37" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" opacity="0.55"/>
+        <path d="M11 27 L16 22 L20 25 L28 15" fill="none" stroke="#3987e5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="28" cy="15" r="2.6" fill="#d95926"/>
+      </svg>
+      <span><span class="name">CYBERBOX</span> <span class="sub">Trading Office</span><br><span class="sub" id="app-sub">Escritório de negociação</span></span>
+    </a>
+    <div class="badges" aria-live="polite">
+      <span class="badge" id="account-badge">?</span>
+      <span class="badge" id="mode-badge"></span>
+      <span class="badge" id="advisor-badge"></span>
+      <span class="badge" id="stream-badge"></span>
+    </div>
+    <div class="clock">
+      <span id="clock-label">Hora do servidor</span>
+      <strong id="clock-time">--:--:--</strong>
+      <div class="sessions" id="sessions"></div>
+    </div>
+    <div class="tools">
+      <button class="icon-btn" id="theme-btn" type="button">Tema</button>
+      <button class="icon-btn" id="lang-btn" type="button">EN</button>
+    </div>
+  </header>
+  <div class="banner" id="banner-account" hidden></div>
+  <div class="banner warn" id="banner-offline" hidden></div>
+  <div class="banner warn" id="banner-paused" hidden></div>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Separadores"></nav>
+  <main id="view" tabindex="-1"></main>
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <button class="icon-btn close" id="drawer-close" type="button">Fechar</button>
+    <h2 id="drawer-title"></h2>
+    <p class="muted small" id="drawer-sub"></p>
+    <div id="drawer-body"></div>
+  </aside>
+  <div class="modal" id="modal" role="dialog" aria-modal="true" hidden><div class="box" id="modal-box"></div></div>
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

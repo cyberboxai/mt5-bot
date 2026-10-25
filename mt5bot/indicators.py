@@ -162,3 +162,64 @@ def rolling_percentile_rank(values: Any, lookback: int, chunk: int = 4096) -> np
         out[lookback - 1 + start: lookback - 1 + start + w.shape[0]] = rank
     return out
 
+
+
+def efficiency_ratio(close: Any, period: int) -> np.ndarray:
+    """Kaufman efficiency ratio: |net change| / sum of |changes| over ``period`` bars (0..1)."""
+    if period < 1:
+        raise ValueError("period must be >= 1")
+    c = np.asarray(close, dtype=float)
+    out = np.full(c.shape, np.nan)
+    if c.size <= period:
+        return out
+    change = np.abs(c[period:] - c[:-period])
+    steps = np.abs(np.diff(c))
+    csum = np.concatenate([[0.0], np.cumsum(steps)])
+    path = csum[period:] - csum[:-period]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out[period:] = np.where(path > 0, change / path, 0.0)
+    return out
+
+
+def adx(high: Any, low: Any, close: Any, period: int = 14) -> np.ndarray:
+    """Wilder's Average Directional Index (0..100). First defined value at index 2 * period."""
+    if period < 1:
+        raise ValueError("period must be >= 1")
+    h = np.asarray(high, dtype=float)
+    lo = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    n = h.size
+    out = np.full(n, np.nan)
+    if n < 2 * period + 1:
+        return out
+    up = h[1:] - h[:-1]
+    down = lo[:-1] - lo[1:]
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = true_range(h, lo, c)[1:]
+
+    def wilder(x: np.ndarray) -> np.ndarray:
+        res = np.full(x.size, np.nan)
+        prev = float(np.sum(x[:period]))
+        res[period - 1] = prev
+        for i in range(period, x.size):
+            prev = prev - prev / period + float(x[i])
+            res[i] = prev
+        return res
+
+    atr_s, plus_s, minus_s = wilder(tr), wilder(plus_dm), wilder(minus_dm)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        plus_di = 100.0 * plus_s / atr_s
+        minus_di = 100.0 * minus_s / atr_s
+        dx = 100.0 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    dx = np.where(np.isfinite(dx), dx, 0.0)
+    adx_vals = np.full(dx.size, np.nan)
+    first = 2 * period - 2
+    if dx.size > first:
+        prev = float(np.mean(dx[period - 1:first + 1]))
+        adx_vals[first] = prev
+        for i in range(first + 1, dx.size):
+            prev = (prev * (period - 1) + dx[i]) / period
+            adx_vals[i] = prev
+    out[1:] = adx_vals
+    return out

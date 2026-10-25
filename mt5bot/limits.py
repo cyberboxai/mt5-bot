@@ -24,3 +24,21 @@ MAX_TP_ATR_MULT = 10.0
 # The bot never uses more than one position per symbol: this is what forbids grids,
 # pyramiding and averaging down.
 MAX_POSITIONS_PER_SYMBOL = 1
+
+# ---- v3: optional Claude advisor. Cost and latency ceilings; no config can exceed them.
+MAX_ADVISOR_LATENCY_BUDGET_MS = 5000
+MAX_ADVISOR_TIMEOUT_SECONDS = 60.0
+MAX_CLAUDE_CALLS_PER_HOUR = 600
+MAX_CLAUDE_DAILY_COST_USD = 50.0
+MAX_CLAUDE_MAX_TOKENS = 16000
+
+# ---- v3: specialist team. The ensemble and the advisor may only shrink the deterministic
+# base size: every multiplier they produce is clamped to [0, MAX_SIZE_MULTIPLIER].
+MAX_SIZE_MULTIPLIER = 1.0
+MIN_AGENT_WEIGHT = 0.05
+MAX_AGENT_WEIGHT = 5.0
+MAX_LEARNING_RATE = 0.5
+# Advisor weight tilts: at most +/-20 percent, never on the Risk Manager or the Guardian.
+MAX_WEIGHT_TILT = 0.20
+MAX_TILT_HOURS = 24.0
+MAX_AGENT_TIMEOUT_MS = 5000
