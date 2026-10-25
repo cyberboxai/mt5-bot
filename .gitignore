@@ -15,3 +15,12 @@ KILL
 
 # Local secrets, never commit
 .env
+
+# v2 runtime files: per-account state, reports, health, supervisor/optimizer logs
+state/
+reports/
+health.json
+health.json.tmp
+supervisor.log
+supervisor.log.*
+optimizer.log

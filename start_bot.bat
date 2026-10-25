@@ -2,7 +2,7 @@
 REM Starts the MT5 bot from this folder using the local virtual environment.
 cd /d %~dp0
 if not exist ".venv\Scripts\activate.bat" (
-    echo Virtual environment .venv not found. See README, section 6.
+    echo Virtual environment .venv not found. See README, section 7.
     pause
     exit /b 2
 )
