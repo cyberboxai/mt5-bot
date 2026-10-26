@@ -26,7 +26,8 @@ def trend_bars() -> np.ndarray:
 
 def test_library_contains_required_strategies() -> None:
     for name in ("ema_cross", "donchian", "rsi_reversion", "bollinger", "session_breakout",
-                 "volfilter_ema_cross", "volfilter_donchian"):
+                 "volfilter_ema_cross", "volfilter_donchian", "momentum_pullback", "vwap_reversion",
+                 "range_fade", "ny_breakout", "vol_contraction"):
         assert name in LIBRARY
     assert S.get(S.NO_TRADE) is S.NOTRADE
 

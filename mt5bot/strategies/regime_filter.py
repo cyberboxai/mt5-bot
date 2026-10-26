@@ -38,8 +38,8 @@ class VolatilityFilter(Strategy):
 
     def compute(self, bars: np.ndarray, params: Params) -> np.ndarray:
         side = np.asarray(self.inner.compute(bars, self._inner_params(params)), dtype=np.int8).copy()
-        vol = indicators.atr(bars["high"], bars["low"], bars["close"], ATR_PERIOD)
-        pct = indicators.rolling_percentile_rank(vol, LOOKBACK)
+        pct = indicators.cached(bars, f"atr_pct{ATR_PERIOD}_{LOOKBACK}", lambda: indicators.rolling_percentile_rank(
+            indicators.bars_atr(bars, ATR_PERIOD), LOOKBACK))
         with np.errstate(invalid="ignore"):
             allowed = (pct >= params[PREFIX + "low"]) & (pct <= params[PREFIX + "high"])
         side[~allowed] = 0

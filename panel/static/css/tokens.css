@@ -1,0 +1,156 @@
+/* CYBERBOX design tokens. The brand layer (--cbx-*) is copied from the CYBERBOX website's
+   :root (see panel/BRAND.md for the source and the rules); everything else in the panel uses
+   the semantic layer below it, never raw hex values. Dark is the default theme; light with
+   data-theme="light"; high contrast with data-contrast="high" (on either theme). */
+
+:root {
+  /* ---- brand (from the CYBERBOX website) ---- */
+  --cbx-teal: #00C9A7;
+  --cbx-blue: #1874CD;
+  --cbx-navy: #1A3A6E;
+  --cbx-red: #E63030;
+  --cbx-orange: #F47C20;
+  --cbx-yellow: #FFE600;
+  --cbx-cyan: #00CFCF;
+  --cbx-dark: #080E1A;
+  --cbx-darker: #050A10;
+  --cbx-glass: rgba(255, 255, 255, 0.04);
+  --cbx-glass-border: rgba(255, 255, 255, 0.08);
+  --cbx-text: #E8EDF7;
+  --cbx-muted: #7A899E;
+  --cbx-font-display: "Syne", "Segoe UI", system-ui, sans-serif;
+  --cbx-font-mono: "Space Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  /* ---- semantic: dark (default) ---- */
+  color-scheme: dark;
+  --page: var(--cbx-dark);
+  --page-deep: var(--cbx-darker);
+  --surface-1: #0c1526;
+  --surface-2: #111d33;
+  --surface-3: #172641;
+  --glass: var(--cbx-glass);
+  --text-primary: var(--cbx-text);
+  --text-secondary: #b9c4d6;
+  --text-muted: #8796ab;
+  --text-on-accent: var(--cbx-dark);
+  --border: var(--cbx-glass-border);
+  --border-strong: #23406d;
+  --border-accent: rgba(0, 201, 167, 0.28);
+  --accent: var(--cbx-teal);
+  --accent-2: var(--cbx-blue);
+  --accent-3: var(--cbx-cyan);
+  --focus: var(--cbx-cyan);
+  --grid: #16253f;
+  --axis: #23406d;
+  /* charts: categorical slots, sequential and diverging ramps (data, not decoration) */
+  --series-1: #3d97ee;
+  --series-2: var(--cbx-orange);
+  --series-3: var(--cbx-teal);
+  --series-4: var(--cbx-yellow);
+  --series-5: #c08cf8;
+  --seq-low: #0f2440;
+  --seq-high: var(--cbx-cyan);
+  --div-neg: #ef5a5a;
+  --div-mid: #23324d;
+  --div-pos: #3d97ee;
+  /* status (reserved: never decorative) */
+  --good: var(--cbx-teal);
+  --warning: var(--cbx-yellow);
+  --serious: var(--cbx-orange);
+  --critical: #ef4b4b;
+  --delta-up: var(--cbx-teal);
+  --delta-down: #ef5a5a;
+  --real: var(--cbx-red);
+  --demo: var(--cbx-blue);
+  --sim: #7c5cff;
+  /* office illustration */
+  --floor: #0e1829;
+  --floor-alt: #101c30;
+  --corridor: #0a1221;
+  --wall: var(--cbx-navy);
+  --wall-top: #2b5aa0;
+  --desk: #22324f;
+  --screen: var(--cbx-darker);
+  --night: rgba(5, 10, 16, 0.42);
+  --room-label: #8fa2bd;
+  /* shape and type */
+  --radius: 10px;
+  --radius-sm: 6px;
+  --font: var(--cbx-font-mono);
+  --font-display: var(--cbx-font-display);
+  --mono: var(--cbx-font-mono);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --topbar-h: 64px;
+  --bottombar-h: 52px;
+  --roster-w: 272px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f3f6fb;
+  --page-deep: #e8edf5;
+  --surface-1: #ffffff;
+  --surface-2: #f2f5fa;
+  --surface-3: #e5ebf4;
+  --glass: rgba(26, 58, 110, 0.04);
+  --text-primary: #0b1a33;
+  --text-secondary: #33415a;
+  --text-muted: #56657d;
+  --text-on-accent: #04241e;
+  --border: rgba(26, 58, 110, 0.12);
+  --border-strong: #b8c6dc;
+  --border-accent: rgba(0, 140, 117, 0.35);
+  --accent: #00866f;
+  --accent-2: var(--cbx-blue);
+  --accent-3: #007a7a;
+  --focus: #0b5fb0;
+  --grid: #e1e7f0;
+  --axis: #b8c6dc;
+  --series-1: var(--cbx-blue);
+  --series-2: #d4630f;
+  --series-3: #00866f;
+  --series-4: #a68a00;
+  --series-5: #8b5cf6;
+  --seq-low: #e3eefb;
+  --seq-high: #0f4f91;
+  --div-neg: #c72828;
+  --div-mid: #eef1f6;
+  --div-pos: var(--cbx-blue);
+  --good: #00866f;
+  --warning: #9a7b00;
+  --serious: #c45a0c;
+  --critical: #c72828;
+  --delta-up: #00745f;
+  --delta-down: #c72828;
+  --floor: #e9eef6;
+  --floor-alt: #e2e8f2;
+  --corridor: #d7dfeb;
+  --wall: #8aa0c4;
+  --wall-top: #6a86b4;
+  --desk: #b9c6db;
+  --screen: #0b1a33;
+  --night: rgba(26, 58, 110, 0.14);
+  --room-label: #33415a;
+  --shadow: 0 10px 30px rgba(26, 58, 110, 0.14);
+}
+
+/* High contrast: stronger text and borders, no translucency, status colours that pass AAA on
+   the page. Works on both themes. */
+:root[data-contrast="high"] {
+  --text-secondary: var(--text-primary);
+  --text-muted: #c9d3e3;
+  --border: #7d93b8;
+  --border-strong: #c9d3e3;
+  --glass: transparent;
+  --focus: var(--cbx-yellow);
+  --night: rgba(5, 10, 16, 0.2);
+}
+:root[data-theme="light"][data-contrast="high"] {
+  --text-muted: #1f2b3e;
+  --border: #33415a;
+  --border-strong: #0b1a33;
+  --focus: #0047ab;
+  --page: #ffffff;
+  --surface-1: #ffffff;
+  --surface-2: #ffffff;
+}

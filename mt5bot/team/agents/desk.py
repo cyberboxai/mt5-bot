@@ -1,7 +1,7 @@
 """Strategy Desk: trend, mean-reversion, breakout/volatility and multi-timeframe analysts.
 
-Each analyst wraps a family of the existing strategy library. The analyst whose family
-holds the v2 champion is the PROPOSER for that bar: it votes for the champion's signal.
+Each analyst wraps a family of the strategy library. The analyst whose family owns the
+proposing arm is the PROPOSER for that bar: it votes for the arm's signal.
 The others vote with a deterministic, state-based bias of their family (for example the
 trend analyst's EMA alignment), so a vote exists on every bar, not only on crossings.
 Raw confidences are mapped to calibrated ones by the CIO from realised outcomes.
@@ -25,11 +25,11 @@ HTF_FACTOR = {"M1": 5, "M5": 6, "M15": 4, "M30": 4, "H1": 4, "H4": 6}
 
 def family_for(strategy: str, params: Optional[Mapping[str, Any]] = None) -> str:
     base = strategy[len("volfilter_"):] if strategy.startswith("volfilter_") else strategy
-    if base == "ema_cross":
+    if base in ("ema_cross", "momentum_pullback"):
         return "trend_analyst"
-    if base in ("donchian", "session_breakout"):
+    if base in ("donchian", "session_breakout", "ny_breakout", "vol_contraction"):
         return "breakout_analyst"
-    if base == "rsi_reversion":
+    if base in ("rsi_reversion", "vwap_reversion", "range_fade"):
         return "mean_reversion_analyst"
     if base == "bollinger":
         return "breakout_analyst" if (params or {}).get("mode") == "squeeze" else "mean_reversion_analyst"
@@ -70,7 +70,7 @@ class DeskAgent(Agent):
             side = 1 if proposal.side == "BUY" else -1
             confidence = 0.70 if direction == side else 0.60 if direction == 0 else 0.55
             stance = "long" if side > 0 else "short"
-            reasons = [("PROPOSER", f"champion {proposal.description} signals {proposal.side}")] + reasons
+            reasons = [("PROPOSER", f"arm {proposal.description} signals {proposal.side}")] + reasons
             details["proposer"] = True
             self.set_state(AgentState.DEBATING, task=f"{sym}: propõe {proposal.side}",
                            message=f"{sym}: proponho {proposal.side} ({proposal.strategy}), confiança {confidence:.2f}")

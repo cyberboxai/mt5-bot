@@ -31,3 +31,8 @@ panel.log.*
 state_sim/
 state_demo/
 simulation.log
+
+# v3.1 runtime files: upgrade backups, migrated config for review, browser smoke output
+backups/
+config.migrated.json
+smoke/

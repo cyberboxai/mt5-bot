@@ -428,12 +428,251 @@ class NotificationsConfig:
             _bool(f"notifications.{f.name}", getattr(self, f.name))
 
 
+# ----------------------------------------------------------------------- tiers
+
+
+def _opt_num(name: str, value: Any, low: float, high: float) -> None:
+    if value is not None:
+        _num(name, value, low, high)
+
+
+@dataclass(frozen=True)
+class TiersConfig:
+    """Evidence tiers and exploration (see ``mt5bot.tiers``). Risk numbers live in the profile."""
+
+    t1_enter_p: float = 0.55
+    t1_exit_p: float = 0.50
+    t1_min_evidence: int = 20
+    t2_enter_p: float = 0.80
+    t2_exit_p: float = 0.70
+    t2_min_trades: int = 50
+    t2_max_dd_r: float = 6.0
+    t3_enter_p: float = 0.93
+    t3_exit_p: float = 0.85
+    t3_min_trades: int = 100
+    t3_max_dd_r: float = 12.0
+    promote_cooldown_hours: float = 4.0
+    exploration_enabled: bool = True
+    exploration_slots: int = 2
+    exploration_threshold: float = 0.0
+    exploration_day_pct: Optional[float] = None
+    exploration_week_pct: Optional[float] = None
+    t1_risk_pct: Optional[float] = None
+    prior_discount: float = 0.3
+    tau_min: float = 0.05
+    global_mean: float = -0.03
+    evidence_refresh_seconds: float = 120.0
+    seed: int = 20261026
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "TiersConfig":
+        cfg = _build(cls, "tiers", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        for name in ("t1_enter_p", "t1_exit_p", "t2_enter_p", "t2_exit_p", "t3_enter_p", "t3_exit_p"):
+            _num(f"tiers.{name}", getattr(self, name), 0.5, 0.999)
+        if not (self.t1_exit_p < self.t1_enter_p and self.t2_exit_p < self.t2_enter_p
+                and self.t3_exit_p < self.t3_enter_p):
+            raise ValueError("tiers: every *_exit_p must be below its *_enter_p (hysteresis)")
+        if not (self.t1_enter_p < self.t2_enter_p < self.t3_enter_p):
+            raise ValueError("tiers: t1_enter_p < t2_enter_p < t3_enter_p is required")
+        _int("tiers.t1_min_evidence", self.t1_min_evidence, 0, 10000)
+        _int("tiers.t2_min_trades", self.t2_min_trades, 10, 10000)
+        _int("tiers.t3_min_trades", self.t3_min_trades, self.t2_min_trades, 100000)
+        _num("tiers.t2_max_dd_r", self.t2_max_dd_r, 1.0, 100.0)
+        _num("tiers.t3_max_dd_r", self.t3_max_dd_r, 1.0, 100.0)
+        _num("tiers.promote_cooldown_hours", self.promote_cooldown_hours, 0.0, 24.0 * 14)
+        _bool("tiers.exploration_enabled", self.exploration_enabled)
+        _int("tiers.exploration_slots", self.exploration_slots, 0, limits.MAX_OPEN_POSITIONS)
+        _num("tiers.exploration_threshold", self.exploration_threshold, -0.05, 1.0)
+        _opt_num("tiers.exploration_day_pct", self.exploration_day_pct, 0.0, limits.MAX_EXPLORATION_DAY_PCT)
+        _opt_num("tiers.exploration_week_pct", self.exploration_week_pct, 0.0, limits.MAX_EXPLORATION_WEEK_PCT)
+        _opt_num("tiers.t1_risk_pct", self.t1_risk_pct, 0.001, limits.MAX_EXPLORATION_TRADE_PCT)
+        _num("tiers.prior_discount", self.prior_discount, 0.0, 1.0)
+        _num("tiers.tau_min", self.tau_min, 0.01, 0.5)
+        _num("tiers.global_mean", self.global_mean, -0.5, 0.0)
+        _num("tiers.evidence_refresh_seconds", self.evidence_refresh_seconds, 10.0, 3600.0)
+        _int("tiers.seed", self.seed, 0, 2 ** 32 - 1)
+
+
+@dataclass(frozen=True)
+class CapitalConfig:
+    """Overrides of the profile's capital rules (null = use the profile; see ``mt5bot.capital``)."""
+
+    floor_drawdown_pct: Optional[float] = None
+    lock_fraction: Optional[float] = None
+    house_money_max: Optional[float] = None
+    kelly_fraction: Optional[float] = None
+    affordability_cap_pct: Optional[float] = None
+    floor_soft_stop: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "CapitalConfig":
+        cfg = _build(cls, "capital", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _opt_num("capital.floor_drawdown_pct", self.floor_drawdown_pct, 0.5, limits.MAX_DRAWDOWN_FROM_PEAK_PCT * 0.9)
+        _opt_num("capital.lock_fraction", self.lock_fraction, 0.0, limits.MAX_LOCK_FRACTION)
+        _opt_num("capital.house_money_max", self.house_money_max, 1.0, limits.MAX_HOUSE_MONEY)
+        _opt_num("capital.kelly_fraction", self.kelly_fraction, 0.01, limits.MAX_KELLY_FRACTION)
+        _opt_num("capital.affordability_cap_pct", self.affordability_cap_pct, 0.0, limits.MAX_RISK_PER_TRADE_PCT)
+        _bool("capital.floor_soft_stop", self.floor_soft_stop)
+
+
+DEFAULT_CANDIDATES = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "XAUUSD")
+UNIVERSE_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4")
+
+
+@dataclass(frozen=True)
+class UniverseConfig:
+    """Opportunity engine: which symbols and timeframes the arms may use."""
+
+    candidates: tuple[str, ...] = DEFAULT_CANDIDATES
+    timeframes: tuple[str, ...] = ("M5", "M15", "H1")
+    max_symbols: int = 6
+    max_arms: int = 400
+    default_arms: bool = True
+    max_spread_points_by_symbol: tuple[tuple[str, float], ...] = ()
+    spread_spike_mult: float = 2.5
+    max_spread_to_stop: float = 0.25
+    scan_every_minutes: float = 15.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "UniverseConfig":
+        if isinstance(data, Mapping):
+            data = dict(data)
+            for key in ("candidates", "timeframes"):
+                if isinstance(data.get(key), list):
+                    data[key] = tuple(data[key])
+            spread = data.get("max_spread_points_by_symbol")
+            if isinstance(spread, Mapping):
+                data["max_spread_points_by_symbol"] = tuple(sorted((str(k), v) for k, v in spread.items()))
+        cfg = _build(cls, "universe", data)
+        cfg.validate()
+        return cfg
+
+    def spread_cap(self, symbol: str) -> Optional[float]:
+        for name, value in self.max_spread_points_by_symbol:
+            if name == symbol or symbol.upper().startswith(name.upper()):
+                return float(value)
+        return None
+
+    def validate(self) -> None:
+        if not isinstance(self.candidates, tuple) or not all(isinstance(s, str) and s.strip() for s in self.candidates):
+            raise ValueError("universe.candidates must be a list of symbol names")
+        if not isinstance(self.timeframes, tuple) or not self.timeframes:
+            raise ValueError("universe.timeframes must be a non-empty list such as [\"M5\", \"M15\", \"H1\"]")
+        for tf in self.timeframes:
+            _choice("universe.timeframes entry", tf, UNIVERSE_TIMEFRAMES)
+        if len(set(self.timeframes)) != len(self.timeframes):
+            raise ValueError("universe.timeframes must not contain duplicates")
+        _int("universe.max_symbols", self.max_symbols, 1, 20)
+        _int("universe.max_arms", self.max_arms, 10, 2000)
+        _bool("universe.default_arms", self.default_arms)
+        if not isinstance(self.max_spread_points_by_symbol, tuple):
+            raise ValueError("universe.max_spread_points_by_symbol must be an object such as {\"EURUSD\": 20}")
+        for name, value in self.max_spread_points_by_symbol:
+            _num(f"universe.max_spread_points_by_symbol.{name}", value, 0.1, 1e6)
+        _num("universe.spread_spike_mult", self.spread_spike_mult, 1.2, 10.0)
+        _num("universe.max_spread_to_stop", self.max_spread_to_stop, 0.02, 1.0)
+        _num("universe.scan_every_minutes", self.scan_every_minutes, 1.0, 1440.0)
+
+
+@dataclass(frozen=True)
+class FlowDoctorConfig:
+    """Adaptive activity governor (see ``mt5bot.flow``). It only moves bounded knobs."""
+
+    enabled: bool = True
+    max_idle_hours_demo: float = 6.0
+    max_idle_hours_real: float = 12.0
+    review_after_trades: int = 10
+    review_after_hours: float = 48.0
+    revert_mean_r: float = -0.25
+    tighten_daily_loss_used: float = 0.6
+    min_hours_between_adjustments: float = 2.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "FlowDoctorConfig":
+        cfg = _build(cls, "flow_doctor", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _bool("flow_doctor.enabled", self.enabled)
+        _num("flow_doctor.max_idle_hours_demo", self.max_idle_hours_demo, 1.0, 24.0 * 14)
+        _num("flow_doctor.max_idle_hours_real", self.max_idle_hours_real, 1.0, 24.0 * 14)
+        _int("flow_doctor.review_after_trades", self.review_after_trades, 3, 1000)
+        _num("flow_doctor.review_after_hours", self.review_after_hours, 1.0, 24.0 * 30)
+        _num("flow_doctor.revert_mean_r", self.revert_mean_r, -2.0, 0.0)
+        _num("flow_doctor.tighten_daily_loss_used", self.tighten_daily_loss_used, 0.1, 1.0)
+        _num("flow_doctor.min_hours_between_adjustments", self.min_hours_between_adjustments, 0.25, 72.0)
+
+
+@dataclass(frozen=True)
+class ManagementConfig:
+    """Trade management policies, evaluated as evidence like arms (see ``mt5bot.management``)."""
+
+    policies_enabled: bool = True
+    policy_min_trades: int = 30
+    policy_min_p_better: float = 0.6
+    spread_spike_protect: bool = True
+    news_derisk_minutes: Optional[int] = 15
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ManagementConfig":
+        cfg = _build(cls, "management", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _bool("management.policies_enabled", self.policies_enabled)
+        _int("management.policy_min_trades", self.policy_min_trades, 10, 100000)
+        _num("management.policy_min_p_better", self.policy_min_p_better, 0.5, 0.999)
+        _bool("management.spread_spike_protect", self.spread_spike_protect)
+        if self.news_derisk_minutes is not None:
+            _int("management.news_derisk_minutes", self.news_derisk_minutes, 1, 240)
+
+
+@dataclass(frozen=True)
+class ResearchConfig:
+    """Quant Research department (walk-forward priors for the arms)."""
+
+    startup_trials: int = 8
+    startup_history_months: int = 6
+    retry_minutes: float = 60.0
+    reference_equity: float = 10_000.0
+    reference_risk_pct: float = 1.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ResearchConfig":
+        cfg = _build(cls, "research", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _int("research.startup_trials", self.startup_trials, 1, 200)
+        _int("research.startup_history_months", self.startup_history_months, 4, 60)
+        _num("research.retry_minutes", self.retry_minutes, 5.0, 24 * 60.0)
+        _num("research.reference_equity", self.reference_equity, 1000.0, 1e9)
+        _num("research.reference_risk_pct", self.reference_risk_pct, 0.1, limits.MAX_RISK_PER_TRADE_PCT)
+
+
 BLOCKS: dict[str, type] = {
     "claude": ClaudeConfig,
     "team": TeamConfig,
     "news": NewsConfig,
     "panel": PanelConfig,
     "notifications": NotificationsConfig,
+    "tiers": TiersConfig,
+    "capital": CapitalConfig,
+    "universe": UniverseConfig,
+    "flow_doctor": FlowDoctorConfig,
+    "management": ManagementConfig,
+    "research": ResearchConfig,
 }
 
 
@@ -450,6 +689,10 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, TeamConfig):
         out = {f.name: to_jsonable(getattr(value, f.name)) for f in dataclasses.fields(value)}
         out["agents"] = dict(value.agents)
+        return out
+    if isinstance(value, UniverseConfig):
+        out = {f.name: to_jsonable(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        out["max_spread_points_by_symbol"] = dict(value.max_spread_points_by_symbol)
         return out
     if dataclasses.is_dataclass(value):
         return {f.name: to_jsonable(getattr(value, f.name)) for f in dataclasses.fields(value)}

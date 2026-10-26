@@ -1,6 +1,7 @@
-"""``TeamRuntime``: builds the office (store, bus, supervisor, 21 agents, learner) and is
-the single object the bot talks to. Every entry point is defensive: the bot catches any
-exception from here and falls back to the deterministic v2 path (see ``Bot``)."""
+"""``TeamRuntime``: builds the office (store, bus, supervisor, 22 agents, learner) and is
+the single object the bot talks to. The team is one STAGE of the single decision pipeline
+(see ``Bot``): every entry point is defensive, and when it fails the pipeline records the
+stage as unavailable and continues without the team's reduction (the risk layer still runs)."""
 
 from __future__ import annotations
 
@@ -146,11 +147,13 @@ class TeamRuntime:
 
     def plan_management(self, positions: Sequence[PositionView], bars: Mapping[str, np.ndarray],
                         points: Mapping[str, float], minutes_to_news: Mapping[str, Optional[float]],
-                        advisor_features: Callable[[PositionView], Mapping[str, Any]]) -> list[ManagementAction]:
+                        advisor_features: Callable[[PositionView], Mapping[str, Any]],
+                        spiking: Optional[Mapping[str, bool]] = None) -> list[ManagementAction]:
         pm = self.agents.get("position_manager")
         if pm is None:
             return []
-        actions = list(pm.plan(positions, dict(bars), dict(points), dict(minutes_to_news)))  # type: ignore[attr-defined]
+        actions = list(pm.plan(positions, dict(bars), dict(points), dict(minutes_to_news),  # type: ignore[attr-defined]
+                               dict(spiking or {})))
         strategist = self.agents.get("claude_strategist")
         if strategist is not None and self.cfg.claude.manage_positions and self.effective_mode == "full":
             planned = {a.ticket for a in actions}
@@ -186,7 +189,7 @@ class TeamRuntime:
                     self._last_vacuum = now
                     self.store.set_kv("last_vacuum", str(now))
             except Exception:  # noqa: BLE001
-                log.warning("office.sqlite retention failed", exc_info=True)
+                log.warning("office tables retention failed", exc_info=True)
         self.persist_agent_states()
 
     def persist_agent_states(self) -> None:

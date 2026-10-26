@@ -4,51 +4,87 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CYBERBOX Trading Office</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="/static/img/favicon-48.png" type="image/png">
+  <link rel="preload" href="/static/fonts/syne-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/fonts/space-mono-400-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/css/fonts.css">
+  <link rel="stylesheet" href="/static/css/tokens.css">
   <link rel="stylesheet" href="/static/css/app.css">
   <script type="module" src="/static/js/main.js"></script>
 </head>
 <body>
-  <a class="skip" href="#view">Saltar para o conteúdo</a>
-  <header class="topbar">
-    <a class="wordmark" href="#/office" aria-label="CYBERBOX Trading Office">
-      <svg viewBox="0 0 40 40" aria-hidden="true">
-        <path d="M20 3 L35 11 L35 29 L20 37 L5 29 L5 11 Z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/>
-        <path d="M5 11 L20 19 L35 11 M20 19 L20 37" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" opacity="0.55"/>
-        <path d="M11 27 L16 22 L20 25 L28 15" fill="none" stroke="#3987e5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="28" cy="15" r="2.6" fill="#d95926"/>
-      </svg>
-      <span><span class="name">CYBERBOX</span> <span class="sub">Trading Office</span><br><span class="sub" id="app-sub">Escritório de negociação</span></span>
-    </a>
-    <div class="badges" aria-live="polite">
-      <span class="badge" id="account-badge">?</span>
-      <span class="badge" id="mode-badge"></span>
-      <span class="badge" id="advisor-badge"></span>
-      <span class="badge" id="stream-badge"></span>
+  <a class="skip" href="#view" data-i18n="a11y.skip">Saltar para o conteúdo</a>
+  <div class="app loading" id="app">
+    <header class="topbar" id="topbar">
+      <button class="icon-btn roster-toggle" id="roster-toggle" type="button" aria-controls="roster" aria-expanded="false"
+              data-i18n-label="roster.toggle">☰</button>
+      <a class="brand" href="#/office">
+        <img class="brand-logo" src="/static/img/cyberbox-logo-96.png" width="40" height="40" alt="CYBERBOX">
+        <span class="brand-text"><span class="brand-name">CYBER<span>BOX</span></span><span class="brand-sub" data-i18n="app.subtitle">Trading Office</span></span>
+      </a>
+      <span class="env-badge env-unknown" id="account-badge" role="status">?</span>
+      <div class="kpis" id="kpis" role="group" data-i18n-label="kpi.group">
+        <div class="kpi" id="kpi-equity"></div>
+        <div class="kpi" id="kpi-pnl"></div>
+        <div class="kpi" id="kpi-cushion"></div>
+        <div class="kpi kpi-meter" id="kpi-explore"></div>
+      </div>
+      <span class="mode-chip" id="mode-chip" role="status"></span>
+      <span class="lamp lamp-grey" id="advisor-lamp" role="status"></span>
+      <div class="clocks" role="group" data-i18n-label="clock.group">
+        <span class="clock-server" data-i18n-title="clock.server_full"><span class="clock-label" data-i18n="clock.server">Servidor</span> <strong id="clock-server">--:--</strong></span>
+        <span class="clock-pill" id="clock-tokyo"></span>
+        <span class="clock-pill" id="clock-london"></span>
+        <span class="clock-pill" id="clock-new_york"></span>
+      </div>
+      <div class="tools">
+        <span class="stream" id="stream-badge" role="status"></span>
+        <button class="icon-btn" id="palette-btn" type="button" data-i18n-label="palette.open" data-i18n-title="palette.open">⌕ <kbd class="kbd-hint">Ctrl K</kbd></button>
+        <button class="icon-btn" id="help-btn" type="button" data-i18n-label="tour.open" data-i18n-title="tour.open">?</button>
+        <button class="icon-btn" id="settings-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings-panel"
+                data-i18n-label="settings.title" data-i18n-title="settings.title">⚙</button>
+        <button class="icon-btn" id="theme-btn" type="button" data-i18n-label="theme.toggle" data-i18n-title="theme.toggle">◐</button>
+        <button class="icon-btn" id="lang-btn" type="button">EN</button>
+      </div>
+    </header>
+    <div class="banners">
+      <div class="banner" id="banner-account" role="note" hidden></div>
+      <div class="banner warn" id="banner-offline" role="alert" hidden></div>
+      <div class="banner warn" id="banner-paused" role="status" hidden></div>
     </div>
-    <div class="clock">
-      <span id="clock-label">Hora do servidor</span>
-      <strong id="clock-time">--:--:--</strong>
-      <div class="sessions" id="sessions"></div>
+    <div class="shell">
+      <aside class="roster" id="roster" data-i18n-label="roster.title">
+        <div class="roster-head">
+          <h2 class="roster-title"><span data-i18n="roster.title">Equipa</span> <span class="count" id="roster-count">0</span></h2>
+          <input type="search" id="roster-search" class="roster-search" data-i18n-label="roster.search" autocomplete="off">
+        </div>
+        <ul class="roster-list" id="roster-list"></ul>
+      </aside>
+      <section class="workspace">
+        <p class="status-line" id="status-line" role="status"></p>
+        <nav class="tabs" id="tabs" role="tablist" data-i18n-label="tabs.label"></nav>
+        <main id="view" class="view" tabindex="-1" role="tabpanel"></main>
+      </section>
     </div>
-    <div class="tools">
-      <button class="icon-btn" id="theme-btn" type="button">Tema</button>
-      <button class="icon-btn" id="lang-btn" type="button">EN</button>
-    </div>
-  </header>
-  <div class="banner" id="banner-account" hidden></div>
-  <div class="banner warn" id="banner-offline" hidden></div>
-  <div class="banner warn" id="banner-paused" hidden></div>
-  <nav class="tabs" id="tabs" role="tablist" aria-label="Separadores"></nav>
-  <main id="view" tabindex="-1"></main>
+    <footer class="bottombar" id="bottombar">
+      <div class="ticker" aria-hidden="true"><ul class="ticker-list" id="ticker-list"></ul></div>
+      <div class="replay-slot" id="replay-slot" role="group" data-i18n-label="office.replay"></div>
+    </footer>
+  </div>
+  <div class="settings-panel" id="settings-panel" role="dialog" aria-modal="false" data-i18n-label="settings.title" hidden></div>
+  <div class="palette" id="palette" hidden></div>
+  <div class="tour" id="tour" hidden></div>
   <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
   <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
-    <button class="icon-btn close" id="drawer-close" type="button">Fechar</button>
+    <button class="icon-btn close" id="drawer-close" type="button" data-i18n="common.close">Fechar</button>
     <h2 id="drawer-title"></h2>
     <p class="muted small" id="drawer-sub"></p>
     <div id="drawer-body"></div>
   </aside>
   <div class="modal" id="modal" role="dialog" aria-modal="true" hidden><div class="box" id="modal-box"></div></div>
   <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  <div class="sr-only" id="announcer" aria-live="polite" aria-atomic="true"></div>
+  <div class="sr-only" id="announcer-urgent" aria-live="assertive" aria-atomic="true"></div>
 </body>
 </html>

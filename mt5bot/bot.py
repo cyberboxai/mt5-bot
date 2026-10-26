@@ -1,7 +1,15 @@
-"""Live trading loop. All terminal access goes through ``api`` (the MetaTrader5 module).
+"""Live trading loop: the ONE decision path from market data to an order.
 
-Every order passes through ``risk`` before it reaches the broker, and every order carries
-SL and TP, so protection lives on the broker server even if this process or the PC dies.
+For every symbol of the universe and every timeframe its arms trade on, each closed bar goes
+through the same stages, each emitting reason codes into the decision funnel:
+
+    data -> arms (shadow books, signals) -> allocation (tiers, exploration) -> sizing
+    (capital, budget, affordability) -> team review (CIO protocol, optional advisor; can only
+    shrink) -> hard risk layer -> execution with server-side SL and TP
+
+All terminal access goes through ``api`` (the MetaTrader5 module). Every order passes
+through ``risk`` before it reaches the broker and carries SL and TP, so protection lives on
+the broker server even if this process or the PC dies.
 """
 
 from __future__ import annotations
@@ -13,25 +21,34 @@ import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from . import __version__, indicators, limits
+from . import __version__, flow, funnel as funnel_mod, indicators, limits
+from . import regime as regime_mod
+from .allocation import AllocationInputs, allocate
+from .arms import ArmEngine, ArmSignal, EntryIntent
+from .capital import CapitalState, SizingDecision, SizingInputs, affordability, anti_martingale_cap, size_risk, \
+    split_volume
 from .config import Config, apply_overrides, in_trading_hours, reload_decision
-from .cycle import OptimizerScheduler, cost_model
-from .engine import AdaptiveEngine, EngineSettings, EntryIntent
+from .db import db_path
+from .funnel import Funnel
 from .market import ServerClock, fmt_server_time, is_weekend, market_expected_open, server_datetime
 from .notify import Notifier
+from .opportunity import STOP_ATR, affordability_rows, atr_and_spread, rank, score_symbol
 from .persistence import account_key, account_state_dir
 from .registry import Registry
 from .reports import trade_stats, write_health, write_report
+from .research import ResearchScheduler, cost_model
 from .risk import (EntryContext, EquityGuard, NewsCalendar, OpenRisk, RiskManager, RiskViolation, SymbolSpec,
                    TradePlan, plan_trade, validate_open_request, validate_sl_change)
 from .terminal import FreezeWatchdog, discover_terminal_paths, kill_terminal, terminal_exe_from_info
+from .tiers import exploration_room, server_week_start
 
 log = logging.getLogger("mt5_bot")
 
@@ -48,7 +65,12 @@ RECONNECT_MAX_SECONDS = 120.0
 CONNECT_WAIT_SECONDS = 60.0
 HOUSEKEEPING_SECONDS = 60.0
 CASH_FLOW_SECONDS = 600.0
+FLOW_SECONDS = 300.0
+FUNNEL_RETENTION_DAYS = 30.0
 MARKET_CLOSED_BACKOFF_SECONDS = 900.0
+QUARANTINE_AFTER = 3          # consecutive execution failures before a symbol is paused
+QUARANTINE_MINUTES = 30.0
+QUARANTINE_MAX_MINUTES = 480.0
 EMERGENCY_SL_ATR_MULT = 2.0
 EMERGENCY_TP_R = 1.5
 
@@ -64,7 +86,6 @@ REAL_MONEY_HELP = (
     "or set \"real_money_confirmed\": true in config.json. Read the README risk section first: "
     "losses are possible and no profit is guaranteed."
 )
-
 
 PAUSE_MARKER = "PAUSE_ENTRIES"
 
@@ -91,6 +112,7 @@ class EntryOutcome:
     dry_run: bool = False
     base_volume: float = 0.0
     risk_pct: float = 0.0
+    code: str = ""
 
 
 class AccountPolicyError(RuntimeError):
@@ -150,7 +172,7 @@ def resolve_symbol(api: Any, wanted: str) -> Optional[str]:
 
 
 class Bot:
-    """Trading loop wiring the adaptive engine, the risk layer and the broker."""
+    """Trading loop wiring the arms, the team, the risk layer and the broker."""
 
     def __init__(
         self,
@@ -172,13 +194,15 @@ class Bot:
         advisor: Any = None,
         no_claude: bool = False,
         durable_files: bool = True,
+        auto_migrate: bool = True,
     ) -> None:
         if api is None:
             try:
                 import MetaTrader5 as api  # type: ignore[no-redef]
             except ImportError as exc:  # pragma: no cover - machines without the package
                 raise StartupError("MetaTrader5 package is not installed. Run: pip install -r requirements.txt") from exc
-        self.cfg = cfg
+        self.base_cfg = cfg          # the file config plus command-line overrides
+        self.cfg = cfg               # the effective config: base plus the Flow Doctor's bounded knobs
         self.mt5 = api
         self._env = os.environ if env is None else env
         self._stop = threading.Event()
@@ -188,45 +212,63 @@ class Bot:
         self._utc_now = utc_now
         self.config_path = config_path
         self.confirm_real_money = confirm_real_money
-        self._signal_source = signal_source
+        self._signal_source = signal_source   # test seam: an external proposer on the primary timeframe
         self.notifier = notifier or Notifier(cfg.telegram_enabled, self._env)
         self._spawn = spawn
         self._globber = globber
         self._terminal_killer = terminal_killer
         self._overrides = dict(cli_overrides or {})
-        self._timeframe = getattr(self.mt5, f"TIMEFRAME_{cfg.timeframe}")
+        self._auto_migrate = auto_migrate
         self._kill_path = Path(cfg.kill_switch_file)
-        self._last_bar: dict[str, int] = {}
+        self._last_bar: dict[tuple[str, str], int] = {}
         self._login: Optional[int] = None
         self.is_real = False
         self.hedging = True
-        self.symbols: dict[str, str] = {}
+        self.symbols: dict[str, str] = {}      # core symbols: configured name -> broker name
+        self.universe: list[str] = []          # broker names of every traded symbol (core first)
         self.specs: dict[str, SymbolSpec] = {}
         self.commission: dict[str, float] = {}
         self._next_heartbeat = 0.0
         self._next_housekeeping = 0.0
         self._next_cash_flow = 0.0
         self._next_reload = 0.0
+        self._next_flow = 0.0
+        self._next_scan = 0.0
+        self._next_prune = 0.0
         self._config_mtime: Optional[float] = None
         self._reconnect_delay: Optional[float] = None
         self._next_reconnect = 0.0
         self._slippage_pause: dict[str, float] = {}
+        # Self-healing: consecutive execution failures per symbol, and quarantine (until, strikes).
+        self._exec_failures: dict[str, int] = {}
+        self._quarantine: dict[str, tuple[float, int]] = {}
+        self._universe_skipped: set[str] = set()  # candidates the last universe selection rejected
         self._closed_until: dict[str, float] = {}
         self._market_state: dict[str, bool] = {}
         self._next_wait = cfg.poll_seconds
         self._init_path: Optional[str] = None
         self._last_loop_utc: Optional[float] = None
         self._first_loop = True
+        self._started_utc = float(utc_now())
         self.news = NewsCalendar()
         self.clock = ServerClock(utc_now=utc_now, monotonic=monotonic)
         self.watchdog = FreezeWatchdog(cfg.terminal_freeze_minutes * 60, monotonic)
         self.registry: Optional[Registry] = None
         self.guard: Optional[EquityGuard] = None
         self.risk: Optional[RiskManager] = None
-        self.engine: Optional[AdaptiveEngine] = None
-        self.scheduler: Optional[OptimizerScheduler] = None
+        self.arms: Optional[ArmEngine] = None
+        self.scheduler: Optional[ResearchScheduler] = None
         self.state_dir: Optional[Path] = None
-        # v3: optional specialist team and advisor. The deterministic core never depends on them.
+        self.funnel = Funnel(None, clock=utc_now)
+        self.capital = CapitalState()
+        self.flow_state = flow.FlowState()
+        self.flow_active: list[flow.Adjustment] = []
+        self.opportunity: list[dict[str, Any]] = []
+        self.affordability: list[dict[str, Any]] = []
+        self._spread_hourly: dict[str, dict[int, float]] = {}
+        self._research_running = False
+        self._rng = np.random.default_rng(int(cfg.tiers.seed))
+        # Optional specialist team and advisor: a stage of the pipeline, never a separate path.
         self._durable_files = durable_files
         self._team_enabled = team
         self._advisor_override = advisor
@@ -313,6 +355,13 @@ class Bot:
             log.warning("mt5.initialize(%s) failed: %s", path or "", self._last_error())
         return False
 
+    def _tf(self, timeframe: str) -> int:
+        return getattr(self.mt5, f"TIMEFRAME_{timeframe}")
+
+    def timeframes(self) -> tuple[str, ...]:
+        """Timeframes processed each loop. An external (test) source only uses the primary one."""
+        return (self.cfg.timeframe,) if self._signal_source is not None else self.cfg.arm_timeframes()
+
     def startup(self) -> None:
         """Connect and run every pre-trade safety check. Raises StartupError or AccountPolicyError."""
         if not self._initialize():
@@ -339,16 +388,15 @@ class Bot:
         self.hedging = getattr(acc, "margin_mode", hedging_mode) == hedging_mode
 
         self.state_dir = account_state_dir(self.cfg.state_root, acc.server, acc.login)
-        self.registry = Registry(self.state_dir / "registry.sqlite", clock=self._utc_now)
+        self._migrate_if_needed()
+        self.registry = Registry(db_path(self.state_dir), clock=self._utc_now)
+        self.funnel = Funnel(self.registry.tx, clock=self._utc_now)
         self.guard = EquityGuard(self.state_dir)
         self.risk = RiskManager(self.cfg, self.is_real)
-        if self._signal_source is None:
-            self.scheduler = OptimizerScheduler(self.cfg, self.registry, self.state_dir, self.config_path,
-                                                self.refresh_market_data, clock=self._utc_now, spawn=self._spawn)
-            self.engine = AdaptiveEngine(self.registry, EngineSettings.from_config(self.cfg),
-                                         notify=self.notifier.send, request_reoptimization=self.scheduler.request,
-                                         clock=self._utc_now)
-            self._signal_source = self.engine
+        self.capital = CapitalState.from_json(self.registry.get_kv("capital_state"))
+        self.capital.observe(float(acc.equity), self._utc_now())
+        self.flow_state = flow.FlowState.from_json(self.registry.get_kv("flow_state"))
+        self.flow_active = self._load_flow_adjustments()
         offset = self.registry.get_kv("server_offset")
         if offset is not None:
             self.clock.offset = int(offset)
@@ -364,18 +412,102 @@ class Bot:
                 log.info("Symbol %s resolved to broker name %s", wanted, name)
             self.symbols[wanted] = name
             self._refresh_spec(name)
+        self.universe = list(self.symbols.values())
+        if self._signal_source is None:
+            self._select_universe(acc)
         self.registry.set_kv("resolved_symbols", json.dumps(self.symbols))
+        self.registry.set_kv("universe", json.dumps({"symbols": self.universe, "timeframes": list(self.timeframes())}))
         self.registry.set_kv("is_real", "1" if self.is_real else "0")
         self.registry.set_kv("equity", str(float(acc.equity)))
         if self.cfg.news_filter_enabled:
             self._load_news()
         self._pause_path = self.state_dir / PAUSE_MARKER
+        if self._signal_source is None:
+            self.arms = ArmEngine(self.registry, self.cfg.tiers, self.cfg.research, clock=self._utc_now,
+                                  notify=self.notifier.send, on_tier_change=self._on_tier_change,
+                                  management_cfg=self.cfg.management)
+            if self.cfg.universe.default_arms:
+                created = self.arms.ensure_default_arms(self.universe, self.timeframes(), self.cfg.strategy_names(),
+                                                        self.cfg.universe.max_arms)
+                if created:
+                    log.info("%d new arm(s) created in shadow (T0); evidence decides their tiers", created)
+            self.scheduler = ResearchScheduler(self.cfg, self.registry, self.state_dir, self.config_path,
+                                               self.refresh_market_data, clock=self._utc_now, spawn=self._spawn)
+        self._apply_flow_knobs(log_changes=False)
         self._start_team()
+        if self.arms is not None:
+            self.arms.refresh(force=True)
 
         self.banner(acc)
         self.reconcile()
         self.notifier.send(f"Bot {__version__} started on {'REAL' if self.is_real else 'DEMO'} account "
                            f"{mask(acc.login)} ({acc.server}), equity {acc.equity:.2f} {acc.currency}")
+
+    def _migrate_if_needed(self) -> None:
+        """First start of v3.1 on a v3.0 install: back up, then merge the old databases in place."""
+        from . import upgrade
+
+        if not self._auto_migrate or self.state_dir is None or not upgrade.needs_migration(self.state_dir):
+            return
+        project = Path(self.config_path).resolve().parent
+        log.warning("First start of version %s on an older install: backing up and migrating the state", __version__)
+        report = upgrade.migrate_installation(project, Path(self.config_path), Path(self.cfg.state_root),
+                                              Path(self.cfg.health_file), self.cfg.timeframe)
+        log.warning("Migration done. Backup: %s. Rollback: python mt5_bot.py --rollback-upgrade", report["backup"])
+
+    def _select_universe(self, acc: Any) -> None:
+        """Core symbols plus the most attractive feasible candidates the broker offers."""
+        cap = self.cfg.universe.max_symbols
+        extra = int(self.flow_state.knobs.get("universe_extra", 0))
+        scored: list[tuple[float, str]] = []
+        self._universe_skipped = set()
+        for wanted in self.cfg.universe.candidates:
+            if wanted in self.symbols:
+                continue
+            name = resolve_symbol(self.mt5, wanted)
+            if name is None or name in self.universe:
+                continue
+            try:
+                if not self.mt5.symbol_select(name, True):
+                    continue
+                info = self.mt5.symbol_info(name)
+                if info is None or info.trade_mode != self.mt5.SYMBOL_TRADE_MODE_FULL:
+                    self._universe_skipped.add(name)
+                    continue
+                spec = self._refresh_spec(name)
+                bars = self.mt5.copy_rates_from_pos(name, self._tf(self.cfg.timeframe), 1, 300)
+            except Exception:  # noqa: BLE001 - a candidate must never stop startup
+                log.debug("candidate %s skipped", wanted, exc_info=True)
+                continue
+            atr, spread, vol_ratio = atr_and_spread(bars)
+            lim = self.risk.limits
+            afford = affordability(name, self.cfg.timeframe, (atr or 0.0) * STOP_ATR, spec.value_per_price,
+                                   spec.volume_min, self.commission.get(name, 0.0), float(acc.equity),
+                                   lim.t1_risk_pct, lim.explore_trade_pct) if atr else None
+            if afford is not None and not afford.feasible:
+                self._universe_skipped.add(name)
+                log.info("Universe: %s skipped: its minimum lot risks %.3f%% of equity at a %.1f ATR stop "
+                         "(needs equity >= %.0f for exploration)", name, afford.min_lot_risk_pct, STOP_ATR,
+                         afford.min_equity)
+                continue
+            s = score_symbol(name, spread, atr, spec.point, vol_ratio, True, True, 0.0, None)
+            scored.append((s.total, name))
+        for _score, name in sorted(scored, reverse=True):
+            if len(self.universe) >= cap + extra:
+                break
+            self.universe.append(name)
+        log.info("Universe: %s on %s", ", ".join(self.universe), ", ".join(self.timeframes()))
+
+    def _can_add_symbol(self) -> bool:
+        """True when a candidate outside the universe could still be added, i.e. when relaxing
+        ``universe_extra`` would change anything (regression: it was relaxed with none left)."""
+        for wanted in self.cfg.universe.candidates:
+            if wanted in self.symbols or wanted in self._universe_skipped:
+                continue
+            name = resolve_symbol(self.mt5, wanted)
+            if name is not None and name not in self.universe and name not in self._universe_skipped:
+                return True
+        return False
 
     def _notify_advisor(self, text: str) -> None:
         """Advisor outage notifications, if ``notifications.advisor_state`` (read at send time: reloadable)."""
@@ -383,17 +515,18 @@ class Bot:
             self.notifier.send(text)
 
     def _start_team(self) -> None:
-        """Build the optional advisor and the specialist team. A failure here never stops trading."""
+        """Build the optional advisor and the specialist team. A failure here never stops trading:
+        the decision pipeline then runs its team stage as neutral (recorded in the funnel)."""
         if not self._team_enabled:
             return
         try:
             from .advisor import build_advisor
-            from .officedb import OfficeStore, office_path
+            from .officedb import OfficeStore
             from .team.runtime import TeamRuntime
             from .teambridge import menu_lookup as _menu_lookup
             from .teambridge import strategy_menu as _strategy_menu
 
-            self.office = OfficeStore(office_path(self.state_dir), clock=self._utc_now)
+            self.office = OfficeStore(db_path(self.state_dir), clock=self._utc_now, shared=self.registry)
             self.advisor = self._advisor_override or build_advisor(
                 self.cfg, store=self.office, env=self._env, notify=self._notify_advisor, no_claude=self._no_claude,
                 strategy_menu=_strategy_menu, menu_lookup=_menu_lookup)
@@ -401,9 +534,22 @@ class Bot:
                                     clock=self._utc_now, monotonic=self._monotonic, store=self.office)
             if self.cfg.claude.enabled and not self._no_claude:
                 log.info("Claude advisor: %s", self.advisor.snapshot().get("state"))
-        except Exception:  # noqa: BLE001 - the team is optional; the deterministic core must keep running
-            log.exception("The specialist team could not start; trading continues on the deterministic v2 path")
+        except Exception:  # noqa: BLE001 - the team is optional; the pipeline keeps running without it
+            log.exception("The specialist team could not start; its review stage is skipped (neutral)")
             self.team = None
+
+    def _on_tier_change(self, arm: Any, decision: Any, audit_id: int) -> None:
+        if decision.tier in ("T2", "T3") or decision.previous in ("T2", "T3"):
+            self.notifier.send(f"{arm.symbol}: {arm.short()} {decision.previous} -> {decision.tier} (#{audit_id})",
+                               key=f"tier-{arm.id}")
+        if self.team is not None:
+            from .team.events import ArmTierChanged
+
+            post = arm.posterior
+            self.team.bus.publish(ArmTierChanged(arm.id, arm.describe(), decision.previous, decision.tier,
+                                                 decision.reason[:240], round(post.p_positive, 4) if post else None),
+                                  agent="quant_researcher", symbol=arm.symbol,
+                                  severity="notice" if decision.direction == "up" else "warning")
 
     def _entry_block_reason(self) -> Optional[str]:
         """Why NEW entries are blocked right now (positions are never closed for these reasons)."""
@@ -413,6 +559,9 @@ class Bot:
             return "new entries paused from the panel (PAUSE_ENTRIES marker in the state folder)"
         if self._guardian_freeze:
             return f"Guardian freeze: {self._guardian_freeze}"
+        if self.cfg.capital.floor_soft_stop and self.capital.soft_stop_day is not None and self.guard is not None \
+                and self.capital.soft_stop_day == self.guard.state.day:
+            return "profit floor reached: new entries stopped for today (soft breaker; --rebase-floor to override)"
         return None
 
     @property
@@ -421,13 +570,16 @@ class Bot:
 
     def banner(self, acc: Any) -> None:
         kind = "REAL MONEY" if self.is_real else "DEMO"
+        lim = self.risk.limits
         lines = [
             "=" * 72,
             f"  ACCOUNT {mask(acc.login)} on {acc.server}: {kind}",
             f"  equity {acc.equity:.2f} {acc.currency}, leverage 1:{getattr(acc, 'leverage', '?')}, "
             f"{'hedging' if self.hedging else 'netting'} account",
-            f"  risk per trade {self.risk.risk_pct:.2f}%, daily loss limit {self.risk.max_daily_loss_pct:.2f}%, "
-            f"drawdown breaker {self.risk.max_drawdown_pct:.1f}% from peak",
+            f"  risk profile {lim.profile}: per trade T1 {lim.t1_risk_pct:.2f}% / T2 {lim.t2_risk_pct:.2f}% / "
+            f"T3 {lim.t3_risk_pct:.2f}%, daily loss {lim.daily_loss_pct:.2f}%, breaker {lim.drawdown_breaker_pct:.1f}%",
+            f"  exploration budget {lim.explore_day_pct:.2f}% per day, {lim.explore_week_pct:.2f}% per week; "
+            f"profit floor {self.capital.floor(lim):.2f}",
             f"  state folder {self.cfg.state_root}/{account_key(acc.server, acc.login).replace(str(acc.login), mask(acc.login))}",
             f"  mode: {'DRY RUN (no orders will be sent)' if self.cfg.dry_run else 'LIVE ORDERS'}",
             "=" * 72,
@@ -435,8 +587,9 @@ class Bot:
         level = logging.WARNING if self.is_real else logging.INFO
         for line in lines:
             log.log(level, line)
-        log.info("Config: symbols=%s timeframe=%s magic=%d strategies=%s", ",".join(self.symbols.values()),
-                 self.cfg.timeframe, self.cfg.magic, ",".join(self.cfg.strategy_names()))
+        arms = self.arms.counts() if self.arms is not None else {}
+        log.info("Config: universe=%s timeframes=%s magic=%d arms=%s", ",".join(self.universe),
+                 ",".join(self.timeframes()), self.cfg.magic, arms or "external source")
 
     def _verify_terminal(self) -> None:
         deadline = self._monotonic() + CONNECT_WAIT_SECONDS
@@ -477,6 +630,15 @@ class Bot:
             log.debug("mt5.shutdown() raised", exc_info=True)
 
     def close(self) -> None:
+        try:
+            self.funnel.flush()
+        except Exception:  # noqa: BLE001 - best effort during exit
+            log.debug("funnel flush at close failed", exc_info=True)
+        if self.registry is not None:
+            try:
+                self.registry.set_kv("capital_state", self.capital.to_json())
+            except Exception:  # noqa: BLE001
+                log.debug("capital state not saved at close", exc_info=True)
         if self.advisor is not None:
             self.advisor.close()
             self.advisor = None
@@ -577,22 +739,24 @@ class Bot:
         any_fresh = self._observe_ticks()
         server_now = self.clock.now()
         # Deposits/withdrawals must be accounted for BEFORE the loss limits are evaluated,
-        # otherwise a withdrawal would trip the drawdown breaker.
+        # otherwise a withdrawal would trip the drawdown breaker or the daily limit.
         near_limit = (self.guard.drawdown_pct(acc.equity) >= self.risk.max_drawdown_pct
-                      or self.guard.daily_loss_pct(acc.equity) >= self.risk.max_daily_loss_pct)
+                      or self.guard.daily_loss_pct(acc.equity) >= self.risk.max_daily_loss_pct
+                      or self.capital.cushion(float(acc.equity), self.risk.limits) <= 0)
         if near_limit or self._monotonic() >= self._next_cash_flow:
             self._next_cash_flow = self._monotonic() + CASH_FLOW_SECONDS
             self._check_cash_flow()
         events = self.guard.update(server_datetime(server_now).date().isoformat(), acc.equity,
                                    self.risk.max_daily_loss_pct, self.risk.max_drawdown_pct)
         self._handle_guard_events(events, acc, server_now)
+        self._update_capital(acc)
         self._maybe_reload_config()
         self._housekeeping(acc, server_now)
         self._maybe_heartbeat(acc)
         if self.guard.halted_reason:
             self._keep_flat_while_halted()
 
-        for wanted, symbol in self.symbols.items():
+        for symbol in list(self.universe):
             if self._stop.is_set():
                 break
             try:
@@ -605,10 +769,24 @@ class Bot:
         self._loop_ms = (time.perf_counter() - loop_started) * 1000.0
         return None
 
+    def _update_capital(self, acc: Any) -> None:
+        """Risk capital is re-evaluated every loop: deposits, withdrawals and P&L move it at once."""
+        equity = float(acc.equity)
+        self.capital.observe(equity, self._utc_now())
+        lim = self.risk.limits
+        if self.cfg.capital.floor_soft_stop and self.capital.cushion(equity, lim) <= 0 and self.guard.state.day:
+            if self.capital.soft_stop_day != self.guard.state.day:
+                self.capital.soft_stop_day = self.guard.state.day
+                text = (f"Profit floor reached: equity {equity:.2f} <= floor {self.capital.floor(lim):.2f}. New "
+                        "entries stop for today (soft breaker); open positions keep their SL/TP.")
+                log.warning(text)
+                self.notifier.send(text, key="floor")
+                self.registry.set_kv("capital_state", self.capital.to_json())
+
     def _observe_ticks(self) -> bool:
         stale = self.cfg.stale_tick_minutes * 60
         any_fresh = False
-        for symbol in self.symbols.values():
+        for symbol in self.universe:
             tick = self.mt5.symbol_info_tick(symbol)
             if tick is not None:
                 self.clock.observe(symbol, int(tick.time), float(tick.bid), float(tick.ask))
@@ -670,7 +848,12 @@ class Bot:
                 self._write_reports(server_now, acc)
         self._first_loop = False
         if "resumed" in events:
-            log.warning("RESUME marker removed: drawdown circuit breaker cleared; peak restarts at %.2f", acc.equity)
+            # A human reviewed the drawdown and resumed: a new risk epoch starts, so the profit
+            # floor (which sits below the old starting capital) does not keep blocking entries.
+            self.capital.rebase(float(acc.equity), self._utc_now())
+            self.registry.set_kv("capital_state", self.capital.to_json())
+            log.warning("RESUME marker removed: drawdown circuit breaker cleared; peak and profit floor restart from "
+                        "%.2f", acc.equity)
             self.notifier.send(f"Drawdown breaker cleared by a human; trading resumes. Equity {acc.equity:.2f}")
         if "drawdown_trip" in events:
             text = (f"DRAWDOWN CIRCUIT BREAKER: equity {acc.equity:.2f} is "
@@ -712,31 +895,14 @@ class Bot:
         log.info("Heartbeat: equity %.2f %s, balance %.2f, bot positions %s, halted=%s, day start equity %s",
                  acc.equity, acc.currency, acc.balance, open_count, self.guard.halted_reason or False,
                  f"{self.guard.state.start_equity:.2f}" if self.guard.state.start_equity is not None else "n/a")
-        for symbol in self.symbols.values():
-            log.info("%s: %s", symbol, self.status_line(symbol))
+        log.info("Status: %s", self.status_line())
 
-    def status_line(self, symbol: str) -> str:
-        if self.engine is None:
-            return "external signal source"
-        champion = self.registry.champion(symbol)
-        if not champion.is_notrade:
-            return f"champion {champion.describe()} trading"
-        progress = self.engine.promotion_status(symbol)
-        run = self.registry.latest_run(symbol)
-        if run is None:
-            running = self.scheduler is not None and self.scheduler.running()
-            return ("OBSERVATION: collecting data; first optimisation "
-                    f"{'running' if running else 'pending'}. No orders until a candidate is promoted.")
-        if not progress:
-            return (f"NO TRADE: no candidate passed the gates in run {run['id']}; standing aside by design. "
-                    "Next cycle at the weekly re-optimisation.")
-        best = max(progress, key=lambda p: (p["enough_evidence"], p["shadow_trades"]))
-        boot = self.engine.bootstrap_left() / 86400
-        return (f"OBSERVATION: best challenger {best['candidate']}: shadow {best['shadow_trades']}/"
-                f"{self.cfg.min_shadow_trades} trades, {best['shadow_days']}/{self.cfg.min_shadow_days:g} days, "
-                f"mean {best['shadow_expectancy_r']:+.3f}R"
-                + (f", bootstrap {boot:.1f} days left" if boot > 0 else "")
-                + ". No orders until a candidate is promoted.")
+    def status_line(self, symbol: Optional[str] = None) -> str:
+        """Plain-language status (PT-PT), the same text the panel and --status show."""
+        if self.arms is None:
+            return "fonte de sinais externa (teste)"
+        return self.flow_state.status_text or flow.status_text(self.arms.counts(), None, 0, False,
+                                                               self._entry_block_reason())
 
     # ------------------------------------------------------------ housekeeping
 
@@ -746,6 +912,7 @@ class Bot:
             return
         self._next_housekeeping = now + HOUSEKEEPING_SECONDS
         self.registry.set_kv("equity", str(float(acc.equity)))
+        self.registry.set_kv("capital_state", self.capital.to_json())
         try:
             positions = self._bot_positions()
         except RuntimeError as exc:
@@ -757,16 +924,48 @@ class Bot:
             self.registry.snapshot_equity(acc.equity, acc.balance, self.guard.state.peak_equity, len(positions))
             self._run_guardian(acc)
         self._check_terminal_freeze(positions)
+        if self.arms is not None:
+            try:
+                self.arms.refresh()
+            except Exception:  # noqa: BLE001 - evidence refresh must never break trading
+                log.exception("Arm evidence refresh failed; tiers unchanged")
+        self.funnel.flush()
         if self.team is not None:
             try:
                 self.team.housekeeping(float(self._utc_now()), self._bot_status(acc, positions, server_now))
             except Exception:  # noqa: BLE001 - the team must never break the trading loop
                 log.exception("Team housekeeping failed; trading continues")
+        weekend = is_weekend(server_now) and not any(self._market_state.values())
         if self.scheduler is not None:
             try:
-                self.scheduler.maybe_launch(weekend=is_weekend(server_now) and not any(self._market_state.values()))
-            except Exception:  # noqa: BLE001 - the optimiser must never break trading
-                log.exception("Could not schedule optimisation")
+                was_running = self._research_running
+                self._research_running = self.scheduler.running()
+                if was_running and not self._research_running and self.arms is not None:
+                    self.arms.reload()
+                    self.arms.refresh(force=True)
+                    log.info("Research results loaded: %s", self.arms.counts())
+                if self.scheduler.maybe_launch(weekend=weekend):
+                    self._research_running = True
+            except Exception:  # noqa: BLE001 - research must never break trading
+                log.exception("Could not schedule research")
+        if self._monotonic() >= self._next_scan and self.arms is not None:
+            self._next_scan = self._monotonic() + self.cfg.universe.scan_every_minutes * 60
+            try:
+                self._scan_opportunities(acc)
+            except Exception:  # noqa: BLE001 - scanning is advisory
+                log.exception("Opportunity scan failed")
+        if self._monotonic() >= self._next_flow and self.arms is not None:
+            self._next_flow = self._monotonic() + FLOW_SECONDS
+            try:
+                self._flow_doctor(acc, server_now, positions)
+            except Exception:  # noqa: BLE001 - the Flow Doctor is advisory; bounds are enforced anyway
+                log.exception("Flow Doctor failed; knobs unchanged")
+        if self._monotonic() >= self._next_prune:
+            self._next_prune = self._monotonic() + 6 * 3600
+            try:
+                funnel_mod.prune(self.registry.conn, self._utc_now() - FUNNEL_RETENTION_DAYS * 86400)
+            except Exception:  # noqa: BLE001
+                log.debug("funnel prune failed", exc_info=True)
         self._write_health(acc, positions)
 
     def _run_guardian(self, acc: Any) -> None:
@@ -802,13 +1001,17 @@ class Bot:
         return {"loop_ms": round(self._loop_ms, 2), "mt5_latency_ms": round(self._mt5_latency_ms, 3),
                 "tick_age_s": round(max(0.0, server_now - latest), 1) if latest else None,
                 "connected": self._reconnect_delay is None, "open_positions": len(positions or []),
-                "weekend": is_weekend(server_now) and not any(self._market_state.values())}
+                "weekend": is_weekend(server_now) and not any(self._market_state.values()),
+                "flow_status": self.flow_state.status_text}
 
     def _check_cash_flow(self) -> None:
         getter = getattr(self.mt5, "history_deals_get", None)
         if getter is None:
             return
         balance_type = getattr(self.mt5, "DEAL_TYPE_BALANCE", 2)
+        credit_types = {getattr(self.mt5, name, code) for name, code in
+                        (("DEAL_TYPE_CREDIT", 3), ("DEAL_TYPE_CHARGE", 4), ("DEAL_TYPE_CORRECTION", 5),
+                         ("DEAL_TYPE_BONUS", 6))}
         checked = self.registry.get_kv("cash_flow_checked")
         # First check for this account: existing balance operations are history, already in equity.
         first_check = checked is None
@@ -823,20 +1026,29 @@ class Bot:
         seen = set(json.loads(self.registry.get_kv("cash_flow_seen") or "[]"))
         amount = 0.0
         for d in deals:
-            if getattr(d, "type", None) == balance_type and d.ticket not in seen:
+            kind = getattr(d, "type", None)
+            if (kind == balance_type or kind in credit_types) and d.ticket not in seen:
                 seen.add(d.ticket)
                 if not first_check:
-                    amount += float(d.profit)
+                    value = float(d.profit)
+                    amount += value
+                    self.registry.conn.execute(
+                        "INSERT OR IGNORE INTO cash_flows (ts, ticket, amount, kind, comment) VALUES (?, ?, ?, ?, ?)",
+                        (float(getattr(d, "time", now) or now), int(d.ticket), value,
+                         "deposit" if value > 0 else "withdrawal", str(getattr(d, "comment", ""))[:120]))
         if amount:
-            log.info("Deposit/withdrawal of %.2f detected; daily start and drawdown peak adjusted", amount)
+            log.info("Deposit/withdrawal of %.2f detected; daily start, drawdown peak, starting capital, high-water "
+                     "mark and profit floor rebased (not counted as profit or loss)", amount)
             self.guard.adjust_for_cash_flow(amount)
+            self.capital.apply_cash_flow(amount)
+            self.registry.set_kv("capital_state", self.capital.to_json())
         self.registry.set_kv("cash_flow_seen", json.dumps(sorted(seen)[-500:]))
         self.registry.set_kv("cash_flow_checked", str(now))
 
     def _check_terminal_freeze(self, positions: Optional[list[Any]]) -> None:
         if not self.cfg.terminal_restart_enabled:
             return
-        stale = self.clock.all_stale_for(self.symbols.values())
+        stale = self.clock.all_stale_for(self.universe)
         expected = market_expected_open(self.clock.now(), self.cfg.holidays)
         term = self.mt5.terminal_info()
         protected = positions is not None and all(p.sl and p.tp for p in positions)
@@ -857,26 +1069,193 @@ class Bot:
         self._reconnect_delay = RECONNECT_START_SECONDS
         self._next_reconnect = self._monotonic() + RECONNECT_START_SECONDS
 
+    # ------------------------------------------------------------ flow doctor
+
+    def _load_flow_adjustments(self) -> list[flow.Adjustment]:
+        rows = self.registry.conn.execute(
+            "SELECT * FROM flow_adjustments WHERE status = 'active' AND direction = 'relax' ORDER BY id")
+        out = []
+        for r in rows:
+            try:
+                evidence = json.loads(r["evidence_json"] or "{}")
+            except ValueError:
+                evidence = {}
+            out.append(flow.Adjustment(int(r["id"]), float(r["ts"]), r["knob"], float(r["old_value"] or 0.0),
+                                       float(r["new_value"] or 0.0), r["direction"], r["reason"],
+                                       float(r["review_after"] or 0.0), r["status"], evidence))
+        return out
+
+    def _apply_flow_knobs(self, log_changes: bool = True) -> None:
+        """Effective config = base config + the Flow Doctor's bounded knobs (re-validated)."""
+        overrides = flow.overrides(self.base_cfg, self.flow_state)
+        try:
+            effective = apply_overrides(self.base_cfg, overrides) if overrides else self.base_cfg
+        except ValueError as exc:
+            log.error("Flow Doctor knobs rejected by validation (%s); using the configured values", exc)
+            effective = self.base_cfg
+        if effective != self.cfg and log_changes:
+            log.info("Flow Doctor knobs applied: %s", overrides or "none (configured values)")
+        self.cfg = effective
+        if self.risk is not None:
+            self.risk.update_config(effective)
+        if self.arms is not None:
+            self.arms.update_settings(effective.tiers, effective.research)
+        if self.team is not None:
+            self.team.update_config(effective)
+
+    def trading_window(self) -> tuple[int, int]:
+        return tuple(self.cfg.trading_hours_server)  # type: ignore[return-value]
+
+    def _flow_doctor(self, acc: Any, server_now: float, positions: Optional[list[Any]]) -> None:
+        fd = self.cfg.flow_doctor
+        idle_hours = fd.max_idle_hours_real if self.is_real else fd.max_idle_hours_demo
+        now = self._utc_now()
+        self.funnel.flush()
+        rep = funnel_mod.report(self.registry.conn, now - idle_hours * 3600, now)
+        status_rep = funnel_mod.report(self.registry.conn, now - 6 * 3600, now)
+        last_order = self.registry.conn.execute(
+            "SELECT MAX(open_ts) AS t FROM trades WHERE mode = 'live'").fetchone()["t"]
+        trades_since: dict[int, list[float]] = {}
+        for adj in self.flow_active:
+            if adj.id is None:
+                continue
+            rows = self.registry.trades(mode="live", status="closed", since=adj.ts)
+            trades_since[adj.id] = [float(r.r) for r in rows if r.r is not None]
+        lim = self.risk.limits
+        inputs = flow.FlowInputs(
+            now=now, is_real=self.is_real, markets_open=any(self._market_state.values()),
+            last_order_ts=float(last_order) if last_order is not None else None, started_ts=self._started_utc,
+            signals_in_window=int(rep.get("signals", 0) or 0), top_blockers=rep.get("top_blockers") or [],
+            counterfactuals=rep.get("counterfactuals") or {}, trades_since=trades_since,
+            daily_loss_used_frac=max(0.0, self.guard.daily_loss_pct(acc.equity)) / lim.daily_loss_pct
+            if lim.daily_loss_pct else 0.0,
+            drawdown_frac=self.guard.drawdown_pct(acc.equity) / lim.drawdown_breaker_pct
+            if lim.drawdown_breaker_pct else 0.0,
+            tier_counts=self.arms.counts(), min_agreement_cfg=self.base_cfg.team.min_agreement,
+            can_add_symbol=self._can_add_symbol())
+        adjustments = flow.evaluate(inputs, self.flow_state, self.flow_active, fd) if fd.enabled else []
+        for adj in self.flow_active:
+            if adj.status != "active" and adj.id is not None:
+                self.registry.conn.execute("UPDATE flow_adjustments SET status = ?, closed_ts = ? WHERE id = ?",
+                                           (adj.status, now, adj.id))
+        self.flow_active = [a for a in self.flow_active if a.status == "active"]
+        for adj in adjustments:
+            cur = self.registry.conn.execute(
+                "INSERT INTO flow_adjustments (ts, knob, old_value, new_value, direction, reason, evidence_json,"
+                " review_after, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (adj.ts, adj.knob, adj.old, adj.new, adj.direction, adj.reason, json.dumps(adj.evidence, default=str),
+                 adj.review_after, "active" if adj.direction == "relax" else "applied"))
+            adj.id = int(cur.lastrowid)
+            log.warning("Flow Doctor %s %s %g -> %g: %s", adj.direction, adj.knob, adj.old, adj.new, adj.reason)
+            if adj.direction == "relax":
+                self.flow_active.append(adj)
+            self.registry.log_event("*", f"flow_{adj.direction}", adj.reason[:900],
+                                    {"knob": adj.knob, "old": adj.old, "new": adj.new})
+        if adjustments:
+            flow.apply(self.flow_state, adjustments)
+            self._apply_flow_knobs()
+            if any(a.knob == "universe_extra" and a.new > a.old for a in adjustments):
+                self._expand_universe(acc)
+        top = funnel_mod.dominant_blocker(status_rep)
+        trading = status_rep.get("orders", 0) > 0 or bool(positions)
+        self.flow_state.status_text = flow.status_text(self.arms.counts(), top, 6, trading, self._entry_block_reason())
+        self.registry.set_kv("flow_state", self.flow_state.to_json())
+        if self.team is not None:
+            doctor = self.team.agents.get("flow_doctor")
+            if doctor is not None:
+                doctor.report(self.flow_state.status_text, adjustments, top)  # type: ignore[attr-defined]
+
+    def _expand_universe(self, acc: Any) -> None:
+        before = list(self.universe)
+        self._select_universe(acc)
+        added = [s for s in self.universe if s not in before]
+        if not added or self.arms is None:
+            return
+        created = self.arms.ensure_default_arms(added, self.timeframes(), self.cfg.strategy_names(),
+                                                self.cfg.universe.max_arms)
+        self.registry.set_kv("universe", json.dumps({"symbols": self.universe, "timeframes": list(self.timeframes())}))
+        if self.scheduler is not None:
+            self.scheduler.request(",".join(added), "universe expanded by the Flow Doctor")
+        log.warning("Universe expanded with %s (%d new arms in shadow)", ", ".join(added), created)
+
+    # ------------------------------------------------------- opportunity engine
+
+    def _scan_opportunities(self, acc: Any) -> None:
+        from .team.agents.market import session_view
+
+        lim = self.risk.limits
+        equity = float(acc.equity)
+        tier_risk = {"T1": lim.t1_risk_pct, "T2": lim.t2_risk_pct, "T3": lim.t3_risk_pct}
+        caps = {"T1": lim.explore_trade_pct, "T2": lim.affordability_cap_pct, "T3": lim.affordability_cap_pct}
+        try:
+            open_symbols = {p.symbol for p in self._bot_positions()}
+        except RuntimeError:
+            open_symbols = set()
+        best_p: dict[str, float] = {}
+        for arm in self.arms.arms.values():
+            if arm.posterior is not None:
+                best_p[arm.symbol] = max(best_p.get(arm.symbol, 0.0), arm.posterior.p_positive)
+        session_open = bool(session_view(self._utc_now())["sessions"])
+        scores, rows = [], []
+        for symbol in self.universe:
+            spec = self.specs.get(symbol)
+            if spec is None:
+                continue
+            for tf in self.timeframes():
+                bars = self.mt5.copy_rates_from_pos(symbol, self._tf(tf), 1, 300)
+                atr, spread, vol_ratio = atr_and_spread(bars)
+                rows.extend(affordability_rows(symbol, tf, atr, spec.value_per_price, spec.volume_min,
+                                               self.commission.get(symbol, 0.0), equity, tier_risk, caps))
+                if tf != self.cfg.timeframe:
+                    continue
+                if bars is not None and len(bars) > 20:
+                    self._spread_hourly[symbol] = _hourly_spread(bars)
+                feasible = any(r["feasible"] for r in rows if r["symbol"] == symbol and r["tier"] == "T1")
+                corr = self._max_correlation(symbol, open_symbols - {symbol}) if open_symbols else 0.0
+                scores.append(score_symbol(symbol, spread, atr, spec.point, vol_ratio, session_open, feasible, corr,
+                                           best_p.get(symbol)))
+        self.opportunity = [s.to_dict() for s in rank(scores)]
+        self.affordability = rows
+        self.registry.set_kv("opportunity", json.dumps({"ts": self._utc_now(), "scores": self.opportunity}))
+        self.registry.set_kv("affordability", json.dumps({"ts": self._utc_now(), "equity": equity, "rows": rows},
+                                                         default=str))
+
+    def _max_correlation(self, symbol: str, others: set[str]) -> float:
+        mine = self._closes.get(symbol)
+        best = 0.0
+        if mine is None or len(mine) < 30:
+            return best
+        for other in others:
+            theirs = self._closes.get(other)
+            if theirs is None or len(theirs) < 30:
+                continue
+            n = min(len(mine), len(theirs))
+            a, b = np.diff(np.log(mine[-n:])), np.diff(np.log(theirs[-n:]))
+            if a.std() > 0 and b.std() > 0:
+                best = max(best, abs(float(np.corrcoef(a, b)[0, 1])))
+        return best
+
     def _write_health(self, acc: Any, positions: Optional[list[Any]]) -> None:
+        lim = self.risk.limits
+        equity = float(acc.equity)
+        server_now = self.clock.now()
+        ranked = self.arms.ranked(400) if self.arms else []
         symbols = {}
-        for symbol in self.symbols.values():
-            champ = self.registry.champion(symbol)
-            symbols[symbol] = {
-                "champion": champ.describe(),
-                "market": "active" if self._market_state.get(symbol) else "quiet/closed",
-                "status_line": self.status_line(symbol),
-                "champion_performance": self.engine.champion_report(symbol) if self.engine else {},
-                "challengers": self.engine.promotion_status(symbol) if self.engine else [],
-            }
+        for symbol in self.universe:
+            symbols[symbol] = {"market": "active" if self._market_state.get(symbol) else "quiet/closed",
+                               "arms": [a.to_dict() for a in ranked if a.symbol == symbol][:6]}
         payload = {
             "version": __version__,
             "account": f"{mask(acc.login)} @ {acc.server}",
             "account_type": "REAL" if self.is_real else "DEMO",
+            "currency": getattr(acc, "currency", ""),
             "state_dir": str(self.state_dir),
-            "equity": round(float(acc.equity), 2),
+            "equity": round(equity, 2),
             "balance": round(float(acc.balance), 2),
             "peak_equity": self.guard.state.peak_equity,
+            "day_start_equity": self.guard.state.start_equity,
             "drawdown_pct": round(self.guard.drawdown_pct(acc.equity), 2),
+            "daily_loss_pct": round(max(0.0, self.guard.daily_loss_pct(acc.equity)), 3),
             "open_positions": len(positions) if positions is not None else None,
             "halted": self.guard.halted_reason,
             "dry_run": self.cfg.dry_run,
@@ -884,10 +1263,23 @@ class Bot:
             .strftime("%Y-%m-%d %H:%M:%S UTC"),
             "last_tick_server": fmt_server_time(self.clock.latest_tick_time) if self.clock.latest_tick_time else None,
             "server_utc_offset_hours": None if self.clock.offset is None else self.clock.offset / 3600,
+            "universe": self.universe,
+            "timeframes": list(self.timeframes()),
             "symbols": symbols,
-            "optimizer": {"running": bool(self.scheduler and self.scheduler.running()),
-                          "last_cycle_finished": self.registry.get_kv("last_cycle_finished")},
+            "limits": lim.to_dict(),
+            "capital": self.capital.snapshot(equity, lim),
+            "exploration": self._exploration_room(acc, server_now).to_dict(),
+            "tiers": self.arms.counts() if self.arms else {},
+            "status_line": self.status_line(),
+            "mode": self._mode_chip(),
+            "flow": {"knobs": self.flow_state.knobs, "active": [flow.adjustment_row(a) for a in self.flow_active]},
+            "quarantined": {sym: round((until - self._monotonic()) / 60.0, 1)
+                            for sym, (until, _strikes) in self._quarantine.items() if until > self._monotonic()},
+            "research": {"running": bool(self.scheduler and self.scheduler.running()),
+                         "last_finished": self.registry.get_kv("last_research_finished"),
+                         "last_status": self.registry.get_kv("last_research_status")},
             "entry_block": self._entry_block_reason(),
+            "trading_hours_server": list(self.trading_window()),
             "team": self.team.snapshot() if self.team is not None else {"effective_mode": "baseline",
                                                                          "mode_reason": "team not running"},
             "advisor": {k: v for k, v in (self.advisor.snapshot() if self.advisor is not None else
@@ -897,6 +1289,19 @@ class Bot:
             write_health(Path(self.cfg.health_file), payload, self._durable_files)
         except OSError as exc:
             log.warning("Could not write %s: %s", self.cfg.health_file, exc)
+
+    def _mode_chip(self) -> str:
+        """The panel's global mode: breaker, paused, active (T2/T3), probation (T1) or exploration."""
+        if self.guard is not None and self.guard.state.dd_halted:
+            return "breaker"
+        if self._entry_block_reason():
+            return "paused"
+        counts = self.arms.counts() if self.arms else {}
+        if counts.get("T2") or counts.get("T3"):
+            return "active"
+        if counts.get("T1"):
+            return "probation"
+        return "exploration"
 
     def _write_reports(self, server_now: float, acc: Any) -> None:
         """At a new server day: report on the previous day, and on the previous week on Mondays."""
@@ -909,21 +1314,21 @@ class Bot:
         desc = f"{'REAL' if self.is_real else 'DEMO'} {mask(self._login)}"
         try:
             write_report(self.registry, out, f"daily_{prev_day}", day_start_utc - 86400, day_start_utc, desc,
-                         list(self.symbols.values()))
+                         self.universe)
             stats = trade_stats([r for r in self.registry.trades(mode="live", status="closed")
                                  if day_start_utc - 86400 <= (r.close_ts or 0) < day_start_utc])
-            champions = ", ".join(f"{s}: {self.registry.champion(s).describe()}" for s in self.symbols.values())
+            tiers = self.arms.counts() if self.arms else {}
             self.notifier.send(f"Daily summary {prev_day}: {stats['trades']} live trades, P&L {stats['net_pnl']:.2f}, "
-                               f"expectancy {stats['expectancy_r']:+.2f}R, equity {acc.equity:.2f}. {champions}",
+                               f"expectancy {stats['expectancy_r']:+.2f}R, equity {acc.equity:.2f}. Tiers {tiers}",
                                key=f"daily-{prev_day}")
             if server_datetime(server_now).weekday() == 0:
                 write_report(self.registry, out, f"weekly_{prev_day}", day_start_utc - 7 * 86400, day_start_utc,
-                             desc, list(self.symbols.values()))
+                             desc, self.universe)
             if self.team is not None and self.cfg.notifications.daily_html_report:
                 from .reports import write_html_report
 
                 path = write_html_report(self.registry, self.office, out, f"daily_{prev_day}", day_start_utc - 86400,
-                                         day_start_utc, desc, list(self.symbols.values()))
+                                         day_start_utc, desc, self.universe)
                 reporter = self.team.agents.get("reporter")
                 if reporter is not None:
                     reporter.reported(f"daily_{prev_day}", path.name)
@@ -964,75 +1369,178 @@ class Bot:
                 log.error("config.json reload rejected (command-line overrides): %s", exc)
                 return False
         try:
-            merged, notes = reload_decision(self.cfg, new)
+            merged, notes = reload_decision(self.base_cfg, new)
         except ValueError as exc:
             log.error("config.json reload rejected: %s", exc)
             return False
         for note in notes:
             log.warning("Config reload: %s", note)
-        if merged != self.cfg:
-            self.cfg = merged
-            self.risk.update_config(merged)
-            if self.engine is not None:
-                self.engine.update_settings(EngineSettings.from_config(merged))
+        if merged != self.base_cfg:
+            self.base_cfg = merged
+            self._apply_flow_knobs(log_changes=False)
             if self.scheduler is not None:
-                self.scheduler.cfg = merged
-            if merged.news_filter_enabled:
+                self.scheduler.cfg = self.cfg
+            if self.cfg.news_filter_enabled:
                 self._load_news()
             if self.advisor is not None:
-                self.advisor.update_config(merged.claude)
-            if self.team is not None:
-                self.team.update_config(merged)
+                self.advisor.update_config(self.cfg.claude)
             log.info("Config reloaded from %s", self.config_path)
         return True
 
     # ------------------------------------------------------------ per symbol
 
     def _costs(self, symbol: str) -> Any:
-        return cost_model(self.cfg, self.commission.get(symbol, self.cfg.commission_fallback_per_lot))
+        return cost_model(self.cfg, self.commission.get(symbol, self.cfg.commission_fallback_per_lot), symbol)
+
+    def _record(self, stage: str, outcome: str, reason: str, symbol: Optional[str] = None,
+                timeframe: Optional[str] = None, **kwargs: Any) -> None:
+        self.funnel.record(stage, outcome, reason, symbol=symbol, timeframe=timeframe, **kwargs)
 
     def _process_symbol(self, symbol: str, acc: Any) -> None:
         if not self._market_state.get(symbol, True):
             return
-        rates = self.mt5.copy_rates_from_pos(symbol, self._timeframe, 0, self.cfg.bars + 1)
+        for tf in self.timeframes():
+            if self._stop.is_set():
+                return
+            self._process_bar(symbol, tf, acc)
+
+    def _process_bar(self, symbol: str, tf: str, acc: Any) -> None:
+        key = (symbol, tf)
+        head = self.mt5.copy_rates_from_pos(symbol, self._tf(tf), 0, 2)
+        if head is None or len(head) < 2:
+            log.warning("%s %s: no rate data (%s)", symbol, tf, self._last_error())
+            return
+        previous = self._last_bar.get(key)
+        if previous is not None and int(head[-2]["time"]) == previous:
+            return
+        rates = self.mt5.copy_rates_from_pos(symbol, self._tf(tf), 0, self.cfg.bars + 1)
         if rates is None or len(rates) < 2:
-            log.warning("%s: no rate data (%s)", symbol, self._last_error())
+            log.warning("%s %s: no rate data (%s)", symbol, tf, self._last_error())
             return
         closed = rates[:-1]  # the last bar is still forming: never let a strategy see it
         bar_time = int(closed[-1]["time"])
-        previous = self._last_bar.get(symbol)
         # Recorded before acting, so a failure is not retried on every poll of the same bar.
-        self._last_bar[symbol] = bar_time
+        self._last_bar[key] = bar_time
         if previous is not None and bar_time == previous:
             return
         spec = self.specs.get(symbol) or self._refresh_spec(symbol)
-        self._closes[symbol] = np.asarray(closed["close"][-(self.cfg.team.correlation_lookback_bars + 1):],
-                                          dtype=float)
-        intent = self._signal_source.on_bar(symbol, closed, spec, self._costs(symbol), float(acc.equity),
-                                            self.risk.risk_pct)
+        primary = tf == self.cfg.timeframe
+        if primary:
+            self._closes[symbol] = np.asarray(closed["close"][-(self.cfg.team.correlation_lookback_bars + 1):],
+                                              dtype=float)
+        self._record("scan", "info", "BAR_EVALUATED", symbol, tf, bar_time=bar_time)
+        if self._signal_source is not None:
+            intent = self._signal_source.on_bar(symbol, closed, spec, self._costs(symbol), float(acc.equity),
+                                                self.risk.risk_pct)
+            signals: list[ArmSignal] = []
+        else:
+            intent = None
+            signals = self.arms.on_bar(symbol, tf, closed, spec, self._costs(symbol))
         if previous is None:
-            log.info("%s: last closed bar %s recorded; waiting for the next one", symbol, fmt_server_time(bar_time))
+            log.info("%s %s: last closed bar %s recorded; waiting for the next one", symbol, tf,
+                     fmt_server_time(bar_time))
             return
-        self._team_observe(symbol, acc, closed)
-
-        positions = self._bot_positions(symbol)
-        if self.cfg.close_on_opposite:
-            for pos in positions:
-                row = self.registry.trade_by_ticket(int(pos.ticket))
-                origin = row.param_set_id if row else None
-                if self._signal_source.exit_signal(symbol, origin, self._side_of(pos), closed):
-                    if not self._close_position(pos, "opposite signal from its own strategy"):
-                        log.warning("%s: could not close position %s on opposite signal", symbol, pos.ticket)
+        if primary:
+            self._team_observe(symbol, acc, closed)
+        self._manage_positions(symbol, tf, acc, closed)
+        self._exits(symbol, tf, closed)
+        for sig in signals:
+            post = sig.arm.posterior
+            self._record("signal", "info", "SIGNAL", symbol, tf, arm_id=sig.arm.id, bar_time=bar_time,
+                         values={"strategy": sig.arm.strategy, "side": sig.signal.side, "tier": sig.arm.tier,
+                                 "p": None if post is None else round(post.p_positive, 4)})
+        if signals:
+            intent = self._allocate(symbol, tf, signals, acc, closed)
+        elif intent is not None:
+            if not isinstance(intent, EntryIntent):
+                log.error("%s: signal source returned %r, expected EntryIntent or None", symbol, intent)
+                return
+            self._record("signal", "info", "SIGNAL", symbol, tf, bar_time=bar_time,
+                         values={"strategy": intent.strategy, "side": intent.signal.side, "tier": intent.tier})
         if intent is None:
-            log.debug("%s: no entry intent on bar %s", symbol, fmt_server_time(bar_time))
+            log.debug("%s %s: no entry intent on bar %s", symbol, tf, fmt_server_time(bar_time))
             return
-        if not isinstance(intent, EntryIntent):
-            log.error("%s: signal source returned %r, expected EntryIntent or None", symbol, intent)
-            return
+        if intent.bar_time is None or intent.timeframe is None:
+            intent = replace(intent, bar_time=intent.bar_time or bar_time, timeframe=intent.timeframe or tf)
         sig = intent.signal
-        log.info("%s: %s signal from %s on bar %s (ATR %.6f)", symbol, sig.side, intent.description,
-                 fmt_server_time(bar_time), sig.atr)
+        log.info("%s %s: %s signal from %s [%s%s] on bar %s (ATR %.6f)", symbol, tf, sig.side, intent.description,
+                 intent.tier, " exploration" if intent.exploration else "", fmt_server_time(bar_time), sig.atr)
         self._enter(symbol, intent, acc, closed)
+
+    def _exits(self, symbol: str, tf: str, closed: np.ndarray) -> None:
+        if not self.cfg.close_on_opposite:
+            return
+        for pos in self._bot_positions(symbol):
+            row = self.registry.trade_by_ticket(int(pos.ticket))
+            row_tf = (row.timeframe if row is not None else None) or self.cfg.timeframe
+            if row_tf != tf:
+                continue
+            side = self._side_of(pos)
+            if self._signal_source is not None:
+                wants_exit = self._signal_source.exit_signal(symbol, row.param_set_id if row else None, side, closed)
+            else:
+                wants_exit = self.arms.exit_signal(row.arm_id if row else None, row.param_set_id if row else None,
+                                                   side, closed)
+            if wants_exit and not self._close_position(pos, "opposite signal from its own arm"):
+                log.warning("%s: could not close position %s on opposite signal", symbol, pos.ticket)
+
+    def _regime(self, symbol: str) -> Optional[str]:
+        if self.team is None:
+            return None
+        detector = self.team.agents.get("regime_detector")
+        info = (getattr(detector, "stats", {}) or {}).get("regimes", {}).get(symbol) if detector else None
+        return info.get("label") if info else None
+
+    def _allocate(self, symbol: str, tf: str, signals: list[ArmSignal], acc: Any,
+                  closed: Optional[np.ndarray] = None) -> Optional[EntryIntent]:
+        positions = self._bot_positions()
+        busy = "ONE_PER_SYMBOL" if any(p.symbol == symbol for p in positions) else None
+        block = self._entry_block_reason()
+        if busy is None and block:
+            busy = "FLOOR_SOFT_STOP" if "profit floor" in block else funnel_mod.risk_reason_code(
+                f"trading halted: {block}")
+        open_rows = self.registry.trades(mode="live", status="open")
+        exploring = sum(1 for r in open_rows if (r.extra or {}).get("exploration"))
+        spec = self.specs.get(symbol)
+        lim = self.risk.limits
+        equity = float(acc.equity)
+
+        def affordable(sig: ArmSignal) -> Optional[str]:
+            if spec is None:
+                return None
+            tier = "T1" if sig.arm.tier == "T0" else sig.arm.tier
+            cap = lim.explore_trade_pct if tier == "T1" else lim.affordability_cap_pct
+            stop = sig.signal.atr * (sig.signal.sl_mult or 2.0)
+            a = affordability(symbol, tf, stop, spec.value_per_price, spec.volume_min,
+                              self.commission.get(symbol, 0.0), equity, lim.tier_risk_pct(tier), cap)
+            return None if a.feasible else a.reason
+
+        regime = self._regime(symbol)
+
+        def ineligible(strategy: str) -> Optional[str]:
+            if self.team is None or regime is None:
+                return None
+            return self.team.regime_ineligible(strategy, regime)
+
+        t = self.cfg.tiers
+        bar_regime = None
+        if closed is not None and len(closed):
+            try:
+                bar_regime = regime_mod.label_at(closed)
+            except Exception:  # noqa: BLE001 - regime evidence is advisory
+                log.debug("%s %s: regime label failed", symbol, tf, exc_info=True)
+        inp = AllocationInputs(symbol, tf, signals, busy, exploring, t.exploration_slots, t.exploration_enabled,
+                               t.exploration_threshold, affordable, ineligible, bar_regime,
+                               lambda sig: self.arms.regime_view(sig.arm, bar_regime or ""),
+                               self.cfg.team.regime_min_trades)
+
+        def record(stage: str, outcome: str, reason: str, **kwargs: Any) -> None:
+            self._record(stage, outcome, reason, symbol, tf, **kwargs)
+
+        intent = allocate(inp, self._rng, record)
+        if intent is not None and not self.cfg.management.policies_enabled and intent.policy != "fixed":
+            intent = replace(intent, policy="fixed")
+        return intent
 
     def _team_observe(self, symbol: str, acc: Any, closed: np.ndarray) -> None:
         """New bar: let the team scan the market and manage open positions. Never raises."""
@@ -1044,16 +1552,96 @@ class Bot:
             self.team.observe_bar(teambridge.decision_context(self, symbol, None, acc, closed, purpose="observe"))
         except Exception:  # noqa: BLE001 - observation is optional
             log.debug("%s: team observation failed", symbol, exc_info=True)
+
+    def _manage_positions(self, symbol: str, tf: str, acc: Any, closed: np.ndarray) -> None:
+        """New bar on ``tf``: manage the open positions whose arm trades this timeframe. Never raises."""
+        if self.team is None:
+            return  # the Position Manager is a team member; without it the positions keep their SL/TP
+        from . import teambridge
+
         try:
-            teambridge.manage_positions(self, symbol, acc, closed)
+            teambridge.manage_positions(self, symbol, acc, closed, tf)
         except Exception:  # noqa: BLE001 - management is optional; SL/TP keep protecting the positions
             log.exception("%s: position management failed; positions keep their SL/TP", symbol)
 
+    def spread_spiking(self, symbol: str) -> bool:
+        """True while the live spread is above spread_spike_mult x this hour's typical spread."""
+        hourly = self._spread_hourly.get(symbol)
+        tick = self.mt5.symbol_info_tick(symbol)
+        spec = self.specs.get(symbol)
+        if not hourly or tick is None or spec is None or spec.point <= 0:
+            return False
+        typical = hourly.get(int((self.clock.now() % 86400) // 3600))
+        if not typical or typical <= 0:
+            return False
+        return (float(tick.ask) - float(tick.bid)) / spec.point > self.cfg.universe.spread_spike_mult * typical
+
+    # ----------------------------------------------------------------- sizing
+
+    def _budget_refs(self, acc: Any, server_now: float) -> tuple[float, float]:
+        """Equity at the start of the server day and week (exploration budget references)."""
+        day_equity = float(self.guard.state.start_equity or acc.equity)
+        week = str(int(server_week_start(server_now)))
+        raw = self.registry.get_kv("week_ref")
+        ref = json.loads(raw) if raw else {}
+        if ref.get("week") != week:
+            ref = {"week": week, "equity": day_equity}
+            self.registry.set_kv("week_ref", json.dumps(ref))
+        return day_equity, float(ref["equity"])
+
+    def _exploration_room(self, acc: Any, server_now: float) -> Any:
+        offset = self.clock.offset if self.clock.offset is not None else 0
+        week_start_utc = server_week_start(server_now) - offset
+        rows = self.registry.trades(mode="live", tier="T1", closed_since=week_start_utc)
+        day_eq, week_eq = self._budget_refs(acc, server_now)
+        lim = self.risk.limits
+        return exploration_room(rows, server_now, offset, day_eq, week_eq, lim.explore_day_pct, lim.explore_week_pct)
+
+    def size(self, symbol: str, intent: EntryIntent, acc: Any) -> SizingDecision:
+        """The sizer's verdict for one proposal (the minimum of every constraint)."""
+        equity = float(acc.equity)
+        positions = self._bot_positions()
+        open_risk = sum(r.risk_money for r in self._open_risks(positions, equity))
+        budget = None
+        if intent.tier == "T1":
+            budget = self._exploration_room(acc, self.clock.now()).room
+        amc = None
+        if intent.arm_id is not None:
+            amc = anti_martingale_cap(self.registry.trades(mode="live", arm_id=intent.arm_id, limit=20))
+        kelly = None
+        if intent.tier in ("T2", "T3") and intent.posterior is not None:
+            kelly = intent.posterior.kelly_fraction
+        inp = SizingInputs(intent.tier, equity, intent.exploration,
+                           intent.posterior.mean if intent.posterior else None, kelly, open_risk, budget, amc)
+        return size_risk(inp, self.risk.limits, self.capital)
+
+    def _exception_cap(self, intent: EntryIntent, sizing: Mapping[str, Any]) -> float:
+        """Largest minimum-lot risk accepted as a conscious exception for this tier."""
+        lim = self.risk.limits
+        room = [float(v) for k, v in sizing.items() if k in ("floor_room", "portfolio_heat", "exploration_budget",
+                                                             "anti_martingale")]
+        base = lim.explore_trade_pct if intent.tier == "T1" else lim.affordability_cap_pct
+        return min([base, limits.MAX_RISK_PER_TRADE_PCT] + room)
+
     def _enter(self, symbol: str, intent: EntryIntent, acc: Any, closed: np.ndarray) -> None:
-        """Route a champion proposal through the team's decision protocol, or straight to the
-        risk layer when there is no team. If the team fails BEFORE submitting, the
-        deterministic v2 path takes over; it can never submit twice."""
+        """Size the proposal, run the team review (if the team is up) and the hard risk gate."""
+        decision = self.size(symbol, intent, acc)
+        tf = intent.timeframe
+        if not decision.ok:
+            code = decision.blocked or "SIZE_ZERO"
+            self._record("sizing", "block", code, symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                         values={"binding": decision.binding, **{k: round(v, 4) for k, v in
+                                                                 decision.constraints.items()}})
+            log.info("%s: no entry: sizing blocked (%s, binding %s)", symbol, code, decision.binding)
+            return
+        sizing = dict(decision.constraints, binding=decision.binding)
+        intent = replace(intent, risk_pct=decision.risk_pct, sizing=sizing)
+        if intent.exploration:
+            self._record("exploration", "pass", "EXPLORATION", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time, values={"risk_pct": decision.risk_pct, "draw": intent.thompson})
         if self.team is None:
+            self._record("team", "info", "TEAM_UNAVAILABLE", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time)
             self._try_open(symbol, intent, acc)
             return
         from . import teambridge
@@ -1061,11 +1649,23 @@ class Bot:
         gateway = teambridge.BotGateway(self, symbol, intent, acc)
         try:
             ctx = teambridge.decision_context(self, symbol, intent, acc, closed)
-            self.team.decide(ctx, gateway)
-        except Exception:  # noqa: BLE001 - fail open to the deterministic core, never to a crash
-            log.exception("%s: team decision failed; falling back to the deterministic path", symbol)
+            result = self.team.decide(ctx, gateway)
+        except Exception:  # noqa: BLE001 - the team stage fails neutral, never to a crash or a double order
+            log.exception("%s: team review failed; the pipeline continues without its reduction", symbol)
+            self._record("team", "info", "TEAM_UNAVAILABLE", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time)
             if not gateway.submitted:
                 self._try_open(symbol, intent, acc)
+            return
+        if not result.submitted:
+            reason = result.reasons[-1] if result.reasons else "no trade"
+            if "risk layer" in reason:
+                code, stage = funnel_mod.risk_reason_code(reason), "risk"
+            else:
+                code = funnel_mod.team_reason_code(reason)
+                stage = funnel_mod.REASONS.get(code, ("team",))[0]
+            self._record(stage, "block", code, symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                         values={"detail": reason[:200], "mode": result.mode})
 
     def _side_of(self, position: Any) -> str:
         return "BUY" if position.type == self.mt5.POSITION_TYPE_BUY else "SELL"
@@ -1101,7 +1701,11 @@ class Bot:
                 risk = max(-float(profit), 0.0) if profit is not None and math.isfinite(profit) else equity
             else:
                 risk = equity  # unprotected: count it as everything at stake until repaired
-            out.append(OpenRisk(p.symbol, risk))
+            group = None
+            if self.registry is not None:
+                row = self.registry.trade_by_ticket(int(p.ticket))
+                group = (row.extra or {}).get("group") if row is not None else None
+            out.append(OpenRisk(p.symbol, risk, group))
         return out
 
     def _notional(self, symbol: str, side: str, volume: float, price: float, acc: Any) -> Optional[float]:
@@ -1115,111 +1719,230 @@ class Bot:
             return None
         return float(margin) * leverage
 
+    def spread_limit(self, symbol: str, sig: Any, spec: SymbolSpec) -> tuple[Optional[float], str]:
+        """Per-symbol spread limit in points: absolute cap (if configured), cost relative to the stop
+        (unit free, valid for FX, gold, indices and crypto) and a spike filter vs this hour's norm."""
+        found: list[tuple[float, str]] = []
+        cap = self.cfg.universe.spread_cap(symbol)
+        if cap is not None:
+            found.append((cap, "configured cap"))
+        stop_points = sig.atr * (sig.sl_mult or 2.0) / spec.point if spec.point > 0 else None
+        if stop_points:
+            found.append((self.cfg.universe.max_spread_to_stop * stop_points, "cost vs stop"))
+        hourly = self._spread_hourly.get(symbol)
+        if hourly:
+            hour = int((self.clock.now() % 86400) // 3600)
+            typical = hourly.get(hour)
+            if typical and typical > 0:
+                found.append((self.cfg.universe.spread_spike_mult * typical, "spike vs typical for this hour"))
+        if not found:
+            return None, ""
+        value, why = min(found)
+        return value, why
+
     def _try_open(self, symbol: str, intent: EntryIntent, acc: Any, multiplier: float = 1.0,
                   dossier_id: Optional[str] = None, preview: bool = False) -> EntryOutcome:
         """Plan, gate and (unless ``preview``) send one entry.
 
         ``multiplier`` (the team's and the advisor's combined verdict) can only SHRINK the
-        fixed-fraction risk: it is clamped to [0, 1] here again, so no caller can raise the
-        size above the deterministic base. Every hard rule of the risk layer still applies.
+        sized risk: it is clamped to [0, 1] here again, so no caller can raise the size above
+        the sizer's figure. Every hard rule of the risk layer still applies.
         """
         try:
             multiplier = float(multiplier)
         except (TypeError, ValueError):
             multiplier = 0.0
         multiplier = min(max(multiplier, 0.0), limits.MAX_SIZE_MULTIPLIER) if math.isfinite(multiplier) else 0.0
+        tf = intent.timeframe
 
-        def note(reason: str, allowed: Optional[bool] = None, level: int = logging.INFO, **extra: Any) -> EntryOutcome:
+        def note(reason: str, allowed: Optional[bool] = None, level: int = logging.INFO, code: str = "",
+                 **extra: Any) -> EntryOutcome:
+            code = code or funnel_mod.risk_reason_code(reason)
             if not preview:
                 log.log(level, "%s: %s", symbol, reason)
-            return EntryOutcome(allowed, reason, **extra)
+                stage = funnel_mod.REASONS.get(code, ("risk",))[0]
+                self._record(stage, "block", code, symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                             values={"detail": reason[:200], "tier": intent.tier})
+            return EntryOutcome(allowed, reason, code=code, **extra)
 
         sig = intent.signal
         info = self.mt5.symbol_info(symbol)
         tick = self.mt5.symbol_info_tick(symbol)
         if info is None or tick is None or info.point <= 0 or tick.bid <= 0 or tick.ask <= 0:
-            return note(f"no symbol info or valid tick ({self._last_error()}); skipping", level=logging.WARNING)
+            return note(f"no symbol info or valid tick ({self._last_error()}); skipping", level=logging.WARNING,
+                        code="NO_TICK")
         if self._closed_until.get(symbol, 0) > self._monotonic():
-            return note("market reported closed recently; skipping")
+            return note("market reported closed recently; skipping", code="MARKET_CLOSED")
+        until = self._quarantine.get(symbol, (0.0, 0))[0]
+        if until > self._monotonic():
+            return note(f"symbol quarantined after repeated execution failures ({(until - self._monotonic()) / 60:.0f} "
+                        "min left); skipping", code="SYMBOL_QUARANTINED")
         if info.trade_mode != self.mt5.SYMBOL_TRADE_MODE_FULL:
-            return note(f"trading mode is restricted (trade_mode={info.trade_mode}); skipping")
+            return note(f"trading mode is restricted (trade_mode={info.trade_mode}); skipping",
+                        code="TRADE_MODE_RESTRICTED")
         hour = server_datetime(tick.time).hour
-        if not in_trading_hours(hour, self.cfg.trading_hours_server):
-            return note(f"server hour {hour:02d} outside trading window {list(self.cfg.trading_hours_server)}; "
-                        "skipping")
+        window = self.trading_window()
+        if not in_trading_hours(hour, window):
+            return note(f"server hour {hour:02d} outside trading window {list(window)}; skipping", code="OUTSIDE_HOURS")
         if multiplier <= 0:
-            return note("size multiplier is zero: no trade", allowed=False)
+            return note("size multiplier is zero: no trade", allowed=False, code="TEAM_VETO")
         spec = SymbolSpec.from_info(info)
         self.specs[symbol] = spec
         spread_points = (tick.ask - tick.bid) / info.point
         price = tick.ask if sig.side == "BUY" else tick.bid
+        equity = float(acc.equity)
+        risk_pct = intent.risk_pct
+        sizing = dict(intent.sizing or {})
+        if risk_pct is None:  # an external source: sized here, by the same sizer
+            decision = self.size(symbol, intent, acc)
+            if not decision.ok:
+                return note(f"no trade: sizing blocked ({decision.blocked}, binding {decision.binding})",
+                            allowed=False, code=decision.blocked or "SIZE_ZERO")
+            risk_pct, sizing = decision.risk_pct, dict(decision.constraints, binding=decision.binding)
+        exception_cap = self._exception_cap(intent, sizing)
 
-        def plan_for(risk_pct: float) -> Any:
+        def plan_for(r: float) -> Any:
             return plan_trade(sig.side, sig.atr, sig.sl_mult or 2.0, sig.tp_mult or 3.0, price, spread_points, spec,
-                              float(acc.equity), risk_pct, self.commission.get(symbol, 0.0),
-                              self.cfg.deviation_points, self._loss_per_lot_fn(symbol))
+                              equity, r, self.commission.get(symbol, 0.0), self.cfg.deviation_points,
+                              self._loss_per_lot_fn(symbol), min_lot_cap_pct=exception_cap,
+                              max_volume=spec.volume_max * limits.MAX_SPLIT_ORDERS)
 
-        base = plan_for(self.risk.risk_pct)
-        result = base if multiplier >= 1.0 else plan_for(self.risk.risk_pct * multiplier)
+        base = plan_for(risk_pct)
+        result = base if multiplier >= 1.0 else plan_for(risk_pct * multiplier)
         base_volume = base.plan.volume if base.plan is not None else 0.0
         if result.plan is None:
             reason = result.reason
+            code = "SL_BELOW_BROKER_MIN" if "broker minimum" in reason else "MIN_LOT_EXCEEDS_RISK"
             if base.plan is not None:
                 reason = f"reduced size (x{multiplier:.2f}) is below the minimum volume: {reason}"
-            return note(f"no trade: {reason}", allowed=False, base_volume=base_volume)
+                code = "TEAM_SIZE_BELOW_MIN"
+            return note(f"no trade: {reason}", allowed=False, base_volume=base_volume, code=code)
         plan = result.plan
+        if plan.exception and not preview:
+            self._record("affordability", "info", "MIN_LOT_EXCEPTION", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time, values={"min_lot_risk_pct": round(plan.risk_pct, 4),
+                                                           "tier_risk_pct": round(risk_pct * multiplier, 4),
+                                                           "cap_pct": round(exception_cap, 4)})
+            log.info("%s: minimum lot accepted as a conscious exception: it risks %.3f%% (tier %.3f%%, cap %.3f%%)",
+                     symbol, plan.risk_pct, risk_pct * multiplier, exception_cap)
         positions = self._bot_positions()
         news = None
         if self.cfg.news_filter_enabled:
             news = self.news.blocked({spec.currency_base, spec.currency_profit, "*"}, self._utc_now(),
                                      self.cfg.news_minutes_before, self.cfg.news_minutes_after)
+        spread_cap, spread_why = self.spread_limit(symbol, sig, spec)
         ctx = EntryContext(
-            symbol=symbol, plan=plan, equity=float(acc.equity), spread_points=spread_points,
-            bot_positions=self._open_risks(positions, float(acc.equity)),
+            symbol=symbol, plan=plan, equity=equity, spread_points=spread_points,
+            bot_positions=self._open_risks(positions, equity),
             symbol_has_foreign_netting_position=self._foreign_netting_position(symbol),
             notional_money=self._notional(symbol, sig.side, plan.volume, price, acc),
             halted_reason=self._entry_block_reason(), news_blocked=news,
             slippage_paused=self._slippage_pause.get(symbol, 0) > self._monotonic(),
+            allowed_risk_pct=risk_pct * multiplier, spread_limit_points=spread_cap, spread_limit_reason=spread_why,
+            exception_cap_pct=exception_cap,
         )
         if ctx.notional_money is None:
             return note("cannot compute exposure (order_calc_margin unavailable); skipping (fail closed)",
-                        allowed=False, level=logging.WARNING, base_volume=base_volume)
+                        allowed=False, level=logging.WARNING, base_volume=base_volume, code="MARGIN_UNKNOWN")
         allowed, reason = self.risk.approve_entry(ctx)
         if not allowed:
-            return note(f"entry rejected by the risk layer: {reason}", allowed=False, base_volume=base_volume)
+            code = funnel_mod.risk_reason_code(reason)
+            if code == "SPREAD_LIMIT" and "spike" in reason:
+                code = "SPREAD_SPIKE"
+            return note(f"entry rejected by the risk layer: {reason}", allowed=False, base_volume=base_volume,
+                        code=code)
         if preview:
             return EntryOutcome(True, "ok", volume=plan.volume, base_volume=base_volume, risk_pct=plan.risk_pct)
         filling = select_filling_mode(info.filling_mode, self.mt5)
+        parts = split_volume(plan.volume, spec.volume_max, spec.volume_step, spec.volume_min) \
+            if plan.volume > spec.volume_max else [plan.volume]
+        if not parts:
+            return note("no trade: the planned volume cannot be split into valid orders", allowed=False,
+                        code="SIZE_ZERO")
+        group = uuid.uuid4().hex[:12] if len(parts) > 1 else None
+        opened: list[EntryOutcome] = []
+        for index, part in enumerate(parts):
+            outcome = self._send_entry(symbol, intent, replace(plan, volume=part), info, tick, filling, multiplier,
+                                       dossier_id, base_volume, group, index, len(parts))
+            self._note_execution(symbol, outcome)
+            if not outcome.ok:
+                if not opened:
+                    return outcome
+                log.error("%s: split order %d/%d failed; %d part(s) already open keep their SL/TP", symbol,
+                          index + 1, len(parts), len(opened))
+                break
+            opened.append(outcome)
+            if outcome.dry_run:
+                break
+        return replace(opened[0], volume=sum(o.volume for o in opened))
+
+    def _note_execution(self, symbol: str, outcome: EntryOutcome) -> None:
+        """Self-healing: QUARANTINE_AFTER consecutive execution failures pause new entries on the
+        symbol (30 min, doubling per strike up to 8 h); one executed order clears it."""
+        if outcome.code == "ORDER_OK":
+            self._exec_failures.pop(symbol, None)
+            self._quarantine.pop(symbol, None)
+            return
+        if outcome.code not in ("ORDER_CHECK_FAIL", "ORDER_SEND_FAIL"):
+            return
+        failures = self._exec_failures.get(symbol, 0) + 1
+        self._exec_failures[symbol] = failures
+        if failures < QUARANTINE_AFTER:
+            return
+        strikes = self._quarantine.get(symbol, (0.0, 0))[1] + 1
+        minutes = min(QUARANTINE_MINUTES * 2 ** (strikes - 1), QUARANTINE_MAX_MINUTES)
+        self._quarantine[symbol] = (self._monotonic() + minutes * 60, strikes)
+        self._exec_failures[symbol] = 0
+        text = (f"{symbol}: {failures} execution failures in a row; new entries on this symbol paused for "
+                f"{minutes:.0f} min (open positions keep their SL/TP)")
+        log.warning(text)
+        self.notifier.send(text, key=f"quarantine-{symbol}")
+
+    def _send_entry(self, symbol: str, intent: EntryIntent, plan: TradePlan, info: Any, tick: Any, filling: int,
+                    multiplier: float, dossier_id: Optional[str], base_volume: float, group: Optional[str],
+                    part: int, parts: int) -> EntryOutcome:
+        sig = intent.signal
+        tf = intent.timeframe
 
         def build(t: Any) -> dict[str, Any]:
             return self._open_request(symbol, plan, info, t, filling)
+
+        def block(code: str, reason: str, level: int = logging.WARNING, **extra: Any) -> EntryOutcome:
+            log.log(level, "%s: %s", symbol, reason)
+            self._record("execution", "block", code, symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                         values={"detail": reason[:200]})
+            return EntryOutcome(True, reason, code=code, base_volume=base_volume, **extra)
 
         request = build(tick)
         try:
             validate_open_request(request, plan)
         except RiskViolation as exc:
-            return note(f"request blocked by the risk layer: {exc}", allowed=False, level=logging.ERROR)
+            return block("RISK_STOPS", f"request blocked by the risk layer: {exc}", logging.ERROR)
         check = self.mt5.order_check(request)
         if check is None:
-            return note(f"order_check returned nothing ({self._last_error()}); skipping", allowed=True,
-                        level=logging.WARNING)
+            return block("ORDER_CHECK_FAIL", f"order_check returned nothing ({self._last_error()}); skipping")
         if check.retcode not in (0, self.mt5.TRADE_RETCODE_DONE):
             if check.retcode == self._market_closed_code:
                 self._closed_until[symbol] = self._monotonic() + MARKET_CLOSED_BACKOFF_SECONDS
-            return note(f"order_check rejected the order: retcode={check.retcode} comment={check.comment}",
-                        allowed=True, level=logging.WARNING)
+            return block("ORDER_CHECK_FAIL", f"order_check rejected the order: retcode={check.retcode} "
+                                             f"comment={check.comment}")
         if self.cfg.dry_run:
-            log.info("DRY RUN: would send %s %s %.2f lots at %s SL %s TP %s (order_check OK, risk %.2f, x%.2f)",
+            log.info("DRY RUN: would send %s %s %.2f lots at %s SL %s TP %s (order_check OK, risk %.2f, x%.2f, %s)",
                      sig.side, symbol, plan.volume, request["price"], request["sl"], request["tp"], plan.planned_risk,
-                     multiplier)
+                     multiplier, intent.tier)
+            self._record("execution", "pass", "DRY_RUN", symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                         values={"tier": intent.tier, "volume": plan.volume})
             return EntryOutcome(True, "dry run: order_check OK, not sent", sent=False, ok=True, volume=plan.volume,
                                 price=float(request["price"]), sl=float(request["sl"]), tp=float(request["tp"]),
-                                dry_run=True, base_volume=base_volume, risk_pct=plan.risk_pct)
+                                dry_run=True, base_volume=base_volume, risk_pct=plan.risk_pct, code="DRY_RUN")
         if self.guard.halted_reason:
             self._entries_while_halted += 1  # defence in depth: the Guardian treats this as a kill condition
         sent = self._send_with_retry(build, tick, symbol, plan)
         if sent is None:
-            return EntryOutcome(True, "order_send failed (see log)", sent=True, ok=False, base_volume=base_volume)
+            self._record("execution", "block", "ORDER_SEND_FAIL", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time)
+            return EntryOutcome(True, "order_send failed (see log)", sent=True, ok=False, base_volume=base_volume,
+                                code="ORDER_SEND_FAIL")
         res, final_request = sent
         slippage = abs(float(res.price) - float(final_request["price"])) / info.point if res.price else 0.0
         if slippage > self.cfg.max_slippage_points:
@@ -1229,19 +1952,36 @@ class Bot:
             self.notifier.send(f"{symbol}: slippage {slippage:.1f} points; entries paused", key=f"slip-{symbol}")
         volume = float(res.volume or plan.volume)
         risk_money = plan.loss_per_lot * volume
-        extra = {"deal": getattr(res, "deal", None), "strategy": intent.strategy, "slippage_points": slippage}
+        acc_now = self.mt5.account_info()
+        equity = float(acc_now.equity) if acc_now is not None else 0.0
+        risk_pct = risk_money / equity * 100.0 if equity > 0 else plan.risk_pct
+        extra: dict[str, Any] = {"deal": getattr(res, "deal", None), "strategy": intent.strategy,
+                                 "slippage_points": slippage, "signal_bar": intent.bar_time,
+                                 "exploration": intent.exploration, "risk_pct": round(risk_pct, 6),
+                                 "policy": intent.policy, "regime": intent.regime,
+                                 "min_lot_exception": plan.exception,
+                                 "sizing_binding": (intent.sizing or {}).get("binding")}
+        if group:
+            extra.update(group=group, part=part + 1, parts=parts)
         if dossier_id:
             extra.update(dossier_id=dossier_id, size_multiplier=round(multiplier, 6))
+        if intent.posterior is not None:
+            extra.update(p_positive=round(intent.posterior.p_positive, 4),
+                         posterior_mean=round(intent.posterior.mean, 4))
         self.registry.open_trade("live", symbol, intent.param_set_id, sig.side, float(res.price or request["price"]),
                                  final_request["sl"], final_request["tp"], volume, risk_money, ticket=int(res.order),
-                                 open_bar_time=self._last_bar.get(symbol), extra=extra)
-        log.info("%s: opened %s %.2f lots at %s SL %s TP %s (order %s, deal %s, risk %.2f, size x%.2f)", symbol,
-                 sig.side, volume, res.price, final_request["sl"], final_request["tp"], res.order, res.deal, risk_money,
-                 multiplier)
+                                 open_bar_time=intent.bar_time, extra=extra, arm_id=intent.arm_id, timeframe=tf,
+                                 tier=intent.tier, risk_pct=risk_pct)
+        self._record("execution", "pass", "ORDER_OK", symbol, tf, arm_id=intent.arm_id, bar_time=intent.bar_time,
+                     values={"tier": intent.tier, "volume": volume, "risk_pct": round(risk_pct, 4),
+                             "exploration": intent.exploration})
+        log.info("%s: opened %s %.2f lots at %s SL %s TP %s (order %s, deal %s, risk %.2f = %.3f%%, %s, size x%.2f)",
+                 symbol, sig.side, volume, res.price, final_request["sl"], final_request["tp"], res.order, res.deal,
+                 risk_money, risk_pct, intent.tier, multiplier)
         return EntryOutcome(True, "opened", sent=True, ok=True, volume=volume,
                             price=float(res.price or request["price"]), sl=float(final_request["sl"]),
                             tp=float(final_request["tp"]), slippage_points=slippage, ticket=int(res.order),
-                            base_volume=base_volume, risk_pct=plan.risk_pct)
+                            base_volume=base_volume, risk_pct=risk_pct, code="ORDER_OK")
 
     def _open_request(self, symbol: str, plan: TradePlan, info: Any, tick: Any, filling: int) -> dict[str, Any]:
         point, digits = info.point, info.digits
@@ -1367,7 +2107,7 @@ class Bot:
         current = tick.bid if side == "BUY" else tick.ask
         risk_money = float(acc.equity) * self.risk.risk_pct / 100.0
         dist = risk_money / (spec.value_per_price * float(p.volume))
-        rates = self.mt5.copy_rates_from_pos(symbol, self._timeframe, 0, 100)
+        rates = self.mt5.copy_rates_from_pos(symbol, self._tf(self.cfg.timeframe), 0, 100)
         if rates is not None and len(rates) > 20:
             a = indicators.atr(rates["high"], rates["low"], rates["close"], 14)[-2]
             if np.isfinite(a) and a > 0:
@@ -1422,7 +2162,8 @@ class Bot:
             exit_price = float(exits[-1].price)
             r = pnl / row.risk_money if row.risk_money > 0 else 0.0
             self.registry.close_trade(row.id, exit_price, pnl, r, "closed at broker")
-            log.info("%s: position %s closed at %s, P&L %.2f (%.2fR)", row.symbol, row.ticket, exit_price, pnl, r)
+            log.info("%s: position %s closed at %s, P&L %.2f (%.2fR, %s)", row.symbol, row.ticket, exit_price, pnl, r,
+                     row.tier or "?")
             if self.team is not None:
                 from .team.events import TradeClosed
 
@@ -1493,25 +2234,47 @@ class Bot:
 
     # ---------------------------------------------------------- market data
 
-    def refresh_market_data(self) -> bool:
-        """Download history for every symbol into the SQLite cache used by the optimiser."""
-        count = int(self.cfg.history_months * 30.4375 * 86400 / self.cfg.bar_seconds * 0.75) + 500
-        count = min(count, 200_000)
-        ok = True
-        for symbol in self.symbols.values():
+    def refresh_market_data(self, mode: str = "full") -> bool:
+        """Download history for every symbol and timeframe of the arms into the research cache."""
+        from .config import TIMEFRAME_SECONDS
+
+        months = self.cfg.research.startup_history_months if mode == "startup" else self.cfg.history_months
+        ok_any = False
+        for symbol in self.universe:
+            for tf in self.timeframes():
+                count = min(int(months * 30.4375 * 86400 / TIMEFRAME_SECONDS[tf] * 0.75) + 500, 200_000)
+                try:
+                    rates = self.mt5.copy_rates_from_pos(symbol, self._tf(tf), 1, count)
+                except Exception:  # noqa: BLE001
+                    log.exception("%s %s: history download failed", symbol, tf)
+                    rates = None
+                if rates is None or len(rates) == 0:
+                    log.warning("%s %s: no history returned (%s). Raise Tools > Options > Charts > Max bars in chart.",
+                                symbol, tf, self._last_error())
+                    continue
+                self.registry.store_bars(symbol, tf, rates)
+                ok_any = True
+                if len(rates) < count * 0.5:
+                    log.info("%s %s: only %d of %d requested bars (the terminal may still be downloading history, "
+                             "or 'Max bars in chart' is low); research adapts its windows", symbol, tf, len(rates),
+                             count)
             try:
-                rates = self.mt5.copy_rates_from_pos(symbol, self._timeframe, 1, count)
-            except Exception:  # noqa: BLE001
-                log.exception("%s: history download failed", symbol)
-                rates = None
-            if rates is None or len(rates) == 0:
-                log.warning("%s: no history returned (%s). Raise Tools > Options > Charts > Max bars in chart.",
-                            symbol, self._last_error())
-                ok = False
-                continue
-            self.registry.store_bars(symbol, self.cfg.timeframe, rates)
-            self._refresh_spec(symbol)
-            log.info("%s: cached %d bars of history for optimisation", symbol, len(rates))
-        if self.mt5.account_info() is not None:
-            self.registry.set_kv("equity", str(float(self.mt5.account_info().equity)))
-        return ok
+                self._refresh_spec(symbol)
+            except StartupError:
+                log.warning("%s: symbol specification unavailable during the data refresh", symbol)
+        acc = self.mt5.account_info()
+        if acc is not None:
+            self.registry.set_kv("equity", str(float(acc.equity)))
+        return ok_any
+
+
+def _hourly_spread(bars: np.ndarray) -> dict[int, float]:
+    """Median bar spread per server hour (points), needing at least 3 bars in an hour."""
+    hours = (np.asarray(bars["time"], dtype=np.int64) % 86400) // 3600
+    spreads = np.asarray(bars["spread"], dtype=float)
+    out: dict[int, float] = {}
+    for h in range(24):
+        sel = spreads[hours == h]
+        if sel.size >= 3:
+            out[h] = float(np.median(sel))
+    return out

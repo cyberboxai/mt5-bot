@@ -1,10 +1,11 @@
-"""``office.sqlite``: the v3 team's database, one per account state folder.
+"""The team's office tables: the event stream the panel renders, decision dossiers, agent
+state, learned weights and calibration, the advisor audit log and the panel's control-action
+audit.
 
-It holds the event stream the panel renders, decision dossiers, agent state, learned
-weights and calibration, the advisor audit log and the panel's control-action audit.
-It is separate from ``registry.sqlite`` so its retention and vacuum policy can never
-touch the trade journal. WAL mode lets the panel read while the bot writes. Every
-statement is parameterised; growth is bounded by ``apply_retention``.
+They live in the account's single database (``mt5bot.sqlite``, see ``db``). Retention here
+only ever deletes from these tables (events, dossiers, advisor calls, metrics, weight
+history); it never touches the trade journal. WAL mode lets the panel read while the bot
+writes. Every statement is parameterised; growth is bounded by ``apply_retention``.
 """
 
 from __future__ import annotations
@@ -18,167 +19,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
-OFFICE_DB = "office.sqlite"
+from .db import DB_NAME, ensure_schema
+
+OFFICE_DB = DB_NAME  # the office tables share the account database
 ADVISOR_RETENTION_DAYS = 90.0
 METRICS_RETENTION_DAYS = 7.0
 WEIGHT_HISTORY_RETENTION_DAYS = 180.0
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    topic TEXT NOT NULL,
-    agent TEXT,
-    symbol TEXT,
-    severity TEXT NOT NULL DEFAULT 'info',
-    correlation_id TEXT,
-    payload_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS ix_events_ts ON events (ts);
-CREATE INDEX IF NOT EXISTS ix_events_agent ON events (agent, id);
-CREATE TABLE IF NOT EXISTS dossiers (
-    id TEXT PRIMARY KEY,
-    ts REAL NOT NULL,
-    symbol TEXT NOT NULL,
-    timeframe TEXT,
-    bar_time INTEGER,
-    side TEXT,
-    mode TEXT NOT NULL,
-    strategy TEXT,
-    param_set_id INTEGER,
-    regime TEXT,
-    session TEXT,
-    status TEXT NOT NULL,
-    final_action TEXT,
-    team_multiplier REAL,
-    advisor_multiplier REAL,
-    final_multiplier REAL,
-    inputs_json TEXT NOT NULL DEFAULT '{}',
-    opinions_json TEXT NOT NULL DEFAULT '[]',
-    weights_json TEXT NOT NULL DEFAULT '{}',
-    ensemble_json TEXT NOT NULL DEFAULT '{}',
-    advisor_json TEXT NOT NULL DEFAULT '{}',
-    risk_json TEXT NOT NULL DEFAULT '{}',
-    execution_json TEXT NOT NULL DEFAULT '{}',
-    outcome_json TEXT NOT NULL DEFAULT '{}',
-    r_base REAL,
-    resolved_ts REAL,
-    explanation TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_dossiers_ts ON dossiers (ts);
-CREATE INDEX IF NOT EXISTS ix_dossiers_status ON dossiers (status, symbol);
-CREATE TABLE IF NOT EXISTS agent_state (
-    agent TEXT PRIMARY KEY,
-    state TEXT NOT NULL,
-    task TEXT,
-    last_message TEXT,
-    updated_ts REAL NOT NULL,
-    benched INTEGER NOT NULL DEFAULT 0,
-    bench_reason TEXT,
-    errors INTEGER NOT NULL DEFAULT 0,
-    stats_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE TABLE IF NOT EXISTS agent_weights (
-    agent TEXT NOT NULL,
-    regime TEXT NOT NULL,
-    log_weight REAL NOT NULL,
-    n INTEGER NOT NULL,
-    updated_ts REAL NOT NULL,
-    PRIMARY KEY (agent, regime)
-);
-CREATE TABLE IF NOT EXISTS weights_history (
-    ts REAL NOT NULL,
-    agent TEXT NOT NULL,
-    regime TEXT NOT NULL,
-    weight REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_weights_history ON weights_history (agent, ts);
-CREATE TABLE IF NOT EXISTS calibration (
-    agent TEXT PRIMARY KEY,
-    a REAL NOT NULL,
-    b REAL NOT NULL,
-    n INTEGER NOT NULL,
-    brier_raw REAL,
-    brier_cal REAL,
-    reliability_json TEXT NOT NULL DEFAULT '[]',
-    updated_ts REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS advisor_calls (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    purpose TEXT NOT NULL,
-    model TEXT NOT NULL,
-    prompt_hash TEXT NOT NULL,
-    redacted_prompt TEXT NOT NULL,
-    response TEXT NOT NULL,
-    valid INTEGER NOT NULL,
-    input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    cache_read_tokens INTEGER NOT NULL,
-    cache_write_tokens INTEGER NOT NULL,
-    cost_usd REAL NOT NULL,
-    latency_ms REAL NOT NULL,
-    outcome TEXT NOT NULL,
-    error_kind TEXT,
-    detail TEXT,
-    state_after TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_advisor_calls_ts ON advisor_calls (ts);
-CREATE TABLE IF NOT EXISTS advisor_states (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    from_state TEXT NOT NULL,
-    to_state TEXT NOT NULL,
-    reason TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS advisor_tilts (
-    agent TEXT PRIMARY KEY,
-    factor REAL NOT NULL,
-    expires_ts REAL NOT NULL,
-    created_ts REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS briefings (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    kind TEXT NOT NULL,
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS hypotheses (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    source TEXT NOT NULL,
-    strategy TEXT NOT NULL,
-    param TEXT NOT NULL,
-    value_json TEXT NOT NULL,
-    rationale TEXT NOT NULL,
-    status TEXT NOT NULL,
-    note TEXT
-);
-CREATE TABLE IF NOT EXISTS control_audit (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    action TEXT NOT NULL,
-    client TEXT NOT NULL,
-    ok INTEGER NOT NULL,
-    detail TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS ablation_reports (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    n INTEGER NOT NULL,
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS metrics (
-    ts REAL NOT NULL,
-    name TEXT NOT NULL,
-    value REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_metrics ON metrics (name, ts);
-CREATE TABLE IF NOT EXISTS kv (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"""
 
 DOSSIER_JSON_FIELDS = ("inputs", "opinions", "weights", "ensemble", "advisor", "risk", "execution", "outcome")
 DOSSIER_COLUMNS = ("id", "ts", "symbol", "timeframe", "bar_time", "side", "mode", "strategy", "param_set_id", "regime",
@@ -231,11 +78,19 @@ class OfficeStore:
     # Simulation only (separate process, synthetic data): WAL without an fsync per commit.
     fast_writes = False
 
-    def __init__(self, path: Path, clock: Any = time.time, read_only: bool = False) -> None:
+    def __init__(self, path: Path, clock: Any = time.time, read_only: bool = False, shared: Any = None) -> None:
+        """``shared``: a Registry on the same database. Its connection and lock are reused, so the
+        trading loop and the event writer queue on one Python lock instead of contending for
+        SQLite's file lock (busy waits) through two connections in one process."""
         self.path = Path(path)
         self._clock = clock
-        self._lock = threading.RLock()
         self.read_only = read_only
+        self._owns_conn = shared is None
+        if shared is not None:
+            self._lock = shared.lock
+            self.conn = shared.raw
+            return
+        self._lock = threading.RLock()
         if read_only:
             # mode=rw never creates a missing database (the panel must not create files), and
             # query_only forbids writes; unlike mode=ro it also works on a WAL database whose
@@ -254,12 +109,12 @@ class OfficeStore:
             self.conn.execute("PRAGMA synchronous=OFF" if self.fast_writes else "PRAGMA synchronous=NORMAL")
         else:
             self.conn.execute("PRAGMA synchronous=OFF")
-        with self.tx():
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
-                    self.conn.execute(statement)
+        with self._lock:
+            ensure_schema(self.conn)
 
     def close(self) -> None:
+        if not self._owns_conn:
+            return  # the Registry that owns the shared connection closes it
         with self._lock:
             self.conn.close()
 
@@ -272,11 +127,11 @@ class OfficeStore:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self.conn
-            except BaseException:
-                self.conn.execute("ROLLBACK")
-                raise
-            else:
                 self.conn.execute("COMMIT")
+            except BaseException:
+                if self.conn.in_transaction:  # also when COMMIT itself failed
+                    self.conn.execute("ROLLBACK")
+                raise
 
     def _exec(self, sql: str, args: Sequence[Any] = ()) -> sqlite3.Cursor:
         with self._lock:

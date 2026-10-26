@@ -6,10 +6,43 @@ which is faster than indexing numpy scalars and still linear in the input size.
 
 from __future__ import annotations
 
-from typing import Any
+from collections import OrderedDict
+from typing import Any, Callable
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
+
+_CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_CACHE_SIZE = 64
+
+
+def _fingerprint(bars: np.ndarray) -> tuple:
+    """Identity of a bars array: buffer, length, first/last time and close. Many arms evaluate
+    the SAME closed-bar array on one bar, so shared indicators are computed once."""
+    n = len(bars)
+    if n == 0:
+        return (0,)
+    return (bars.__array_interface__["data"][0], n, int(bars["time"][0]), int(bars["time"][-1]),
+            float(bars["close"][0]), float(bars["close"][-1]), float(bars["high"][-1]), float(bars["low"][-1]))
+
+
+def cached(bars: np.ndarray, name: str, compute: Callable[[], np.ndarray]) -> np.ndarray:
+    """Memoise an indicator of ``bars`` (results are read-only views; callers must not mutate)."""
+    key = (_fingerprint(bars), name)
+    hit = _CACHE.get(key)
+    if hit is not None:
+        _CACHE.move_to_end(key)
+        return hit
+    value = np.asarray(compute())
+    value.flags.writeable = False
+    _CACHE[key] = value
+    if len(_CACHE) > _CACHE_SIZE:
+        _CACHE.popitem(last=False)
+    return value
+
+
+def bars_atr(bars: np.ndarray, period: int) -> np.ndarray:
+    return cached(bars, f"atr{period}", lambda: atr(bars["high"], bars["low"], bars["close"], period))
 
 
 def ema(values: Any, period: int) -> np.ndarray:

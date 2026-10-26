@@ -1,9 +1,9 @@
 """Glue between the trading loop and the specialist team.
 
 * ``decision_context`` turns MT5 data into the immutable, relative snapshot agents see.
-* ``BotGateway`` is bound to ONE champion proposal. The CIO can only preview it or submit
-  it once with a multiplier in [0, 1]; side, SL, TP and strategy are fixed by the champion,
-  and the hard risk layer runs inside ``Bot._try_open`` exactly as in v2.
+* ``BotGateway`` is bound to ONE arm proposal (already sized by the capital rules). The CIO
+  can only preview it or submit it once with a multiplier in [0, 1]; side, SL, TP, arm and
+  size cap are fixed, and the hard risk layer runs inside ``Bot._try_open``.
 * ``guardian_snapshot`` gives the Guardian its independent view of the broker state.
 * ``execute_management`` applies Position Manager / advisor actions only after the risk
   layer accepts them (tighten-only stops, partial closes that leave a valid volume).
@@ -14,11 +14,13 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from dataclasses import replace
 from decimal import ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
+from .config import TIMEFRAME_SECONDS
 from .market import DEFAULT_OFFSET_HOURS
 from .risk import RiskViolation, validate_sl_change
 from .team.agents.cio import ExecutionResult, GateResult
@@ -30,7 +32,7 @@ from .team.events import OrderExecuted, OrderFailed, PositionManaged
 
 if TYPE_CHECKING:  # pragma: no cover
     from .bot import Bot
-    from .engine import EntryIntent
+    from .arms import EntryIntent
 
 log = logging.getLogger("mt5_bot")
 
@@ -54,15 +56,18 @@ def position_views(bot: "Bot", acc: Any, positions: Optional[list[Any]] = None) 
             profit = bot.mt5.order_calc_profit(order_type, p.symbol, p.volume, p.price_open, price)
             if profit is not None and math.isfinite(profit):
                 unrealized_r = float(profit) / row.risk_money
+        tf = (row.timeframe if row is not None else None) or bot.cfg.timeframe
         bars_open = 0
-        last_bar = bot._last_bar.get(p.symbol)
+        last_bar = bot._last_bar.get((p.symbol, tf))
         if row is not None and row.open_bar_time and last_bar:
-            bars_open = max(0, int((last_bar - int(row.open_bar_time)) // bot.cfg.bar_seconds))
+            seconds = TIMEFRAME_SECONDS.get(tf, bot.cfg.bar_seconds)
+            bars_open = max(0, int((last_bar - int(row.open_bar_time)) // seconds))
         spec = bot.specs.get(p.symbol)
+        policy = str((row.extra or {}).get("policy") or "fixed") if row is not None else "fixed"
         out.append(PositionView(p.symbol, side, float(p.volume), float(p.price_open), float(p.sl or 0.0),
                                 float(p.tp or 0.0), int(p.ticket), risks.get(id(p), 0.0) / equity * 100.0,
                                 unrealized_r, bars_open, spec.currency_base if spec else "",
-                                spec.currency_profit if spec else "", row.param_set_id if row else None))
+                                spec.currency_profit if spec else "", row.param_set_id if row else None, tf, policy))
     return tuple(out)
 
 
@@ -89,33 +94,42 @@ def decision_context(bot: "Bot", symbol: str, intent: Optional["EntryIntent"], a
     spec = bot.specs.get(symbol)
     offset = bot.clock.offset if bot.clock.offset is not None else DEFAULT_OFFSET_HOURS * 3600
     since = bot.clock.seconds_since_change(symbol)
+    # The bars are the proposing arm's timeframe: every bar-based check (the Data Clerk's
+    # staleness rule, gap counts) must use that timeframe's bar length, not the primary one.
+    tf = (intent.timeframe if intent is not None and intent.timeframe else None) or bot.cfg.timeframe
     market = MarketView(
-        symbol=symbol, timeframe=bot.cfg.timeframe, bar_seconds=bot.cfg.bar_seconds, bar_time=int(closed[-1]["time"]),
+        symbol=symbol, timeframe=tf, bar_seconds=TIMEFRAME_SECONDS.get(tf, bot.cfg.bar_seconds),
+        bar_time=int(closed[-1]["time"]),
         closed=read_only(closed), bid=float(tick.bid), ask=float(tick.ask), point=float(info.point),
         digits=int(info.digits), spread_points=(float(tick.ask) - float(tick.bid)) / float(info.point),
         tick_time=int(tick.time), utc_now=float(bot._utc_now()), server_offset=int(offset),
         currency_base=spec.currency_base if spec else "", currency_profit=spec.currency_profit if spec else "",
-        tick_age_seconds=float(since) if since is not None else 0.0)
+        tick_age_seconds=float(since) if since is not None else 0.0,
+        spread_limit_points=(bot.spread_limit(symbol, intent.signal, spec)[0]
+                             if intent is not None and spec is not None else None))
     views = position_views(bot, acc) if positions is None else positions
     proposal = None
     if intent is not None:
         sig = intent.signal
         params: dict = {}
-        oos = win = None
         if intent.param_set_id is not None and bot.registry is not None:
             try:
                 params = bot.registry.param_set(int(intent.param_set_id))[1]
             except KeyError:
                 params = {}
-            champ = bot.registry.champion(symbol)
-            if champ.param_set_id == intent.param_set_id:
-                oos = champ.metrics.get("expectancy_r")
-                win = champ.metrics.get("win_rate")
+        post = intent.posterior
         proposal = Proposal(sig.side, intent.strategy, intent.param_set_id, intent.description, float(sig.atr),
-                            float(sig.sl_mult or 2.0), float(sig.tp_mult or 3.0), oos, win, params)
+                            float(sig.sl_mult or 2.0), float(sig.tp_mult or 3.0),
+                            None if post is None else float(post.mean), None, params, tier=intent.tier,
+                            arm_id=intent.arm_id, exploration=intent.exploration,
+                            p_positive=None if post is None else float(post.p_positive),
+                            risk_pct=intent.risk_pct)
     others = {s: arr for s, arr in bot._closes.items() if s != symbol}
-    return DecisionContext(f"{symbol}-{int(closed[-1]['time'])}-{uuid.uuid4().hex[:6]}", market,
-                           account_view(bot, acc, views), proposal, others, purpose=purpose)
+    account = account_view(bot, acc, views)
+    if intent is not None and intent.risk_pct is not None:
+        account = replace(account, risk_pct=float(intent.risk_pct))
+    return DecisionContext(f"{symbol}-{int(closed[-1]['time'])}-{uuid.uuid4().hex[:6]}", market, account, proposal,
+                           others, purpose=purpose)
 
 
 # --------------------------------------------------------------------- gateway
@@ -164,9 +178,14 @@ def guardian_snapshot(bot: "Bot", positions: list[Any], acc: Any) -> GuardianSna
     equity = float(acc.equity)
     journal = {int(r.ticket) for r in bot.registry.trades(mode="live", status="open") if r.ticket is not None}
     open_risk = sum(r.risk_money for r in bot._open_risks(positions, equity))
+    groups = {}
+    for p in positions:
+        row = bot.registry.trade_by_ticket(int(p.ticket))
+        groups[int(p.ticket)] = (row.extra or {}).get("group") if row is not None else None
     return GuardianSnapshot(
         positions=tuple({"ticket": int(p.ticket), "symbol": p.symbol, "sl": float(p.sl or 0.0),
-                         "tp": float(p.tp or 0.0), "volume": float(p.volume)} for p in positions),
+                         "tp": float(p.tp or 0.0), "volume": float(p.volume), "group": groups.get(int(p.ticket))}
+                        for p in positions),
         journal_open_tickets=frozenset(journal), equity=equity, open_risk_money=open_risk,
         max_total_open_risk_pct=bot.risk.max_total_open_risk_pct, risk_pct=bot.risk.risk_pct,
         max_positions=bot.risk.max_positions, entries_while_halted=bot._entries_while_halted)
@@ -233,11 +252,15 @@ def execute_management(bot: "Bot", action: ManagementAction) -> tuple[bool, str]
     return False, f"unknown action {action.action!r}"
 
 
-def manage_positions(bot: "Bot", symbol: str, acc: Any, closed: np.ndarray) -> None:
+def manage_positions(bot: "Bot", symbol: str, acc: Any, closed: np.ndarray, tf: Optional[str] = None) -> None:
+    """Manage the open positions on ``symbol`` whose arm trades ``tf`` (the bars just closed)."""
     pm = bot.cfg.team.position_manager
-    if bot.team is None or not (pm.any_enabled or bot.cfg.claude.manage_positions):
+    if bot.team is None or not (pm.any_enabled or bot.cfg.claude.manage_positions
+                                or bot.cfg.management.policies_enabled
+                                or bot.cfg.management.news_derisk_minutes is not None):
         return
-    views = [p for p in position_views(bot, acc) if p.symbol == symbol]
+    tf = tf or bot.cfg.timeframe
+    views = [p for p in position_views(bot, acc) if p.symbol == symbol and p.timeframe == tf]
     if not views:
         return
     info = bot.mt5.symbol_info(symbol)
@@ -250,10 +273,11 @@ def manage_positions(bot: "Bot", symbol: str, acc: Any, closed: np.ndarray) -> N
 
     def features(p: PositionView) -> dict:
         return {"symbol": p.symbol, "position_side": p.side, "unrealized_r": p.unrealized_r, "bars_open": p.bars_open,
-                "timeframe": bot.cfg.timeframe, "purpose": "management"}
+                "timeframe": p.timeframe, "purpose": "management"}
 
+    spiking = {symbol: bot.spread_spiking(symbol)} if bot.cfg.management.spread_spike_protect else {}
     actions = bot.team.plan_management(views, {symbol: closed}, {symbol: float(info.point) if info else 0.0},
-                                       {symbol: minutes}, features)
+                                       {symbol: minutes}, features, spiking)
     for action in actions:
         applied, detail = execute_management(bot, action)
         log.info("%s: position %s management %s (%s): %s", symbol, action.ticket, action.action, action.source,

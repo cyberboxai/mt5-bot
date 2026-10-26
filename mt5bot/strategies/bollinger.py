@@ -38,7 +38,9 @@ class BollingerBands(Strategy):
             if params["mode"] == "reversion":
                 return sides_from(crosses_above(close, lower), crosses_below(close, upper))
             bandwidth = np.where(mid > 0, (upper - lower) / mid, np.nan)
-            pct = indicators.rolling_percentile_rank(bandwidth, SQUEEZE_LOOKBACK)
+            # The band-width percentile does not depend on the width multiple: cache by period only.
+            pct = indicators.cached(bars, f"bbw_pct{period}_{SQUEEZE_LOOKBACK}",
+                                    lambda: indicators.rolling_percentile_rank(bandwidth, SQUEEZE_LOOKBACK))
             squeezed_before = np.zeros(len(close), dtype=bool)
             squeezed_before[1:] = pct[:-1] <= SQUEEZE_PERCENTILE
             buy = crosses_above(close, upper) & squeezed_before

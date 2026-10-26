@@ -1,10 +1,11 @@
 """Chief Investment Officer: runs the decision protocol and owns the decision dossier.
 
-Protocol for one champion proposal (the ONLY thing that can originate a trade):
+Protocol for one arm proposal (the ONLY thing that can originate a trade; the allocation
+stage selected it and the capital rules sized it):
 
 1. context   Data Clerk, Regime Detector, Session Analyst, News Sentinel, Correlation
              Analyst, Risk Manager pre-check, Guardian (all supervised, in parallel);
-2. proposals the Strategy Desk votes (the analyst owning the champion proposes);
+2. proposals the Strategy Desk votes (the analyst owning the arm's family proposes);
 3. evaluation the Meta-Labeler scores the candidate (stage 2b, it uses the desk votes);
 4. aggregation bounded ensemble with learned weights; advisor tilts can only shrink it;
 5. risk gate the hard risk layer (``RiskManager.approve_entry``) previews and, at send
@@ -14,8 +15,9 @@ Protocol for one champion proposal (the ONLY thing that can originate a trade):
 7. execution through the gateway the bot provides, which can only scale the base size
              DOWN (multiplier in [0, 1]) and always attaches SL/TP.
 
-``team_mode``: in ``baseline`` the multiplier is 1 (the v2 core) and the team and advisor
-are recorded as counterfactuals for the ablation; in ``full`` their reductions apply.
+``team_mode``: in ``baseline`` the multiplier is 1 (simple rules: the sized proposal as is)
+and the team and advisor are recorded as counterfactuals for the ablation; in ``full``
+their reductions apply.
 Safety gates (data unhealthy, look-ahead audit flag, Guardian freeze, panel pause,
 risk layer) apply in EVERY mode.
 """
@@ -201,9 +203,9 @@ class ChiefInvestmentOfficer(Agent):
             voter_ops[agent_id] = op
         proposer = family_for(prop.strategy, prop.params)
         if proposer not in voter_ops:
-            # The owning analyst is benched, disabled or failed: the champion still speaks for itself.
+            # The owning analyst is benched, disabled or failed: the arm still speaks for itself.
             voter_ops["champion"] = Opinion("champion", sym, ctx.market.timeframe, "long" if side > 0 else "short",
-                                            0.6, timestamp=self.now(), reasons=(("PROPOSER", "champion signal"),),
+                                            0.6, timestamp=self.now(), reasons=(("PROPOSER", "arm signal"),),
                                             details={"proposer": True, "stand_in_for": proposer})
 
         # 2b. meta-labeler, fed with a preliminary read of the desk
@@ -316,7 +318,9 @@ class ChiefInvestmentOfficer(Agent):
             else None, "final_multiplier": round(final_m if action == "enter" else 0.0, 6),
             "inputs": {"proposal": {"side": prop.side, "strategy": prop.strategy, "description": prop.description,
                                     "atr": prop.atr, "sl_mult": prop.sl_mult, "tp_mult": prop.tp_mult,
-                                    "oos_expectancy_r": prop.oos_expectancy_r, "win_rate": prop.win_rate},
+                                    "oos_expectancy_r": prop.oos_expectancy_r, "win_rate": prop.win_rate,
+                                    "arm_id": prop.arm_id, "tier": prop.tier, "exploration": prop.exploration,
+                                    "p_positive": prop.p_positive, "risk_pct": prop.risk_pct},
                        "market": {"bid": ctx.market.bid, "ask": ctx.market.ask,
                                   "spread_points": round(ctx.market.spread_points, 3)},
                        "account": {"risk_pct": ctx.account.risk_pct,
@@ -374,7 +378,8 @@ class ChiefInvestmentOfficer(Agent):
             "drawdown_pct": a.drawdown_pct, "drawdown_limit_pct": a.drawdown_limit_pct, "risk_pct": a.risk_pct,
             "equity_change_today_pct": a.equity_change_today_pct, "team_multiplier": team_m,
             "aggregate_confidence": result.aggregate_confidence, "disagreement": result.disagreement,
-            "agreement_count": result.agreement_count, "champion_oos_expectancy_r": prop.oos_expectancy_r,
+            "agreement_count": result.agreement_count, "arm_expectancy_r": prop.oos_expectancy_r, "tier": prop.tier,
+            "p_positive": prop.p_positive,
             "news_minutes_to_next": news.get("minutes"),
             "votes": [{"agent": v.agent, "stance": v.stance, "confidence": v.confidence} for v in votes],
         }

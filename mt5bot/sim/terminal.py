@@ -27,6 +27,8 @@ CONSTANTS: dict[str, int] = {
     "TRADE_RETCODE_NO_MONEY": 10019, "TRADE_RETCODE_PRICE_CHANGED": 10020, "TRADE_RETCODE_PRICE_OFF": 10021,
 }
 COMMISSION_PER_LOT_SIDE = 3.5
+TIMEFRAME_SECONDS = {1: 60, 5: 300, 15: 900, 30: 1800, 16385: 3600, 16388: 14400}
+MAX_BASE_BARS = 12_000
 SERVER_OFFSET = 2 * 3600
 SIM_LOGIN = 10_000_001
 SIM_SERVER = "CYBERBOX-Simulation"
@@ -50,6 +52,7 @@ class SimulatedTerminal:
             margin_mode=self.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING, leverage=100, trade_allowed=True, trade_expert=True,
             equity=balance, balance=balance)
         self.terminal = SimpleNamespace(connected=True, trade_allowed=True, path=r"C:\CYBERBOX\Simulation")
+        self._agg_cache: dict[tuple[str, int], tuple[int, np.ndarray]] = {}
         self._open_forming_bars()
 
     # ---------------------------------------------------------------- market clock
@@ -80,8 +83,8 @@ class SimulatedTerminal:
             row["time"], row["open"], row["high"], row["low"], row["close"] = bar_time, o, h, lo, c
             row["spread"], row["tick_volume"] = spr, vol
             self._fill_stops(sym.name, row)
-            if len(rates) > 6000:  # bounded memory over long runs
-                self.rates[sym.name] = rates[-5000:]
+            if len(rates) > MAX_BASE_BARS + 1000:  # bounded memory over long runs
+                self.rates[sym.name] = rates[-MAX_BASE_BARS:]
         self._open_forming_bars()
         self._mark_to_market()
         return bar_time
@@ -188,10 +191,36 @@ class SimulatedTerminal:
         ask = round(bid + int(last["spread"]) * point, model.digits if model else 5)
         return SimpleNamespace(time=int(last["time"]) + 60, bid=bid, ask=ask)
 
+    def _aggregated(self, name: str, seconds: int) -> np.ndarray:
+        """Bars of ``seconds`` built from the base bars (the last one may still be forming)."""
+        base = self.rates[name]
+        key = (name, seconds)
+        stamp = int(base[-1]["time"]) * 100_000 + len(base)
+        cached = self._agg_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        times = np.asarray(base["time"], dtype=np.int64)
+        bucket = times // seconds
+        starts = np.flatnonzero(np.r_[True, bucket[1:] != bucket[:-1]])
+        ends = np.r_[starts[1:], len(base)]
+        out = np.zeros(len(starts), dtype=RATES_DTYPE)
+        out["time"] = bucket[starts] * seconds
+        out["open"] = base["open"][starts]
+        out["close"] = base["close"][ends - 1]
+        out["high"] = np.maximum.reduceat(np.asarray(base["high"]), starts)
+        out["low"] = np.minimum.reduceat(np.asarray(base["low"]), starts)
+        out["tick_volume"] = np.add.reduceat(np.asarray(base["tick_volume"], dtype=np.uint64), starts)
+        out["spread"] = np.minimum.reduceat(np.asarray(base["spread"]), starts)
+        self._agg_cache[key] = (stamp, out)
+        return out
+
     def copy_rates_from_pos(self, name: str, timeframe: int, start: int, count: int) -> Any:
         rates = self.rates.get(name)
         if rates is None:
             return None
+        seconds = TIMEFRAME_SECONDS.get(int(timeframe), self.market.bar_seconds)
+        if seconds > self.market.bar_seconds:
+            rates = self._aggregated(name, seconds)
         end = len(rates) - start
         return rates[max(0, end - count):end].copy()
 

@@ -233,6 +233,29 @@ class ControlAction(Message):
 
 
 @dataclass(frozen=True)
+class ArmTierChanged(Message):
+    TOPIC: ClassVar[str] = "arm.tier"
+    SEVERITY: ClassVar[str] = "notice"
+    arm_id: int
+    arm: str
+    old: str
+    new: str
+    reason: str
+    p_positive: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class FlowAdjusted(Message):
+    TOPIC: ClassVar[str] = "flow.adjustment"
+    SEVERITY: ClassVar[str] = "notice"
+    knob: str
+    old: float
+    new: float
+    direction: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class SystemHealth(Message):
     TOPIC: ClassVar[str] = "system.health"
     SEVERITY: ClassVar[str] = "debug"
@@ -374,7 +397,7 @@ class EventBus:
                 self._store.insert_events([e.row() for e in batch])
             except Exception:  # noqa: BLE001 - a locked or full disk must not crash the trading loop
                 self.write_errors += 1
-                log.warning("Could not persist %d event(s) to office.sqlite", len(batch), exc_info=True)
+                log.warning("Could not persist %d event(s) to the database", len(batch), exc_info=True)
             self._written(len(batch))
             if stop:
                 return

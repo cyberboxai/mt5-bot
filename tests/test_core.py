@@ -139,10 +139,15 @@ class TestConfig:
         assert cfg.symbols == ("EURUSD",)
         assert cfg.account_mode == "any"
         assert cfg.real_money_confirmed is False
-        assert cfg.risk_per_trade_pct(is_real=False) == 0.5
-        assert cfg.risk_per_trade_pct(is_real=True) == 0.25
-        assert cfg.max_daily_loss_pct(is_real=False) == 2.0
-        assert cfg.max_daily_loss_pct(is_real=True) == 1.5
+        assert cfg.risk_profile == "balanced"
+        from mt5bot.profiles import effective_limits
+
+        for real in (False, True):
+            lim = effective_limits(cfg, real)
+            assert lim.t3_risk_pct <= limits.MAX_RISK_PER_TRADE_PCT and lim.t1_risk_pct <= lim.t2_risk_pct
+            assert lim.daily_loss_pct <= limits.MAX_DAILY_LOSS_PCT
+            assert lim.explore_day_pct <= limits.MAX_EXPLORATION_DAY_PCT
+        assert effective_limits(cfg, True).t1_risk_pct < effective_limits(cfg, False).t1_risk_pct
 
     def test_valid_file_loads(self, tmp_path: Path) -> None:
         path = tmp_path / "c.json"
@@ -181,10 +186,12 @@ class TestConfig:
         {"trading_hours_server": [8, 8]}, {"trading_hours_server": [-1, 10]}, {"trading_hours_server": [7]},
         {"bars": 100}, {"bars": True}, {"magic": 0}, {"magic": "123"},
         {"account_mode": "live"}, {"real_money_confirmed": "yes"}, {"real_money_confirmed": 1},
-        {"risk_per_trade_pct_demo": 0}, {"max_open_positions_total": 0}, {"max_spread_points": 0},
+        {"risk_per_trade_pct_demo": 0}, {"max_open_positions_total": 0}, {"risk_profile": "yolo"},
+        {"tiers": {"t2_enter_p": 0.5}}, {"tiers": {"exploration_day_pct": 5.0}}, {"universe": {"timeframes": ["D1"]}},
+        {"capital": {"lock_fraction": 0.99}}, {"universe": {"max_spread_points_by_symbol": {"EURUSD": 0}}},
         {"deviation_points": -1}, {"poll_seconds": 0}, {"heartbeat_minutes": 0}, {"kill_switch_file": ""},
         {"mt5_path": ""}, {"enabled_strategies": ["martingale"]}, {"holidays": ["2025/12/25"]},
-        {"min_shadow_trades_floor": 50}, {"history_months": 3},
+        {"tiers": {"t1_exit_p": 0.6}}, {"history_months": 3},
     ])
     def test_invalid_values_raise(self, overrides: dict[str, Any]) -> None:
         with pytest.raises(ValueError):
@@ -387,7 +394,7 @@ class TestEntries:
         assert fake_mt5.sends == []
 
     def test_spread_filter_blocks_entry(self, make_bot, fake_mt5: FakeMT5) -> None:
-        bot = started(make_bot(max_spread_points=20))
+        bot = started(make_bot(universe={"max_spread_points_by_symbol": {"EURUSD": 20}}))
         fake_mt5.advance_bar("EURUSD")
         fake_mt5.ticks["EURUSD"].ask = fake_mt5.ticks["EURUSD"].bid + 0.00050
         bot.run_once()

@@ -32,6 +32,8 @@ class PositionView:
     currency_base: str = ""
     currency_profit: str = ""
     param_set_id: Optional[int] = None
+    timeframe: str = ""
+    policy: str = "fixed"    # the arm's management policy at entry (mt5bot.management)
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,7 @@ class MarketView:
     currency_base: str = ""
     currency_profit: str = ""
     tick_age_seconds: float = 0.0
+    spread_limit_points: Optional[float] = None
 
     @property
     def server_now(self) -> float:
@@ -74,7 +77,8 @@ class MarketView:
 
 @dataclass(frozen=True)
 class Proposal:
-    """The v2 champion's entry intent: the ONLY thing that can originate a trade."""
+    """An arm's entry proposal (selected by the allocation stage): the ONLY thing that can
+    originate a trade. ``oos_expectancy_r`` carries the arm's posterior mean expectancy."""
 
     side: str
     strategy: str
@@ -86,6 +90,11 @@ class Proposal:
     oos_expectancy_r: Optional[float] = None
     win_rate: Optional[float] = None
     params: Mapping[str, Any] = field(default_factory=dict)
+    tier: str = "EXT"
+    arm_id: Optional[int] = None
+    exploration: bool = False
+    p_positive: Optional[float] = None
+    risk_pct: Optional[float] = None
 
 
 @dataclass(frozen=True)

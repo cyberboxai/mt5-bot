@@ -6,9 +6,10 @@ shadow trading and the backtester so they can never diverge.
 
 Forbidden behaviours, each enforced here and covered by tests:
 
-* martingale or any size increase after a loss: the size is a pure function of
-  current equity and the fixed configured risk; trade history is never an input,
-  and a plan whose risk exceeds the configured fraction is rejected;
+* martingale or any size increase after a loss: the risk fraction comes from the sizer
+  (``capital.size_risk``: tier, evidence, cushion, heat, anti-martingale cap), never from
+  the last trade's result, and a plan whose risk exceeds that fraction, the profile cap or
+  the hard ceiling is rejected here again;
 * averaging down, pyramiding and grids: at most one bot position per symbol;
 * orders without SL and TP, or with SL/TP on the wrong side of the price;
 * removing or widening an SL after entry (only adding a missing SL or tightening);
@@ -32,6 +33,7 @@ from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 from . import limits
 from .persistence import atomic_write_json, atomic_write_text
+from .profiles import effective_limits
 
 log = logging.getLogger("mt5_bot")
 
@@ -180,6 +182,7 @@ class TradePlan:
     loss_per_lot: float
     risk_money: float
     risk_pct: float
+    exception: bool = False   # minimum lot accepted above the tier risk (conscious, logged exception)
 
     @property
     def planned_risk(self) -> float:
@@ -209,6 +212,8 @@ def plan_trade(
     commission_per_lot: float,
     adverse_points: float,
     loss_per_lot_fn: Optional[LossPerLotFn] = None,
+    min_lot_cap_pct: Optional[float] = None,
+    max_volume: Optional[float] = None,
 ) -> PlanResult:
     """Turn a direction and volatility into SL, TP and a risk-capped volume.
 
@@ -216,6 +221,10 @@ def plan_trade(
     per lot is measured from the worst fill ``adverse_points`` away from it, plus the
     round-turn commission, so slippage within the limit and costs cannot exceed the
     configured risk. Used verbatim by live, shadow and backtest code.
+
+    ``min_lot_cap_pct``: when the minimum lot risks more than ``risk_pct`` but no more than
+    this cap (never above the hard ceiling), plan exactly the minimum lot and flag the plan as
+    an exception. Without it, such a trade is refused (the default for backtests and shadow).
     """
     if side not in ("BUY", "SELL"):
         return PlanResult(None, f"invalid side {side!r}")
@@ -248,10 +257,18 @@ def plan_trade(
         return PlanResult(None, f"cannot compute loss per lot ({price_loss!r})")
     loss_per_lot = price_loss + max(commission_per_lot, 0.0)
     risk_money = equity * risk_pct / 100.0
-    volume = lots_for_risk(risk_money, loss_per_lot, spec.volume_min, spec.volume_max, spec.volume_step)
+    # ``max_volume`` above the broker's volume_max lets a large account split one entry into a few
+    # orders (see capital.split_volume); the total risk is still capped by ``risk_money``.
+    volume = lots_for_risk(risk_money, loss_per_lot, spec.volume_min, max_volume or spec.volume_max, spec.volume_step)
     if volume <= 0:
+        min_money = spec.volume_min * loss_per_lot
+        min_pct = min_money / equity * 100.0
+        cap = min(min_lot_cap_pct, limits.MAX_RISK_PER_TRADE_PCT) if min_lot_cap_pct is not None else None
+        if cap is not None and min_pct <= cap + 1e-12:
+            return PlanResult(TradePlan(side, price, sl, tp, sl_points, tp_points, spec.volume_min, loss_per_lot,
+                                        min_money, min_pct, exception=True))
         return PlanResult(None, (f"minimum volume {spec.volume_min} would risk "
-                                 f"{spec.volume_min * loss_per_lot:.2f} > allowed {risk_money:.2f}"))
+                                 f"{min_money:.2f} ({min_pct:.3f}%) > allowed {risk_money:.2f}"))
     return PlanResult(TradePlan(side, price, sl, tp, sl_points, tp_points, volume, loss_per_lot,
                                 risk_money, risk_pct))
 
@@ -261,10 +278,19 @@ def plan_trade(
 
 @dataclass(frozen=True)
 class OpenRisk:
-    """Risk still at stake on an open bot position (money lost if its SL is hit)."""
+    """Risk still at stake on an open bot position (money lost if its SL is hit).
+
+    ``group`` identifies one entry: an order larger than the broker's volume_max may be split
+    into a few positions with the same group; they count as ONE entry for the per-symbol and
+    position-count limits (their risks still add up)."""
 
     symbol: str
     risk_money: float
+    group: Optional[str] = None
+
+
+def entry_groups(positions: Sequence[OpenRisk]) -> set[tuple[str, str]]:
+    return {(p.symbol, p.group or f"#{i}") for i, p in enumerate(positions)}
 
 
 @dataclass(frozen=True)
@@ -279,23 +305,38 @@ class EntryContext:
     halted_reason: Optional[str] = None
     news_blocked: Optional[str] = None
     slippage_paused: bool = False
+    allowed_risk_pct: Optional[float] = None       # from the sizer (already x the team multiplier)
+    spread_limit_points: Optional[float] = None    # per symbol: absolute cap, cost-to-stop and spike filters
+    spread_limit_reason: str = ""
+    exception_cap_pct: Optional[float] = None      # tier-specific cap for a minimum-lot exception (None: refuse)
 
 
 class RiskManager:
-    """Applies the configured limits, each clamped to the hard ceilings in ``limits``."""
+    """Applies the effective limits (profile, tightened by user caps), clamped to ``limits``."""
 
     def __init__(self, cfg: Any, is_real: bool) -> None:
         self.is_real = is_real
         self.update_config(cfg)
 
     def update_config(self, cfg: Any) -> None:
-        self.risk_pct = min(cfg.risk_per_trade_pct(self.is_real), limits.MAX_RISK_PER_TRADE_PCT)
-        self.max_daily_loss_pct = min(cfg.max_daily_loss_pct(self.is_real), limits.MAX_DAILY_LOSS_PCT)
-        self.max_positions = min(cfg.max_open_positions_total, limits.MAX_OPEN_POSITIONS)
-        self.max_total_open_risk_pct = min(cfg.max_total_open_risk_pct, limits.MAX_TOTAL_OPEN_RISK_PCT)
+        self.limits = effective_limits(cfg, self.is_real)
+        # The largest per-trade risk any tier may use (the T3 cap of the profile).
+        self.risk_pct = min(self.limits.t3_risk_pct, limits.MAX_RISK_PER_TRADE_PCT)
+        self.max_daily_loss_pct = min(self.limits.daily_loss_pct, limits.MAX_DAILY_LOSS_PCT)
+        self.max_positions = min(self.limits.max_positions, limits.MAX_OPEN_POSITIONS)
+        self.max_total_open_risk_pct = min(self.limits.max_open_risk_pct, limits.MAX_TOTAL_OPEN_RISK_PCT)
         self.max_symbol_exposure_x = min(cfg.max_symbol_exposure_x, limits.MAX_SYMBOL_EXPOSURE_X)
-        self.max_drawdown_pct = min(cfg.max_drawdown_from_peak_pct, limits.MAX_DRAWDOWN_FROM_PEAK_PCT)
-        self.max_spread_points = cfg.max_spread_points
+        self.max_drawdown_pct = min(self.limits.drawdown_breaker_pct, limits.MAX_DRAWDOWN_FROM_PEAK_PCT)
+
+    def allowed_risk_pct(self, ctx: EntryContext) -> float:
+        """The per-trade risk this entry may use: the sizer's figure (or, for a minimum-lot
+        exception, the affordability cap), never above the profile cap or the hard ceiling."""
+        cap = min(self.risk_pct, limits.MAX_RISK_PER_TRADE_PCT)
+        if ctx.plan.exception:
+            return min(cap, ctx.exception_cap_pct) if ctx.exception_cap_pct is not None else 0.0
+        if ctx.allowed_risk_pct is not None:
+            cap = min(cap, ctx.allowed_risk_pct)
+        return cap
 
     def approve_entry(self, ctx: EntryContext) -> tuple[bool, str]:
         """Every check an entry must pass. Returns (allowed, reason)."""
@@ -306,24 +347,28 @@ class RiskManager:
             validate_plan_stops(plan)
         except RiskViolation as exc:
             return False, str(exc)
-        if ctx.spread_points > self.max_spread_points:
-            return False, f"spread {ctx.spread_points:.1f} points > max {self.max_spread_points:.1f}"
+        if ctx.spread_limit_points is not None and ctx.spread_points > ctx.spread_limit_points:
+            why = f" ({ctx.spread_limit_reason})" if ctx.spread_limit_reason else ""
+            return False, f"spread {ctx.spread_points:.1f} points > max {ctx.spread_limit_points:.1f}{why}"
         if ctx.slippage_paused:
             return False, "recent slippage exceeded max_slippage_points; entries paused on this symbol"
         if ctx.news_blocked:
             return False, f"news blackout: {ctx.news_blocked}"
-        same_symbol = [p for p in ctx.bot_positions if p.symbol == ctx.symbol]
+        groups = entry_groups(ctx.bot_positions)
+        same_symbol = [g for g in groups if g[0] == ctx.symbol]
         if len(same_symbol) >= limits.MAX_POSITIONS_PER_SYMBOL:
             return False, "bot already has a position on this symbol (no averaging down, pyramiding or grids)"
         if ctx.symbol_has_foreign_netting_position:
             return False, "netting account already holds a non-bot position on this symbol"
-        if len(ctx.bot_positions) >= self.max_positions:
-            return False, f"{len(ctx.bot_positions)} bot positions open (max {self.max_positions})"
-        allowed_risk = ctx.equity * self.risk_pct / 100.0
-        # Martingale guard: size can only come from the fixed fraction of current equity.
-        if plan.planned_risk > allowed_risk * (1 + 1e-9) or plan.risk_pct > self.risk_pct + 1e-12:
-            return False, (f"planned risk {plan.planned_risk:.2f} exceeds the fixed per-trade risk "
-                           f"{allowed_risk:.2f} (size increases are forbidden)")
+        if len(groups) >= self.max_positions:
+            return False, f"{len(groups)} bot positions open (max {self.max_positions})"
+        allowed_pct = self.allowed_risk_pct(ctx)
+        allowed_risk = ctx.equity * allowed_pct / 100.0
+        # Martingale guard: size can only come from the sizer's fraction of current equity,
+        # itself capped by the profile and the hard ceiling.
+        if plan.planned_risk > allowed_risk * (1 + 1e-9) or plan.risk_pct > allowed_pct + 1e-9:
+            return False, (f"planned risk {plan.planned_risk:.2f} exceeds the allowed per-trade risk "
+                           f"{allowed_risk:.2f} ({allowed_pct:.3f}%; size increases are forbidden)")
         open_risk = sum(max(p.risk_money, 0.0) for p in ctx.bot_positions)
         max_total = ctx.equity * self.max_total_open_risk_pct / 100.0
         if open_risk + plan.planned_risk > max_total * (1 + 1e-9):

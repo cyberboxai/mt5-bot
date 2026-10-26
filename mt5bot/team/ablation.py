@@ -1,7 +1,7 @@
 """Ablation: replay resolved decision dossiers with each agent (and the advisor) removed,
-and compare the full team with the simple baseline (the v2 core: every proposal at base size).
+and compare the full team with the simple baseline (every sized proposal taken as is).
 
-Every resolved dossier carries ``r_base``: the R the champion's proposal actually made
+Every resolved dossier carries ``r_base``: the R the arm's proposal actually made
 (from its shadow trade, filled by the backtester's rules). Replaying a configuration gives
 a multiplier m_i per dossier, so its per-proposal return is ``m_i * r_base_i`` (0 when it
 skips). Weights stored in a dossier were learned only from EARLIER outcomes, so the replay

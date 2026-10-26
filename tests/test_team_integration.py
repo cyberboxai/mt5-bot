@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 import fake_anthropic as fa
@@ -250,12 +251,12 @@ def sim_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def test_simulation_produces_a_populated_office(sim_dir: Path) -> None:
     from mt5bot.officedb import OfficeStore
 
-    office = next(sim_dir.glob("*/office.sqlite"))
+    office = next(sim_dir.glob("*/mt5bot.sqlite"))
     store = OfficeStore(office)
     try:
         states = store.agent_states()
-        assert len(states) == 21
-        assert store.dossiers(500), "the seeded champions must produce decision meetings"
+        assert len(states) == 22
+        assert store.dossiers(500), "exploration and arm proposals must produce decision meetings"
         topics = {e["topic"] for e in store.latest_events(5000)}
         assert {"agent.state", "decision.started", "decision.finished", "market.snapshot"} <= topics
         assert store.advisor_calls(), "the simulated advisor audits its calls"
@@ -274,3 +275,29 @@ def test_cli_ablation_report_and_reset(sim_dir: Path, tmp_path: Path, capsys) ->
     out = capsys.readouterr().out
     assert "Team ablation report" in out and "Verdict" in out
     assert cli.main(["--config", str(config), "--reset-team-weights"]) == 0
+
+
+def test_team_judges_bars_on_the_proposing_arms_timeframe(make_bot, fake_mt5: FakeMT5) -> None:
+    """Regression: the market view used the primary timeframe's bar length (M15) for an H1 arm's
+    bars, so the Data Clerk saw every H1 bar as stale and vetoed every H1 proposal."""
+    from conftest import make_rates
+    from mt5bot import teambridge
+    from mt5bot.arms import EntryIntent
+    from mt5bot.strategies.base import Signal
+
+    bot = start(make_bot, source=FixedSource(None))
+    assert bot.cfg.timeframe == "M15"
+    h1 = make_rates(np.full(300, 1.1), bar_seconds=3600)
+    tick_time = int(h1["time"][-1]) + 3600 + 46 * 60  # 46 min into the forming H1 bar: normal
+    fake_mt5.set_tick("EURUSD", 1.1, time=tick_time)
+    clerk = bot.team.agents["data_clerk"]
+    intent = EntryIntent(Signal("BUY", 0.001, 2.0, 3.0), None, "donchian", "donchian H1", arm_id=1, tier="T1",
+                         timeframe="H1")
+    ctx = teambridge.decision_context(bot, "EURUSD", intent, fake_mt5.account_info(), h1)
+    assert ctx.market.timeframe == "H1" and ctx.market.bar_seconds == 3600
+    clerk.analyze(ctx)
+    assert not any("lags the latest tick" in p for p in clerk.stats["problems"])
+    stale = make_rates(np.full(300, 1.1), bar_seconds=3600, start_time=int(h1["time"][0]) - 5 * 3600)
+    clerk.analyze(teambridge.decision_context(bot, "EURUSD", intent, fake_mt5.account_info(), stale))
+    assert any("lags the latest tick" in p for p in clerk.stats["problems"])  # 5 bars late: still caught
+    bot.close()

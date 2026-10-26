@@ -1,7 +1,9 @@
 """Read-only data layer of the panel: one method per API endpoint.
 
-Sources: ``health.json`` (written by the bot), ``registry.sqlite`` (journal, champions,
-runs, equity, cached bars) and ``office.sqlite`` (events, dossiers, agents, advisor).
+Sources: ``health.json`` (written by the bot) and the account database ``mt5bot.sqlite``
+(journal, arms and tiers, research, funnel, equity, cached bars, events, dossiers, agents,
+advisor). Before the bot has migrated an older install, the legacy ``registry.sqlite`` and
+``office.sqlite`` are read instead.
 Connections are opened per request with ``mode=rw`` + ``query_only`` so the panel can
 never create or modify them. Every result size is bounded. Missing data gives empty,
 honestly labelled results, never invented numbers.
@@ -20,8 +22,12 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 
-from mt5bot import __version__, limits
-from mt5bot.officedb import OFFICE_DB, OfficeStore
+from mt5bot import __version__, funnel as funnel_mod, limits
+from mt5bot.flow import KNOBS
+from mt5bot.profiles import PROFILES, effective_limits
+from mt5bot.tiers import TIER_PT
+from mt5bot.db import DB_NAME, LEGACY_OFFICE, LEGACY_REGISTRY
+from mt5bot.officedb import OfficeStore
 from mt5bot.team.agents.market import correlation_matrix, currency_exposure, session_view
 from mt5bot.team.context import PositionView
 from mt5bot.team.roster import BY_ID, DEPARTMENTS, ROSTER, VOTERS
@@ -63,8 +69,14 @@ class StateLocator:
             pass
         root = self.resolve(self.cfg.state_root)
         folders = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
-        candidates = [p for p in folders if (p / "registry.sqlite").exists()]
+        candidates = [p for p in folders if (p / DB_NAME).exists() or (p / LEGACY_REGISTRY).exists()]
         return candidates[0] if len(candidates) == 1 else None
+
+
+def _db_file(state: Path, legacy: str) -> Path:
+    """The unified database, or the legacy file while an older install is not yet migrated."""
+    unified = state / DB_NAME
+    return unified if unified.exists() or not (state / legacy).exists() else state / legacy
 
 
 def _f(x: Any, digits: int = 6) -> Any:
@@ -85,7 +97,7 @@ class PanelData:
     @contextmanager
     def registry(self) -> Iterator[Optional[sqlite3.Connection]]:
         state = self.locator.get()
-        path = state / "registry.sqlite" if state else None
+        path = _db_file(state, LEGACY_REGISTRY) if state else None
         if path is None or not path.exists():
             yield None
             return
@@ -100,7 +112,7 @@ class PanelData:
     @contextmanager
     def office(self) -> Iterator[Optional[OfficeStore]]:
         state = self.locator.get()
-        path = state / OFFICE_DB if state else None
+        path = _db_file(state, LEGACY_OFFICE) if state else None
         if path is None or not path.exists():
             yield None
             return
@@ -153,7 +165,11 @@ class PanelData:
             return wall
 
     def _symbols(self, health: dict) -> list[str]:
-        return list((health.get("symbols") or {}).keys()) or list(self.cfg.symbols)
+        return list(health.get("universe") or (health.get("symbols") or {}).keys()) or list(self.cfg.symbols)
+
+    def _pnl_today(self, health: dict) -> Optional[float]:
+        with self.registry() as reg:
+            return self._pnl_since(reg, _day_start(self.now(health)), health.get("equity"))
 
     # ---------------------------------------------------------------- status
 
@@ -177,6 +193,12 @@ class PanelData:
             "has_data": state is not None,
             "equity": health.get("equity"), "balance": health.get("balance"), "peak_equity": health.get("peak_equity"),
             "drawdown_pct": health.get("drawdown_pct"), "open_positions": health.get("open_positions"),
+            "currency": health.get("currency") or "", "mode": health.get("mode") or "exploration",
+            "status_line": health.get("status_line") or "", "tiers": health.get("tiers") or {},
+            "capital": health.get("capital") or {}, "exploration": health.get("exploration") or {},
+            "limits": health.get("limits") or {}, "universe": health.get("universe") or [],
+            "timeframes": health.get("timeframes") or [], "daily_loss_pct": health.get("daily_loss_pct"),
+            "pnl_today": self._pnl_today(health),
             "team": {k: team.get(k) for k in ("configured_mode", "effective_mode", "mode_reason", "guardian_freeze",
                                                "benched_performance", "benched_errors")},
             "advisor": {"state": advisor.get("state", "DISABLED"), "reason": advisor.get("reason", ""),
@@ -225,11 +247,40 @@ class PanelData:
 
     # ---------------------------------------------------------------- equity
 
+    @staticmethod
+    def _cash_flows(reg: Optional[sqlite3.Connection], since: float = 0.0) -> list[tuple[float, float]]:
+        """(ts, amount) of deposits/withdrawals after ``since`` (empty on a pre-3.1 database)."""
+        if reg is None:
+            return []
+        try:
+            return [(float(r["ts"]), float(r["amount"])) for r in reg.execute(
+                "SELECT ts, amount FROM cash_flows WHERE ts >= ? ORDER BY ts", (since,))]
+        except sqlite3.OperationalError:
+            return []
+
     def _pnl_since(self, reg: Optional[sqlite3.Connection], since: float, equity_now: Any) -> Optional[float]:
+        """Equity change since ``since`` minus deposits plus withdrawals: cash flows are not P&L."""
         if reg is None or equity_now is None:
             return None
-        row = reg.execute("SELECT equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts LIMIT 1", (since,)).fetchone()
-        return _f(float(equity_now) - float(row["equity"]), 2) if row else None
+        row = reg.execute("SELECT ts, equity FROM equity_snapshots WHERE ts >= ? ORDER BY ts LIMIT 1",
+                          (since,)).fetchone()
+        if not row:
+            return None
+        flows = sum(a for _ts, a in self._cash_flows(reg, float(row["ts"])))
+        return _f(float(equity_now) - float(row["equity"]) - flows, 2)
+
+    def _adjusted(self, reg: sqlite3.Connection, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        """Equity curve with deposits/withdrawals removed (so drawdown and return ignore them)."""
+        flows = self._cash_flows(reg)
+        if not flows:
+            return points
+        out, k, cum = [], 0, 0.0
+        for ts, eq in points:
+            while k < len(flows) and flows[k][0] <= ts:
+                cum += flows[k][1]
+                k += 1
+            out.append((ts, eq - cum))
+        return out
 
     def equity(self, days: float = 30.0) -> dict[str, Any]:
         health, _ = self.health()
@@ -241,12 +292,12 @@ class PanelData:
                                     (now - days * DAY,)))
             points = [{"ts": r["ts"], "equity": r["equity"], "balance": r["balance"], "peak": r["peak"]}
                       for r in metrics.downsample(rows)]
-            first = reg.execute("SELECT equity FROM equity_snapshots ORDER BY ts LIMIT 1").fetchone()
             eq = health.get("equity")
             summary = {"today": self._pnl_since(reg, _day_start(now), eq),
                        "week": self._pnl_since(reg, now - 7 * DAY, eq),
                        "month": self._pnl_since(reg, now - 30 * DAY, eq),
-                       "all_time": _f(float(eq) - float(first["equity"]), 2) if first and eq is not None else None,
+                       "all_time": self._pnl_since(reg, 0.0, eq),
+                       "cash_flows": _f(sum(a for _t, a in self._cash_flows(reg)), 2),
                        "drawdown_pct": health.get("drawdown_pct"), "peak_equity": health.get("peak_equity"),
                        "equity": eq, "balance": health.get("balance")}
         return {"points": points, "summary": summary, "insufficient": len(points) < 2}
@@ -262,8 +313,18 @@ class PanelData:
                                                  "'live' AND status = 'closed' ORDER BY close_ts")]
             shadow = [dict(r) for r in reg.execute("SELECT r, pnl, open_ts, close_ts FROM trades WHERE mode = "
                                                    "'shadow' AND status = 'closed' ORDER BY close_ts")]
-            points = [(r["ts"], r["equity"]) for r in reg.execute("SELECT ts, equity FROM equity_snapshots ORDER BY ts")]
+            points = self._adjusted(reg, [(r["ts"], r["equity"]) for r in reg.execute(
+                "SELECT ts, equity FROM equity_snapshots ORDER BY ts")])
             out["live"] = metrics.trade_metrics(live)
+            out["by_tier"] = {}
+            try:
+                for tier in ("T1", "T2", "T3"):
+                    rows = [dict(r) for r in reg.execute("SELECT r, pnl, open_ts, close_ts, symbol FROM trades WHERE "
+                                                         "mode = 'live' AND status = 'closed' AND tier = ? ORDER BY "
+                                                         "close_ts", (tier,))]
+                    out["by_tier"][tier] = metrics.trade_metrics(rows)
+            except sqlite3.OperationalError:
+                pass
             out["shadow"] = metrics.trade_metrics(shadow)
             out["equity"] = metrics.equity_metrics(points)
             out["buy_and_hold"] = self._buy_and_hold(reg, points)
@@ -347,7 +408,11 @@ class PanelData:
     def _trade_row(self, reg: sqlite3.Connection, r: dict, specs: dict[str, float]) -> dict[str, Any]:
         extra = json.loads(r.get("extra_json") or "{}")
         row = {k: r.get(k) for k in ("id", "mode", "symbol", "side", "status", "open_ts", "close_ts", "entry", "exit",
-                                     "sl", "tp", "volume", "risk_money", "pnl", "r", "exit_reason", "param_set_id")}
+                                     "sl", "tp", "volume", "risk_money", "pnl", "r", "exit_reason", "param_set_id",
+                                     "arm_id", "timeframe", "tier", "risk_pct")}
+        row["exploration"] = bool(extra.get("exploration"))
+        row["min_lot_exception"] = bool(extra.get("min_lot_exception"))
+        row["sizing_binding"] = extra.get("sizing_binding")
         row.update(strategy=extra.get("strategy"), slippage_points=_f(extra.get("slippage_points"), 2),
                    dossier_id=extra.get("dossier_id"), size_multiplier=extra.get("size_multiplier"),
                    commission_estimate=_f(specs.get(r["symbol"], 0.0) * float(r["volume"]), 2),
@@ -493,43 +558,115 @@ class PanelData:
     # ------------------------------------------------------------ strategies
 
     def strategies(self) -> dict[str, Any]:
+        """Arms and Research: every arm with its tier and evidence, research runs and quality flags,
+        tier changes (with the metrics that justified them) and the research hypotheses."""
         health, _ = self.health()
-        out: dict[str, Any] = {"symbols": {}, "runs": [], "promotions": [], "rejected": []}
+        out: dict[str, Any] = {"arms": [], "tiers": health.get("tiers") or {}, "runs": [], "tier_changes": [],
+                               "research": [], "status_line": health.get("status_line") or ""}
         with self.registry() as reg:
             if reg is None:
                 return out
-            for symbol, info in (health.get("symbols") or {}).items():
-                out["symbols"][symbol] = {"champion": info.get("champion"), "status_line": info.get("status_line"),
-                                          "performance": info.get("champion_performance"),
-                                          "challengers": info.get("challengers", [])}
-            runs = [dict(r) for r in reg.execute("SELECT * FROM optimization_runs ORDER BY id DESC LIMIT 20")]
-            out["runs"] = runs
-            for run in runs[:6]:
-                cands = reg.execute("SELECT c.*, p.strategy, p.params_json FROM candidate_metrics c JOIN param_sets p "
-                                    "ON p.id = c.param_set_id WHERE run_id = ? ORDER BY rank", (run["id"],))
-                for c in cands:
-                    m = json.loads(c["metrics_json"])
-                    entry = {"run_id": run["id"], "symbol": run["symbol"], "strategy": c["strategy"],
-                             "params": json.loads(c["params_json"]), "passed": bool(c["passed"]), "score": c["score"],
-                             "reasons": json.loads(c["reasons_json"]),
-                             "metrics": {k: _f(m.get(k), 4) for k in ("trades", "expectancy_r", "profit_factor",
-                                                                       "max_drawdown_r", "deflated_sharpe",
-                                                                       "profitable_window_ratio", "neighbor_pass_ratio",
-                                                                       "total_trials")},
-                             "stability": _choice_heatmap(m.get("windows_chosen") or [])}
-                    out.setdefault("candidates", []).append(entry)
-                    if not entry["passed"]:
-                        out["rejected"].append({"run_id": run["id"], "strategy": c["strategy"],
-                                                "gate": (entry["reasons"] or ["?"])[0]})
-            out["promotions"] = [dict(r) for r in reg.execute(
-                "SELECT id, ts, symbol, action, old_desc, new_desc, reason FROM promotions ORDER BY id DESC LIMIT 60")]
-            out["shadow_progress"] = [dict(r) for r in reg.execute(
-                "SELECT param_set_id, symbol, COUNT(*) AS trades, ROUND(AVG(r), 4) AS mean_r FROM trades "
-                "WHERE mode = 'shadow' AND status = 'closed' GROUP BY param_set_id, symbol ORDER BY trades DESC "
-                "LIMIT 30")]
+            try:
+                arms = list(reg.execute(
+                    "SELECT a.*, p.params_json FROM arms a JOIN param_sets p ON p.id = a.param_set_id WHERE a.active = 1"))
+                stats = {r["arm_id"]: dict(r) for r in reg.execute(
+                    "SELECT arm_id, SUM(mode = 'shadow') AS shadow, SUM(mode = 'live') AS live, ROUND(AVG(r), 4) AS mean_r"
+                    " FROM trades WHERE status = 'closed' AND arm_id IS NOT NULL GROUP BY arm_id")}
+            except sqlite3.OperationalError:
+                arms, stats = [], {}
+            for a in arms:
+                post = json.loads(a["posterior_json"] or "{}")
+                st = stats.get(a["id"], {})
+                out["arms"].append({
+                    "id": a["id"], "symbol": a["symbol"], "timeframe": a["timeframe"], "strategy": a["strategy"],
+                    "params": json.loads(a["params_json"]), "source": a["source"], "tier": a["tier"],
+                    "tier_pt": TIER_PT.get(a["tier"], a["tier"]), "tier_since": a["tier_since"],
+                    "pinned_until": a["pinned_until"], "policy": a["policy"], "prior_n": a["prior_n"],
+                    "prior_mean": _f(a["prior_mean"], 4), "p_positive": _f(post.get("p_positive"), 4),
+                    "mean_r": _f(post.get("mean"), 4), "lo": _f(post.get("lo"), 4), "hi": _f(post.get("hi"), 4),
+                    "shrinkage": _f(post.get("shrinkage"), 3), "n_obs": post.get("n_obs", 0),
+                    "dd_r": _f(post.get("dd_r"), 3), "shadow_trades": int(st.get("shadow") or 0),
+                    "live_trades": int(st.get("live") or 0), "observed_mean_r": st.get("mean_r")})
+            out["arms"].sort(key=lambda x: (-int(x["tier"][1]), -(x["p_positive"] or 0), x["id"]))
+            out["runs"] = [dict(r) for r in reg.execute("SELECT * FROM optimization_runs ORDER BY id DESC LIMIT 30")]
+            try:
+                for r in reg.execute("SELECT * FROM research_results ORDER BY id DESC LIMIT 120"):
+                    m = json.loads(r["metrics_json"] or "{}")
+                    out["research"].append({
+                        "ts": r["ts"], "symbol": r["symbol"], "timeframe": r["timeframe"], "strategy": r["strategy"],
+                        "n_oos": r["n_oos"], "mean_r": _f(r["mean_r"], 4), "flags": json.loads(r["flags_json"] or "[]"),
+                        "metrics": {k: _f(m.get(k), 4) for k in ("profit_factor", "max_drawdown_r", "deflated_sharpe",
+                                                                  "profitable_window_ratio", "neighbor_pass_ratio")}})
+            except sqlite3.OperationalError:
+                pass
+            out["tier_changes"] = [dict(r) for r in reg.execute(
+                "SELECT id, ts, symbol, action, old_desc, new_desc, reason, metrics_json FROM promotions "
+                "ORDER BY id DESC LIMIT 80")]
+            for row in out["tier_changes"]:
+                row["metrics"] = json.loads(row.pop("metrics_json") or "{}")
         with self.office() as office:
             out["hypotheses"] = office.hypotheses(limit=30) if office is not None else []
         return out
+
+    def funnel(self, hours: float = 24.0) -> dict[str, Any]:
+        """"Porque nao estou a negociar?": the decision funnel, top blockers and what each filter is worth."""
+        health, _ = self.health()
+        now = self.now(health)
+        out: dict[str, Any] = {"hours": hours, "status_line": health.get("status_line") or "",
+                               "mode": health.get("mode"), "tiers": health.get("tiers") or {},
+                               "exploration": health.get("exploration") or {}, "capital": health.get("capital") or {},
+                               "entry_block": health.get("entry_block"),
+                               "trading_hours_server": health.get("trading_hours_server")}
+        with self.registry() as reg:
+            if reg is None:
+                out["report"] = {"available": False}
+                return out
+            out["report"] = funnel_mod.report(reg, now - hours * 3600, now)
+            try:
+                out["counterfactuals"] = funnel_mod.counterfactuals(reg, now - hours * 3600, now)
+            except sqlite3.OperationalError:
+                out["counterfactuals"] = {}
+            hourly = []
+            try:
+                for r in reg.execute("SELECT CAST(ts / 3600 AS INTEGER) AS h, SUM(reason = 'SIGNAL') AS signals, "
+                                     "SUM(outcome = 'block') AS blocked, SUM(reason = 'ORDER_OK') AS orders FROM "
+                                     "funnel_events WHERE ts >= ? GROUP BY h ORDER BY h", (now - hours * 3600,)):
+                    hourly.append({"ts": r["h"] * 3600, "signals": r["signals"], "blocked": r["blocked"],
+                                   "orders": r["orders"]})
+            except sqlite3.OperationalError:
+                pass
+            out["hourly"] = hourly
+            out["flow"] = self._flow(reg)
+            raw = self._kv(reg, "affordability")
+            out["affordability"] = json.loads(raw) if raw else {"rows": []}
+        rep = out["report"]
+        stages = []
+        if rep.get("available"):
+            stages = [{"stage": "bars", "label": "Barras avaliadas", "count": rep["bars_evaluated"]},
+                      {"stage": "signals", "label": "Sinais", "count": rep["signals"]},
+                      {"stage": "blocked", "label": "Bloqueados", "count": rep["blocked"]},
+                      {"stage": "orders", "label": "Ordens", "count": rep["orders"]}]
+        out["stages"] = stages
+        return out
+
+    def _flow(self, reg: sqlite3.Connection) -> dict[str, Any]:
+        try:
+            rows = [dict(r) for r in reg.execute("SELECT * FROM flow_adjustments ORDER BY id DESC LIMIT 60")]
+        except sqlite3.OperationalError:
+            rows = []
+        raw = self._kv(reg, "flow_state")
+        state = json.loads(raw) if raw else {}
+        knobs = []
+        for name, (default, step, lo, hi, label) in KNOBS.items():
+            knobs.append({"knob": name, "value": (state.get("knobs") or {}).get(name, default), "default": default,
+                          "floor": lo, "ceiling": hi, "step": step, "label": label})
+        return {"adjustments": rows, "knobs": knobs, "status_text": state.get("status_text", "")}
+
+    def flow(self) -> dict[str, Any]:
+        with self.registry() as reg:
+            if reg is None:
+                return {"adjustments": [], "knobs": [], "status_text": ""}
+            return self._flow(reg)
 
     # ------------------------------------------------------------------ risk
 
@@ -564,6 +701,7 @@ class PanelData:
         names, corr = correlation_matrix(closes, 500) if len(closes) >= 2 else (list(closes), np.eye(len(closes)))
         worst = sum(float(r["risk_money"]) for r in open_rows)
         is_real = health.get("account_type") == "REAL"
+        lim = health.get("limits") or effective_limits(self.cfg, is_real).to_dict()
         cfg = self.cfg
         out.update(
             by_symbol=by_symbol, by_currency=currency_exposure(views),
@@ -571,24 +709,32 @@ class PanelData:
             var=metrics.var_estimate(points),
             worst_case_open_risk={"money": _f(worst, 2), "pct": _f(worst / equity * 100, 4) if equity > 0 else None,
                                   "note": "se todas as posições abertas atingissem o stop loss"},
+            profile=lim.get("profile"), profiles={k: v.to_dict() for k, v in PROFILES.items()},
+            capital=health.get("capital") or {}, exploration=health.get("exploration") or {},
             limits=[
-                {"name": "risk_per_trade_pct", "config": cfg.risk_per_trade_pct(is_real),
-                 "ceiling": limits.MAX_RISK_PER_TRADE_PCT},
-                {"name": "max_daily_loss_pct", "config": cfg.max_daily_loss_pct(is_real),
-                 "ceiling": limits.MAX_DAILY_LOSS_PCT},
-                {"name": "max_total_open_risk_pct", "config": cfg.max_total_open_risk_pct,
+                {"name": "t1_risk_pct", "config": lim.get("t1_risk_pct"), "ceiling": limits.MAX_EXPLORATION_TRADE_PCT},
+                {"name": "t2_risk_pct", "config": lim.get("t2_risk_pct"), "ceiling": limits.MAX_RISK_PER_TRADE_PCT},
+                {"name": "t3_risk_pct", "config": lim.get("t3_risk_pct"), "ceiling": limits.MAX_RISK_PER_TRADE_PCT},
+                {"name": "max_daily_loss_pct", "config": lim.get("daily_loss_pct"),
+                 "ceiling": limits.MAX_DAILY_LOSS_PCT, "current": health.get("daily_loss_pct")},
+                {"name": "max_total_open_risk_pct", "config": lim.get("max_open_risk_pct"),
                  "ceiling": limits.MAX_TOTAL_OPEN_RISK_PCT,
                  "current": _f(worst / equity * 100, 4) if equity > 0 else None},
-                {"name": "max_open_positions_total", "config": cfg.max_open_positions_total,
+                {"name": "max_open_positions_total", "config": lim.get("max_positions"),
                  "ceiling": limits.MAX_OPEN_POSITIONS, "current": len(open_rows)},
-                {"name": "max_drawdown_from_peak_pct", "config": cfg.max_drawdown_from_peak_pct,
+                {"name": "max_drawdown_from_peak_pct", "config": lim.get("drawdown_breaker_pct"),
                  "ceiling": limits.MAX_DRAWDOWN_FROM_PEAK_PCT, "current": health.get("drawdown_pct")},
+                {"name": "exploration_day_pct", "config": lim.get("explore_day_pct"),
+                 "ceiling": limits.MAX_EXPLORATION_DAY_PCT},
+                {"name": "exploration_week_pct", "config": lim.get("explore_week_pct"),
+                 "ceiling": limits.MAX_EXPLORATION_WEEK_PCT},
                 {"name": "max_symbol_exposure_x", "config": cfg.max_symbol_exposure_x,
                  "ceiling": limits.MAX_SYMBOL_EXPOSURE_X},
             ],
             breakers={"halted": health.get("halted"), "guardian_freeze": (health.get("team") or {}).get(
                 "guardian_freeze"), "entry_block": health.get("entry_block"),
-                "drawdown_distance_pct": _f(cfg.max_drawdown_from_peak_pct - float(health.get("drawdown_pct") or 0), 3)})
+                "drawdown_distance_pct": _f(float(lim.get("drawdown_breaker_pct") or 0)
+                                            - float(health.get("drawdown_pct") or 0), 3)})
         with self.office() as office:
             rows = office.agent_states() if office is not None else {}
         out["gauges"] = (rows.get("risk_manager") or {}).get("stats", {}).get("agent", {}).get("gauges", {})
@@ -616,6 +762,11 @@ class PanelData:
             news = (rows.get("news_sentinel") or {}).get("stats", {}).get("agent", {}).get("news", {})
         out["news"] = {"calendar": (news or {}).get("calendar", "sem calendário"), "upcoming": (news or {}).get("upcoming",
                                                                                                            [])}
+        with self.registry() as reg:
+            raw = self._kv(reg, "opportunity")
+            out["opportunity"] = (json.loads(raw) if raw else {}).get("scores", [])
+            raw = self._kv(reg, "affordability")
+            out["affordability"] = json.loads(raw) if raw else {"rows": []}
         return out
 
     # --------------------------------------------------------------- advisor
@@ -673,12 +824,12 @@ class PanelData:
         now = self.now(health)
         out: dict[str, Any] = {"bot_alive": age is not None and age < 180, "health_age_s": age,
                                "last_loop_utc": health.get("last_loop_utc"), "last_tick_server": health.get(
-                                   "last_tick_server"), "optimizer": health.get("optimizer"),
+                                   "last_tick_server"), "research": health.get("research"),
                                "event_bus": (health.get("team") or {}).get("event_bus"), "version": health.get("version")}
         with self.office() as office:
             series = {}
-            for name in ("cpu_pct", "rss_mb", "loop_ms", "mt5_latency_ms", "tick_age_s", "office_db_mb", "log_mb",
-                         "disk_free_gb", "registry_db_mb", "panel_heartbeat_age_s"):
+            for name in ("cpu_pct", "rss_mb", "loop_ms", "mt5_latency_ms", "tick_age_s", "db_mb", "log_mb",
+                         "disk_free_gb", "panel_heartbeat_age_s"):
                 points = office.metrics(name, since_ts=now - DAY) if office is not None else []
                 series[name] = [{"ts": t, "value": _f(v, 3)} for t, v in metrics.downsample(points, 400)]
             alerts = [e for e in (office.latest_events(3000) if office is not None else [])
@@ -745,18 +896,6 @@ class PanelData:
 
 def _day_start(ts: float) -> float:
     return float(int(ts // DAY) * DAY)
-
-
-def _choice_heatmap(windows: list) -> dict[str, dict[str, int]]:
-    """How often each parameter value was chosen across walk-forward windows (stability view)."""
-    out: dict[str, dict[str, int]] = {}
-    for params in windows:
-        if not isinstance(params, dict):
-            continue
-        for name, value in params.items():
-            bucket = out.setdefault(str(name), {})
-            bucket[str(value)] = bucket.get(str(value), 0) + 1
-    return out
 
 
 def utc_text(ts: float) -> str:

@@ -190,7 +190,7 @@ class Strategy(ABC):
         """Vectorised signals over all closed bars, with warm-up and invalid ATR masked out."""
         params = self.validate_params(params)
         n = len(bars)
-        vol = indicators.atr(bars["high"], bars["low"], bars["close"], ATR_PERIOD)
+        vol = indicators.bars_atr(bars, ATR_PERIOD)
         side = np.zeros(n, dtype=np.int8)
         warm = self.warmup_bars(params)
         if n > warm:

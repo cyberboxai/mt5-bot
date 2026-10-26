@@ -12,8 +12,9 @@ Fill model (MT5 bars are BID prices; ``spread`` is per bar, in points):
 * SL fills get slippage, TP fills do not (limit-like);
 * commission is charged per lot round turn; negative swap is charged per rollover
   (triple on the symbol's 3-day swap weekday); positive swap is ignored;
-* no entry when the entry bar spread exceeds ``max_spread_points`` or its server hour
-  is outside ``trading_hours``;
+* no entry when the entry bar spread exceeds ``max_spread_points``, or costs more than
+  ``max_spread_to_stop`` of the stop distance (a unit-free filter, valid for FX, gold,
+  indices and crypto alike), or its server hour is outside ``trading_hours``;
 * positions still open at the end of a window are closed at the last bar close.
 """
 
@@ -40,6 +41,7 @@ class CostModel:
     max_spread_points: float = 1e9
     trading_hours: tuple[int, int] = (0, 24)
     close_on_opposite: bool = True
+    max_spread_to_stop: float = 1.0
 
 
 @dataclass
@@ -82,6 +84,8 @@ def open_position(side: int, index: int, bar_time: int, bar_open: float, spread_
                   equity: float, risk_pct: float) -> Optional[VirtualPosition]:
     """Open a virtual position at the bar open, or None if a filter or the risk plan rejects it."""
     if spread_points > costs.max_spread_points:
+        return None
+    if spread_points * spec.point > costs.max_spread_to_stop * atr_value * sl_mult:
         return None
     hour = datetime.fromtimestamp(int(bar_time), tz=timezone.utc).hour
     if not in_trading_hours(hour, costs.trading_hours):

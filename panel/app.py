@@ -39,6 +39,7 @@ def setup_logging(path: Optional[Path]) -> None:
     console.setFormatter(formatter)
     log.addHandler(console)
     if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)  # the demo folder may not exist yet
         handler = logging.handlers.RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")
         handler.setFormatter(formatter)
         log.addHandler(handler)
