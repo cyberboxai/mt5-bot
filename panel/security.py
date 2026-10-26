@@ -33,6 +33,10 @@ SECURE_HEADERS = {
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
+# What the login page itself needs (brand styles, fonts, logo): public, contains no data.
+PUBLIC_PATHS = ("/login", "/api/login", "/static/css/app.css", "/static/css/tokens.css", "/static/css/fonts.css",
+                "/static/js/login.js", "/favicon.ico")
+PUBLIC_PREFIXES = ("/static/fonts/", "/static/img/")
 SESSION_COOKIE = "cbx_session"
 SESSION_SECONDS = 12 * 3600
 # Keys that must never leave the panel, wherever they appear in a payload.
@@ -121,7 +125,7 @@ class PanelSecurity:
         """Remote mode: everything except the login page needs a session or the bearer token."""
         if not self.remote:
             return True
-        if path in ("/login", "/api/login", "/static/css/app.css", "/static/js/login.js", "/favicon.svg"):
+        if path in PUBLIC_PATHS or (path.startswith(PUBLIC_PREFIXES) and ".." not in path):
             return True
         return self.session_ok(headers.get("Cookie")) or self.token_ok(self.bearer(headers))
 

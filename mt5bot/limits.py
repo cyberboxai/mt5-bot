@@ -21,9 +21,24 @@ MAX_SL_ATR_MULT = 6.0
 MIN_TP_ATR_MULT = 0.5
 MAX_TP_ATR_MULT = 10.0
 
-# The bot never uses more than one position per symbol: this is what forbids grids,
-# pyramiding and averaging down.
+# The bot never holds more than one entry per symbol: this is what forbids grids,
+# pyramiding and averaging down. An entry larger than the broker's volume_max may be split
+# into a few broker positions that share one entry group (same arm, same SL/TP, one plan).
 MAX_POSITIONS_PER_SYMBOL = 1
+MAX_SPLIT_ORDERS = 4
+
+# ---- v3.1: evidence-scaled risk. Exploration (tier T1) is the explicit price of
+# information; its loss budget can never exceed these ceilings, whatever the config says.
+MAX_EXPLORATION_DAY_PCT = 0.5
+MAX_EXPLORATION_WEEK_PCT = 1.5
+MAX_EXPLORATION_TRADE_PCT = 0.25
+# The profit ratchet locks at least nothing and at most 90 percent of new highs.
+MAX_LOCK_FRACTION = 0.9
+MAX_HOUSE_MONEY = 1.5
+MAX_KELLY_FRACTION = 0.5
+# Trading-hours window the Flow Doctor may widen to (server hours, [start, end)). The
+# rollover hour around server midnight stays closed: spreads are widest there.
+WIDEST_TRADING_HOURS = (1, 23)
 
 # ---- v3: optional Claude advisor. Cost and latency ceilings; no config can exceed them.
 MAX_ADVISOR_LATENCY_BUDGET_MS = 5000

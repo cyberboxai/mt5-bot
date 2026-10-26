@@ -1,7 +1,7 @@
 """Risk and Control: the Risk Manager (wraps the hard risk layer) and the Guardian.
 
 The Risk Manager's veto is final: the CIO's request goes through ``RiskManager.approve_entry``
-in ``mt5bot.risk`` (the same code v2 uses), and nothing in the team can outvote, tilt or
+in ``mt5bot.risk`` (the single risk gate of the pipeline), and nothing in the team can outvote, tilt or
 bench it. Its ``analyze`` is an early, cheap pre-check so obviously blocked entries do not
 cost an advisor call; the authoritative check always runs again at the gate.
 
@@ -29,10 +29,10 @@ class RiskManagerAgent(Agent):
     def analyze(self, ctx: DecisionContext) -> Opinion:
         a, m = ctx.account, ctx.market
         reasons: list[tuple[str, str]] = []
-        max_spread = float(self.cfg.max_spread_points)
+        max_spread = m.spread_limit_points
         if a.halted:
             reasons.append(("HALTED", a.halted))
-        if m.spread_points > max_spread:
+        if max_spread is not None and m.spread_points > max_spread:
             reasons.append(("SPREAD_LIMIT", f"spread {m.spread_points:.1f} > max {max_spread:.1f} points"))
         if a.open_risk_pct + a.risk_pct > a.max_open_risk_pct + 1e-9:
             reasons.append(("OPEN_RISK_LIMIT", f"open risk {a.open_risk_pct:.2f}% + {a.risk_pct:.2f}% > "
@@ -42,7 +42,8 @@ class RiskManagerAgent(Agent):
         gauges = {"daily_loss_used_pct_of_limit": round(a.daily_loss_used_pct_of_limit, 2),
                   "open_risk_pct": round(a.open_risk_pct, 3), "max_open_risk_pct": a.max_open_risk_pct,
                   "drawdown_pct": round(a.drawdown_pct, 3), "drawdown_limit_pct": a.drawdown_limit_pct,
-                  "spread_points": round(m.spread_points, 2), "max_spread_points": max_spread,
+                  "spread_points": round(m.spread_points, 2),
+                  "max_spread_points": None if max_spread is None else round(max_spread, 2),
                   "risk_pct": a.risk_pct}
         self.stats["gauges"] = gauges
         if reasons:
@@ -102,9 +103,12 @@ class Guardian(Agent):
         team = self.cfg.team
         report = GuardianReport()
         unprotected = [p for p in snap.positions if not p.get("sl") or not p.get("tp")]
-        per_symbol: dict[str, int] = {}
+        # One entry per symbol: positions of a split order share a group and count once.
+        entries: dict[str, set] = {}
         for p in snap.positions:
-            per_symbol[p["symbol"]] = per_symbol.get(p["symbol"], 0) + 1
+            entries.setdefault(p["symbol"], set()).add(p.get("group") or f"#{p['ticket']}")
+        per_symbol = {symbol: len(groups) for symbol, groups in entries.items()}
+        n_entries = sum(per_symbol.values())
         if unprotected:
             self._unprotected_checks += 1
             report.violations.append(f"{len(unprotected)} bot position(s) without SL/TP after repair")
@@ -112,10 +116,10 @@ class Guardian(Agent):
                 report.kill_reason = "a bot position stayed without SL/TP for several checks"
         else:
             self._unprotected_checks = 0
-        if len(snap.positions) > min(snap.max_positions, limits.MAX_OPEN_POSITIONS) or \
-                any(n > limits.MAX_POSITIONS_PER_SYMBOL for n in per_symbol.values()):
-            report.violations.append(f"{len(snap.positions)} bot positions (per symbol {per_symbol}) exceed the "
-                                     "hard ceilings")
+        if n_entries > min(snap.max_positions, limits.MAX_OPEN_POSITIONS) or \
+                any(n > limits.MAX_POSITIONS_PER_SYMBOL for n in per_symbol.values()) or \
+                len(snap.positions) > limits.MAX_OPEN_POSITIONS * limits.MAX_SPLIT_ORDERS:
+            report.violations.append(f"{n_entries} bot entries (per symbol {per_symbol}) exceed the hard ceilings")
             if team.guardian_kill_enabled:
                 report.kill_reason = report.kill_reason or "position count beyond the hard ceilings"
         missing = [p["ticket"] for p in snap.positions if int(p["ticket"]) not in snap.journal_open_tickets]

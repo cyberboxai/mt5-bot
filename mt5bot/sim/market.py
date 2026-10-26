@@ -44,7 +44,13 @@ DEFAULT_SYMBOLS = (
     SymbolModel("GBPUSD", 1.2700, 0.00001, 5, 0.00065, 12),
     SymbolModel("USDJPY", 150.00, 0.001, 3, 0.00060, 10),
 )
+# The demo office trades a wider universe, including gold (2 digits, 100 oz contract).
+DEMO_SYMBOLS = DEFAULT_SYMBOLS + (
+    SymbolModel("AUDUSD", 0.6600, 0.00001, 5, 0.00060, 10),
+    SymbolModel("XAUUSD", 2350.0, 0.01, 2, 0.00090, 25, contract=100.0),
+)
 CORRELATION = np.array([[1.0, 0.70, -0.35], [0.70, 1.0, -0.30], [-0.35, -0.30, 1.0]])
+VOL_REFERENCE_SECONDS = 900  # SymbolModel.vol is per M15 bar; other bar lengths scale by sqrt(time)
 
 
 def spread_factor(server_hour: int) -> float:
@@ -58,14 +64,19 @@ def spread_factor(server_hour: int) -> float:
 
 class SyntheticMarket:
     def __init__(self, seed: int = 7, symbols: tuple[SymbolModel, ...] = DEFAULT_SYMBOLS,
-                 bar_seconds: int = 900, start_server_ts: int = 1_767_571_200, trend_strength: float = 0.18) -> None:
+                 bar_seconds: int = 900, start_server_ts: int = 1_767_571_200, trend_strength: float = 0.18,
+                 random_walk: bool = False) -> None:
         # 1_767_571_200 = Monday 2026-01-05 00:00 (server time)
         self.rng = np.random.default_rng(seed)
         self.symbols = symbols
         self.bar_seconds = bar_seconds
-        self.trend_strength = trend_strength
+        self.trend_strength = 0.0 if random_walk else trend_strength
+        self.random_walk = random_walk  # no drift and no mean reversion: no edge exists before costs
+        self.vol_scale = float(np.sqrt(bar_seconds / VOL_REFERENCE_SECONDS))
         n = len(symbols)
-        corr = CORRELATION[:n, :n] if n <= 3 else np.eye(n)
+        corr = np.eye(n)
+        k = min(n, 3)
+        corr[:k, :k] = CORRELATION[:k, :k]
         self._chol = np.linalg.cholesky(corr)
         self.regime = 2
         self.time = int(start_server_ts)
@@ -93,9 +104,11 @@ class SyntheticMarket:
         z = self._chol @ self.rng.standard_normal(len(self.symbols))
         out = []
         for i, sym in enumerate(self.symbols):
-            vol = sym.vol * (2.5 if self.regime == 3 else 1.0) * (0.6 if 1 <= hour < 7 else 1.0)
+            vol = sym.vol * self.vol_scale * (2.5 if self.regime == 3 else 1.0) * (0.6 if 1 <= hour < 7 else 1.0)
             drift = 0.0
-            if self.regime == 0:
+            if self.random_walk:
+                drift = 0.0
+            elif self.regime == 0:
                 drift = self.trend_strength * vol
             elif self.regime == 1:
                 drift = -self.trend_strength * vol

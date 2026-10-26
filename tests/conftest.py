@@ -366,7 +366,7 @@ class FixedSource:
         self.seen: list[np.ndarray] = []
 
     def on_bar(self, symbol: str, closed: np.ndarray, spec: Any, costs: Any, equity: float, risk_pct: float):
-        from mt5bot.engine import EntryIntent
+        from mt5bot.arms import EntryIntent
         from mt5bot.strategies.base import Signal
 
         self.seen.append(closed.copy())
@@ -388,6 +388,8 @@ def make_cfg(tmp_path: Path):
     """Config factory with file paths isolated in tmp_path."""
 
     def factory(**overrides: Any) -> Config:
+        # The v3.0 risk numbers as explicit user caps: tests of the risk layer keep their
+        # meaning (0.5% per trade on demo), and caps can only tighten the balanced profile.
         values: dict[str, Any] = {
             "state_root": str(tmp_path / "state"),
             "reports_dir": str(tmp_path / "reports"),
@@ -395,6 +397,12 @@ def make_cfg(tmp_path: Path):
             "kill_switch_file": str(tmp_path / "KILL"),
             "log_file": str(tmp_path / "bot.log"),
             "trading_hours_server": [0, 24],
+            "risk_per_trade_pct_demo": 0.5,
+            "risk_per_trade_pct_real": 0.25,
+            "max_daily_loss_pct_demo": 2.0,
+            "max_daily_loss_pct_real": 1.5,
+            "max_total_open_risk_pct": 2.0,
+            "max_open_positions_total": 3,
         }
         values.update(overrides)
         return Config.from_dict(values)

@@ -15,7 +15,7 @@ import pytest
 
 from conftest import FakeMT5
 from mt5bot import cli, persistence
-from mt5bot.cycle import CycleLock, OptimizerScheduler
+from mt5bot.research import ResearchLock, ResearchScheduler
 from mt5bot.config import Config, reload_decision
 from mt5bot.market import ServerClock, market_expected_open
 from mt5bot.notify import Notifier
@@ -244,9 +244,20 @@ class TestHotReload:
         assert bot.cfg.dry_run is True and bot.cfg.poll_seconds == 7
 
     def test_reload_decision_notes(self) -> None:
-        merged, notes = reload_decision(Config(), Config(max_drawdown_from_peak_pct=15.0, symbols=("GBPUSD",)))
-        assert merged.max_drawdown_from_peak_pct == 12.0 and merged.symbols == ("EURUSD",)
+        old = Config(max_drawdown_from_peak_pct=10.0)
+        merged, notes = reload_decision(old, Config(max_drawdown_from_peak_pct=15.0, symbols=("GBPUSD",)))
+        assert merged.max_drawdown_from_peak_pct == 10.0 and merged.symbols == ("EURUSD",)
         assert len(notes) == 2
+        # Removing a cap (None = no user cap) is a loosening too; adding or lowering one is applied.
+        merged, notes = reload_decision(old, Config(max_drawdown_from_peak_pct=None))
+        assert merged.max_drawdown_from_peak_pct == 10.0 and len(notes) == 1
+        merged, notes = reload_decision(Config(), Config(max_drawdown_from_peak_pct=8.0))
+        assert merged.max_drawdown_from_peak_pct == 8.0 and not notes
+        # A more aggressive profile needs a restart; a more conservative one applies at once.
+        merged, notes = reload_decision(Config(), Config(risk_profile="aggressive"))
+        assert merged.risk_profile == "balanced" and notes
+        merged, notes = reload_decision(Config(), Config(risk_profile="conservative"))
+        assert merged.risk_profile == "conservative" and not notes
 
 
 # ----------------------------------------------------------------- notifications
@@ -301,35 +312,41 @@ class TestOperations:
         bot.startup()
         bot.run_once()
         health = json.loads((tmp_path / "health.json").read_text())
-        for key in ("last_loop_utc", "last_tick_server", "equity", "open_positions", "halted", "symbols"):
+        for key in ("last_loop_utc", "last_tick_server", "equity", "open_positions", "halted", "symbols", "capital",
+                    "exploration", "limits", "tiers", "mode", "status_line"):
             assert key in health
-        assert health["symbols"]["EURUSD"]["champion"] == "NoTrade"
+        assert health["capital"]["floor"] < health["equity"] and health["limits"]["profile"] == "balanced"
         assert "87654321" not in json.dumps(health["account"])
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text(json.dumps({"health_file": str(tmp_path / "health.json"),
                                         "state_root": str(tmp_path / "state")}))
         assert cli.main(["--config", str(cfg_path), "--status"]) == 0
         out = capsys.readouterr().out
-        assert "Equity: 10000.0" in out and "EURUSD: champion NoTrade" in out
+        assert "Equity: 10000.0" in out and "Profit floor" in out and "Exploration budget" in out
 
     def test_history_rollback_resume(self, make_bot, fake_mt5: FakeMT5, tmp_path: Path,
                                      capsys: pytest.CaptureFixture) -> None:
-        from test_engine import candidate, store_run
+        from mt5bot.arms import ArmEngine
+        from mt5bot.tiers import TierDecision
 
         bot = make_bot()
         bot.startup()
         reg = bot.registry
-        [cid] = store_run(reg, candidate())
-        promo = reg.record_switch("EURUSD", "promote", reg.champion("EURUSD"), reg.candidate(cid), "unit test", {"x": 1})
-        reg.record_switch("EURUSD", "demote", reg.candidate(cid), reg.champion("NONE"), "degraded", {})
+        engine = ArmEngine(reg, bot.cfg.tiers, bot.cfg.research)
+        arm = engine.ensure_arm("EURUSD", "M15", "donchian", {"channel": 40, "sl_mult": 2.0, "tp_mult": 3.0}, "test")
+        up = engine.store.change_tier(arm, TierDecision("T1", "T0", "promote: unit test"), 1_000.0)
+        engine.store.change_tier(arm, TierDecision("T2", "T1", "promote: more evidence"), 2_000.0)
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text(json.dumps({"health_file": str(tmp_path / "health.json"),
                                         "state_root": str(tmp_path / "state")}))
         assert cli.main(["--config", str(cfg_path), "--history"]) == 0
         out = capsys.readouterr().out
-        assert "PROMOTE" in out and "DEMOTE" in out and "unit test" in out
-        assert cli.main(["--config", str(cfg_path), "--rollback", str(promo)]) == 0
-        assert reg.champion("EURUSD").candidate_id == cid
+        assert "TIER_UP" in out and "unit test" in out and "T0 #" in out
+        assert cli.main(["--config", str(cfg_path), "--rollback", str(up)]) == 0
+        restored = engine.store.get(arm.id)
+        assert restored.tier == "T0" and restored.pinned_until is not None
+        assert reg.promotions(1)[0]["action"] == "manual"
+        assert cli.main(["--config", str(cfg_path), "--rollback", "999999"]) != 0
         (bot.state_dir / "RESUME_REQUIRED.txt").write_text("halt")
         assert cli.main(["--config", str(cfg_path), "--resume"]) == 0
         assert not (bot.state_dir / "RESUME_REQUIRED.txt").exists()
@@ -355,7 +372,12 @@ class TestOperations:
         fake_mt5.account.equity = 8_000.0  # -20%: the guard is about to trip, so cash flow is checked first
         bot.run_once()
         assert bot.guard.state.peak_equity == 8_000.0
-        assert not bot.guard.state.dd_halted
+        assert not bot.guard.state.dd_halted and bot.guard.halted_reason is None
+        # Starting capital and high-water mark move with the withdrawal: no fake drawdown, no soft stop.
+        assert bot.capital.c0 == 8_000.0 and bot.capital.hwm == 8_000.0
+        assert bot._entry_block_reason() is None
+        rows = list(bot.registry.conn.execute("SELECT amount, kind FROM cash_flows"))
+        assert [(r["amount"], r["kind"]) for r in rows] == [(-2_000.0, "withdrawal")]
 
     def test_preexisting_deposits_are_not_counted(self, make_bot, fake_mt5: FakeMT5) -> None:
         fake_mt5.deals = [SimpleNamespace(type=2, ticket=1, profit=10_000.0)]
@@ -372,37 +394,52 @@ class TestScheduler:
     def test_cold_start_launches_low_priority_offline_process(self, tmp_path: Path) -> None:
         reg = Registry(tmp_path / "r.sqlite")
         launched = []
-        sched = OptimizerScheduler(Config(), reg, tmp_path, str(tmp_path / "config.json"), lambda: True,
-                                   spawn=lambda args, **kw: launched.append((args, kw)) or FakeProc(0))
-        assert sched.maybe_launch(weekend=False) == "cold start: no optimisation results yet"
+        sched = ResearchScheduler(Config(), reg, tmp_path, str(tmp_path / "config.json"), lambda mode: True,
+                                  spawn=lambda args, **kw: launched.append((args, kw)) or FakeProc(0))
+        assert sched.maybe_launch(weekend=False) == "cold start: no research results yet"
         args, kw = launched[0]
-        assert "--optimize-once" in args and "--offline" in args and "--state-dir" in args
+        assert "--research-once" in args and "--offline" in args and "--state-dir" in args
+        assert args[args.index("--research-mode") + 1] == "startup"
+        reg.close()
+
+    def test_failed_research_is_retried_within_the_hour(self, tmp_path: Path) -> None:
+        """Regression (v3.0): a failed cold-start optimisation recorded 'finished' and waited a week."""
+        reg = Registry(tmp_path / "r.sqlite")
+        now = [1_760_000_000.0]
+        reg.set_kv("last_research_attempt", str(now[0]))  # attempted, nothing finished
+        sched = ResearchScheduler(Config(), reg, tmp_path, "config.json", lambda mode: True, clock=lambda: now[0])
+        assert sched.due(weekend=False) is None
+        now[0] += Config().research.retry_minutes * 60 + 1
+        reason, mode = sched.due(weekend=False)
+        assert reason.startswith("retry") and mode == "startup"
         reg.close()
 
     def test_weekly_cycle_waits_for_the_weekend(self, tmp_path: Path) -> None:
         reg = Registry(tmp_path / "r.sqlite")
         now = [1_760_000_000.0]
-        reg.set_kv("last_cycle_finished", str(now[0]))
-        sched = OptimizerScheduler(Config(), reg, tmp_path, "config.json", lambda: True, clock=lambda: now[0])
+        reg.set_kv("last_research_finished", str(now[0]))
+        reg.set_kv("last_full_research", str(now[0]))
+        sched = ResearchScheduler(Config(), reg, tmp_path, "config.json", lambda mode: True, clock=lambda: now[0])
         assert sched.due(weekend=True) is None
         now[0] += 7.5 * 86400
         assert sched.due(weekend=False) is None
-        assert sched.due(weekend=True) == "weekly cycle (market closed)"
+        assert sched.due(weekend=True) == ("weekly research (market closed)", "full")
         now[0] += 3 * 86400
-        assert "overdue" in sched.due(weekend=False)
-        sched.request("EURUSD", "demotion")
-        assert sched.due(weekend=False) == "EURUSD: demotion"
+        assert "overdue" in sched.due(weekend=False)[0]
+        sched.request("EURUSD", "universe expanded")
+        assert sched.due(weekend=False) == ("EURUSD: universe expanded", "full")
         reg.close()
 
     def test_failed_data_refresh_postpones(self, tmp_path: Path) -> None:
         reg = Registry(tmp_path / "r.sqlite")
-        sched = OptimizerScheduler(Config(), reg, tmp_path, "config.json", lambda: False,
-                                   spawn=lambda *a, **k: pytest.fail("must not launch"))
+        sched = ResearchScheduler(Config(), reg, tmp_path, "config.json", lambda mode: False,
+                                  spawn=lambda *a, **k: pytest.fail("must not launch"))
         assert sched.maybe_launch(weekend=True) is None
+        assert reg.get_kv("last_research_attempt") is not None  # counts as an attempt: retried later
         reg.close()
 
-    def test_cycle_lock_is_exclusive(self, tmp_path: Path) -> None:
-        a, b = CycleLock(tmp_path), CycleLock(tmp_path)
+    def test_research_lock_is_exclusive(self, tmp_path: Path) -> None:
+        a, b = ResearchLock(tmp_path), ResearchLock(tmp_path)
         assert a.acquire() and not b.acquire()
         a.release()
         assert b.acquire()

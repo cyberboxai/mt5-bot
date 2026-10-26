@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from ...db import DB_NAME
 from ...advisor.types import AdvisorOpinion, AdvisorState, ManagementSuggestion, unavailable
 from ..agent import Agent, AgentState
 from ..events import AdvisorStateChanged, AdvisorVerdict, Event, SystemHealth
@@ -98,8 +99,7 @@ class OpsEngineer(Agent):
         except OSError:
             pass
         metrics["log_mb"] = round(file_size_mb(Path(self.cfg.log_file), rotated=True), 2)
-        metrics["office_db_mb"] = round(file_size_mb(state_dir / "office.sqlite"), 2)
-        metrics["registry_db_mb"] = round(file_size_mb(state_dir / "registry.sqlite"), 2)
+        metrics["db_mb"] = round(file_size_mb(state_dir / DB_NAME) + file_size_mb(state_dir / f"{DB_NAME}-wal"), 2)
         heartbeat = state_dir / PANEL_HEARTBEAT
         try:
             metrics["panel_heartbeat_age_s"] = round(time.time() - heartbeat.stat().st_mtime, 1)

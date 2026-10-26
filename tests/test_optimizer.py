@@ -84,7 +84,7 @@ def test_parallel_workers_give_identical_results() -> None:
 
 
 def test_short_history_fails_cleanly() -> None:
-    bars = synthetic_bars(500, seed=1)
+    bars = synthetic_bars(480, seed=1)  # 20 days of H1 bars: below the minimum span for walk-forward
     settings = OptimizerSettings(bar_seconds=3600, gates=Gates(bootstrap_samples=300))
     result = optimize_symbol("EURUSD", bars, EURUSD_SPEC, TEST_COSTS, settings, ["donchian"])
     assert result.best is None

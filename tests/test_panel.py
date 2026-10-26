@@ -32,7 +32,8 @@ TOKEN = "panel-test-token-0123456789"
 API_KEY = "sk-ant-api03-PANEL-LEAK-CHECK-000000"
 ENDPOINTS = ("/api/status", "/api/office/state", "/api/equity", "/api/performance", "/api/trades", "/api/agents",
              "/api/agents/risk_manager", "/api/decisions", "/api/strategies", "/api/risk", "/api/markets",
-             "/api/advisor", "/api/health", "/api/team", "/api/events", "/api/replay")
+             "/api/advisor", "/api/health", "/api/team", "/api/events", "/api/replay", "/api/arms", "/api/funnel",
+             "/api/flow")
 
 
 @pytest.fixture(scope="module")
@@ -110,11 +111,27 @@ def test_status_and_office_contract(panel) -> None:
     assert status["simulation"] is True and status["team"]["effective_mode"] == "full"
     assert {"tokyo", "london", "new_york"} <= set(status["sessions"]["detail"])
     office = json.loads(request(port, "/api/office/state")[2])
-    assert len(office["agents"]) == 21 and len(office["rooms"]) == 10
+    assert len(office["agents"]) == 22 and len(office["rooms"]) == 10
     assert {a["visual"] for a in office["agents"]} <= {"idle", "typing", "reading", "talking", "meeting", "ticket",
                                                         "veto", "celebrating", "resting", "error", "away"}
     assert office["advisor"]["state"] and office["last_event_id"] > 0
-    assert set(office["screens"]["symbols"]) == {"EURUSD", "GBPUSD", "USDJPY"}
+    assert {"EURUSD", "GBPUSD", "USDJPY"} <= set(office["screens"]["symbols"])
+    assert status["mode"] in ("exploration", "probation", "active", "paused", "breaker")
+    assert set(status["tiers"]) == {"T0", "T1", "T2", "T3"} and status["exploration"]["day_budget"] > 0
+    assert status["capital"]["floor"] is not None and status["status_line"]
+
+
+def test_funnel_endpoint_explains_trading(panel) -> None:
+    _ctx, port = panel()
+    data = json.loads(request(port, "/api/funnel?hours=48")[2])
+    rep = data["report"]
+    assert rep["available"] and rep["bars_evaluated"] > 0 and rep["signals"] > 0
+    assert [s["stage"] for s in data["stages"]] == ["bars", "signals", "blocked", "orders"]
+    for blocker in rep["top_blockers"]:
+        assert blocker["reason"] and blocker["description"] and blocker["stage"]
+    assert {k["knob"] for k in data["flow"]["knobs"]} >= {"hours_extend", "spread_mult", "t1_entry_p"}
+    arms = json.loads(request(port, "/api/arms")[2])
+    assert arms["arms"] and {a["tier"] for a in arms["arms"]} <= {"T0", "T1", "T2", "T3"}
 
 
 def test_windows_follow_the_simulation_clock_and_the_wall_clock_otherwise(sim_root: Path, tmp_path: Path) -> None:
@@ -134,7 +151,7 @@ def test_windows_follow_the_simulation_clock_and_the_wall_clock_otherwise(sim_ro
 
     state = tmp_path / "state" / "DEMO_1"
     state.mkdir(parents=True)
-    Registry(state / "registry.sqlite").close()
+    Registry(state / "mt5bot.sqlite").close()
     real = PanelData(cfg, StateLocator(cfg, tmp_path, state), clock=lambda: wall)
     assert real.now() == wall
 
@@ -156,7 +173,7 @@ def test_detail_endpoints_and_404s(panel) -> None:
 def test_no_secret_or_identifier_in_any_response(panel, sim_root: Path, monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", API_KEY)
     _ctx, port = panel(token=TOKEN, controls=True)
-    account_folder = next(sim_root.glob("*/office.sqlite")).parent.name
+    account_folder = next(sim_root.glob("*/mt5bot.sqlite")).parent.name
     health = json.loads((sim_root / "health.json").read_text())
     assert health["state_dir"] and health["account"]  # present in the file the panel reads...
     for path in ENDPOINTS + ("/api/csrf",):
@@ -199,7 +216,7 @@ def read_events(port: int, after: Optional[int], wanted: int, timeout: float = 8
 
 def test_stream_delivers_new_events_and_resumes_after_reconnect(panel, sim_root: Path) -> None:
     _ctx, port = panel()
-    store = OfficeStore(next(sim_root.glob("*/office.sqlite")))
+    store = OfficeStore(next(sim_root.glob("*/mt5bot.sqlite")))
     try:
         start = store.max_event_id()
         received: list[dict] = []
@@ -250,7 +267,7 @@ def control(port: int, action: str, token: Optional[str] = TOKEN, csrf: Optional
 
 
 def audit_rows(sim_root: Path) -> list[dict]:
-    store = OfficeStore(next(sim_root.glob("*/office.sqlite")), read_only=True)
+    store = OfficeStore(next(sim_root.glob("*/mt5bot.sqlite")), read_only=True)
     try:
         return store.control_audit(200)
     finally:
@@ -275,7 +292,7 @@ def test_control_actions_need_token_csrf_origin_and_confirmation(sim_root: Path)
 
 
 def _check_controls(ctx: Any, port: int, sim_root: Path) -> None:
-    state = next(sim_root.glob("*/office.sqlite")).parent
+    state = next(sim_root.glob("*/mt5bot.sqlite")).parent
     csrf = json.loads(request(port, "/api/csrf")[2])["csrf"]
     assert control(port, "pause", token=None, csrf=csrf)[0] == 401
     assert control(port, "pause", token="wrong", csrf=csrf)[0] == 401
@@ -395,7 +412,7 @@ def test_derive_builds_the_office_from_rows_and_events() -> None:
 
 def test_panel_never_imports_the_trading_loop() -> None:
     code = ("import sys; sys.path.insert(0, '.'); import panel.app, panel.server, panel.data; "
-            "bad = [m for m in ('mt5bot.bot', 'mt5bot.engine', 'mt5bot.cycle', 'MetaTrader5') if m in sys.modules]; "
+            "bad = [m for m in ('mt5bot.bot', 'mt5bot.arms', 'mt5bot.research', 'MetaTrader5') if m in sys.modules]; "
             "print(bad); sys.exit(1 if bad else 0)")
     result = subprocess.run([sys.executable, "-c", code], cwd=PROJECT, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -440,7 +457,7 @@ def test_killing_the_panel_does_not_affect_the_bot(tmp_path: Path) -> None:
     code = run_simulation(Config(), root, steps=30, speed=0, warmup_bars=600, on_step=on_step)
     assert state.get("status") == 200 and state["proc"].returncode == -signal.SIGKILL
     assert code == 0
-    store = OfficeStore(next(root.glob("*/office.sqlite")), read_only=True)
+    store = OfficeStore(next(root.glob("*/mt5bot.sqlite")), read_only=True)
     try:
         assert store.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         last = max(e["ts"] for e in store.latest_events(50))

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""MT5 trading bot v2 entry point. See README.md (PT-PT) for setup and operation.
+"""MT5 trading bot v3.1: the single entry point. See README.md (PT-PT) for setup and operation.
 
 Usage examples:
     python mt5_bot.py --dry-run
     python mt5_bot.py --confirm-real-money
-    python mt5_bot.py --status | --history | --rollback ID | --resume
-    python mt5_bot.py --backtest | --optimize-once
+    python mt5_bot.py --status | --diagnose --hours 24 | --arms | --risk-report
+    python mt5_bot.py --history | --rollback ID | --resume | --rebase-floor
+    python mt5_bot.py --migrate | --rollback-upgrade
+    python mt5_bot.py --backtest | --research-once | --simulate
 """
 
 import os

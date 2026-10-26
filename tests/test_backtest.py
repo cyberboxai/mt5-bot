@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from conftest import EURUSD_SPEC, RATES_DTYPE, FakeMT5, synthetic_bars
-from mt5bot import backtest, bot, engine, risk
+from mt5bot import arms, backtest, bot, risk
 from mt5bot.backtest import CostModel, compute_metrics, rollover_nights, simulate
 from mt5bot.strategies.base import SignalArrays
 
@@ -121,8 +121,8 @@ class TestSharedCode:
     def test_backtest_shadow_and_live_use_the_same_sizing_function(self) -> None:
         assert backtest.plan_trade is risk.plan_trade
         assert bot.plan_trade is risk.plan_trade
-        assert engine.open_position is backtest.open_position
-        assert engine.exit_for_bar is backtest.exit_for_bar
+        assert arms.open_position is backtest.open_position
+        assert arms.exit_for_bar is backtest.exit_for_bar
 
     def test_live_and_backtest_size_identically(self, make_bot, fake_mt5: FakeMT5) -> None:
         from conftest import FixedSource

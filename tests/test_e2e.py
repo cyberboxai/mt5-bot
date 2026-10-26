@@ -1,7 +1,8 @@
-"""Synthetic end-to-end simulation with a fake MT5 that replays data and fills SL/TP.
+"""Synthetic end-to-end lifecycle with a fake MT5 that replays H1 data and fills SL/TP.
 
-Bootstrap (observation) -> optimisation -> shadow trading -> promotion -> live orders ->
-adverse regime -> demotion -> re-optimisation. The decision log is asserted at the end.
+Cold start (arms in shadow, exploration with micro risk from the first bars) -> research
+priors -> live evidence with a genuine edge -> tier promotion and larger risk -> adverse
+regime -> demotion. The audit log and the funnel are asserted at the end.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ import pytest
 from conftest import FakeMT5, synthetic_bars
 from mt5bot.bot import Bot
 from mt5bot.config import Config
-from mt5bot.cycle import run_cycle
+from mt5bot.db import db_path
+from mt5bot.research import run_research
 
 H1 = 3600
 
@@ -70,14 +72,14 @@ class ReplayMT5(FakeMT5):
 
 
 class InlineProcess:
-    """Stands in for the low-priority optimiser subprocess: runs the cycle synchronously."""
+    """Stands in for the low-priority research subprocess: runs the cycle synchronously."""
 
-    def __init__(self, cfg: Config, state_dir: Path, trigger: str) -> None:
+    def __init__(self, cfg: Config, state_dir: Path, trigger: str, mode: str) -> None:
         from mt5bot.registry import Registry
 
-        reg = Registry(state_dir / "registry.sqlite")
+        reg = Registry(db_path(state_dir))
         try:
-            run_cycle(cfg, reg, trigger)
+            run_research(cfg, reg, trigger, mode)
         finally:
             reg.close()
 
@@ -85,16 +87,23 @@ class InlineProcess:
         return 0
 
 
+def _scaled(live: np.ndarray, anchor: float) -> tuple[np.ndarray, np.ndarray]:
+    close = live["close"] / live["close"][0] * anchor
+    return close, close / live["close"]
+
+
 @pytest.mark.slow
-def test_bootstrap_promotion_live_trading_and_demotion(tmp_path: Path) -> None:
-    history = synthetic_bars(24 * 365, seed=201, trend=0.15)
+def test_lifecycle_exploration_research_promotion_and_demotion(tmp_path: Path) -> None:
+    history = synthetic_bars(24 * 200, seed=201, trend=0.15)
     cfg = Config.from_dict({
         "symbols": ["EURUSD"], "timeframe": "H1", "bars": 600, "trading_hours_server": [0, 24],
         "state_root": str(tmp_path / "state"), "reports_dir": str(tmp_path / "reports"),
         "health_file": str(tmp_path / "health.json"), "kill_switch_file": str(tmp_path / "KILL"),
         "log_file": str(tmp_path / "bot.log"), "enabled_strategies": ["donchian", "ema_cross"],
-        "trials_per_strategy": 5, "bootstrap_samples": 500, "min_shadow_trades": 10, "min_shadow_trades_floor": 5,
-        "min_shadow_days": 3, "max_spread_points": 30, "commission_per_lot": 7.0,
+        "trials_per_strategy": 5, "commission_per_lot": 7.0, "history_months": 6,
+        "universe": {"candidates": ["EURUSD"], "timeframes": ["H1"], "max_symbols": 1},
+        "research": {"startup_trials": 5, "startup_history_months": 6},
+        "tiers": {"promote_cooldown_hours": 1.0}, "team": {"team_mode": "baseline"},
     })
     fake = ReplayMT5(history)
     clock = {"t": float(history["time"][-1]) + 60}
@@ -104,74 +113,76 @@ def test_bootstrap_promotion_live_trading_and_demotion(tmp_path: Path) -> None:
     def spawn(args: list[str], **kwargs: Any) -> InlineProcess:
         trigger = args[args.index("--trigger") + 1]
         launches.append(trigger)
-        return InlineProcess(cfg, Path(args[args.index("--state-dir") + 1]), trigger)
+        return InlineProcess(cfg, Path(args[args.index("--state-dir") + 1]), trigger,
+                             args[args.index("--research-mode") + 1])
 
     bot = Bot(cfg, api=fake, wait=lambda s: None, env={}, monotonic=utc, utc_now=utc,
-              config_path=str(tmp_path / "config.json"), spawn=spawn, globber=lambda p: [])
+              config_path=str(tmp_path / "config.json"), spawn=spawn, globber=lambda p: [], durable_files=False)
     bot.startup()
     reg = bot.registry
-    assert reg.champion("EURUSD").is_notrade
-    assert "OBSERVATION" in bot.status_line("EURUSD")
+    assert bot.arms.counts()["T0"] == 2  # one default-parameter arm per enabled strategy, in shadow
 
-    # Phase 1: cold start launches the first optimisation; candidates become challengers.
+    # Phase 1: cold start launches research at once; its priors arrive on the next pass.
     bot.run_once()
     assert launches and launches[0].startswith("cold start")
-    assert reg.latest_run("EURUSD") is not None
+    bot._next_housekeeping = 0
     bot.run_once()
-    assert reg.challengers("EURUSD"), "the injected trend edge should produce survivors"
+    assert any(a.prior_n > 0 for a in bot.arms.arms.values()), "research must give the arms a prior"
 
-    # Phase 2: the edge persists live; challengers shadow trade until one is promoted.
-    live = synthetic_bars(24 * 120, seed=202, trend=0.15)
-    live_close = live["close"] / live["close"][0] * float(history["close"][-1])
-    scale = live_close / live["close"]
-    promoted_at = None
+    # Phase 2: the edge persists live; the bot trades from the first hours (exploration or
+    # prior-qualified T1) and evidence lifts at least one arm to T2.
+    live = synthetic_bars(24 * 150, seed=202, trend=0.15)
+    close, scale = _scaled(live, float(history["close"][-1]))
+    first_trade_hour = promoted_hour = None
     for i in range(len(live)):
         clock["t"] += H1
         fake.push_bar(float(live["open"][i] * scale[i]), float(live["high"][i] * scale[i]),
-                      float(live["low"][i] * scale[i]), float(live_close[i]))
+                      float(live["low"][i] * scale[i]), float(close[i]))
         bot.run_once()
-        if not reg.champion("EURUSD").is_notrade:
-            promoted_at = i
+        if first_trade_hour is None and reg.trades(mode="live"):
+            first_trade_hour = i
+        if any(a.tier in ("T2", "T3") for a in bot.arms.arms.values()):
+            promoted_hour = i
             break
-    assert promoted_at is not None, "a validated challenger must be promoted after shadow evidence"
-    champion = reg.champion("EURUSD")
-    assert champion.strategy in ("donchian", "ema_cross")
+    assert first_trade_hour is not None and first_trade_hour < 48, "trading must start within the first two days"
+    assert promoted_hour is not None, "a genuine edge must be promoted to T2 by evidence"
+    promoted = next(a for a in bot.arms.arms.values() if a.tier in ("T2", "T3"))
+    t1_risk = [t.risk_pct for t in reg.trades(mode="live") if t.tier == "T1" and t.risk_pct]
+    assert t1_risk and max(t1_risk) <= bot.risk.limits.t1_risk_pct + 1e-6
 
-    # Phase 3: an adverse regime. Every live position is driven to its stop loss; when flat
-    # the price drifts so that breakouts keep triggering new (losing) entries.
+    # Phase 3: an adverse regime for the promoted arm. Every trade it takes, live or in its
+    # shadow book (the evidence counts both), is driven to its stop loss; when it is flat the
+    # price swings so that breakouts keep triggering new (losing) entries.
     price = float(fake.rates["EURUSD"][-1]["close"])
+    demoted = False
     for _ in range(24 * 120):
         clock["t"] += H1
         pos = next((p for p in fake.positions if p.magic == cfg.magic), None)
-        if pos is not None:
+        mine = reg.trades(status="open", arm_id=promoted.id)
+        if mine:
+            buy = mine[-1].side == "BUY"
+            o, c = price, (mine[-1].sl - 0.0002 if buy else mine[-1].sl + 0.0002)
+        elif pos is not None:
             buy = pos.type == fake.POSITION_TYPE_BUY
-            target = pos.sl - 0.0002 if buy else pos.sl + 0.0002
-            o, c = price, target
+            o, c = price, (pos.sl - 0.0002 if buy else pos.sl + 0.0002)
         else:
             o, c = price, price * (1 + 0.004 * (1 if (int(clock["t"]) // (H1 * 48)) % 2 else -1))
-        h, lo = max(o, c) + 0.0003, min(o, c) - 0.0003
-        fake.push_bar(o, h, lo, c)
+        fake.push_bar(o, max(o, c) + 0.0003, min(o, c) - 0.0003, c)
         price = c
+        bot._next_housekeeping = 0
         bot.run_once()
-        if reg.champion("EURUSD").is_notrade or reg.champion("EURUSD").param_set_id != champion.param_set_id:
+        if bot.arms.arms[promoted.id].tier not in ("T2", "T3"):
+            demoted = True
             break
-    actions = [r["action"] for r in reversed(reg.promotions(200))]
-    assert "promote" in actions and "demote" in actions
-    assert actions.index("promote") < actions.index("demote")
-    demote = next(r for r in reg.promotions(200) if r["action"] == "demote")
-    assert demote["reason"] and json.loads(demote["metrics_json"])
-    assert reg.trades(mode="live"), "the promoted champion placed real (simulated) orders"
-    closed_live = [t for t in reg.trades(mode="live") if t.status == "closed"]
-    assert closed_live and all(t.r is not None for t in closed_live)
-    assert all(t.sl and t.tp for t in reg.trades(mode="live"))
-
-    # Demotion triggers a re-optimisation on the next housekeeping pass.
-    bot._next_housekeeping = 0
-    bot.run_once()
-    assert any("demotion" in t for t in launches[1:])
-    assert len(reg.runs()) >= 2
-
-    # The decision log is what --history prints.
-    first = reg.promotions(200)[-1]
-    assert first["action"] == "optimization"
+    assert demoted, "losing evidence must demote the arm"
+    actions = [r["action"] for r in reversed(reg.promotions(500))]
+    assert "tier_up" in actions and "tier_down" in actions
+    down = next(r for r in reg.promotions(500) if r["action"] == "tier_down")
+    assert down["reason"].startswith("demote") and json.loads(down["metrics_json"])["arm_id"]
+    live_rows = reg.trades(mode="live")
+    assert live_rows and all(t.sl and t.tp for t in live_rows)
+    assert all(t.r is not None for t in live_rows if t.status == "closed")
+    bot.funnel.flush()
+    reasons = {r["reason"] for r in reg.conn.execute("SELECT DISTINCT reason FROM funnel_events")}
+    assert {"BAR_EVALUATED", "SIGNAL", "ORDER_OK"} <= reasons
     bot.close()

@@ -22,15 +22,16 @@ def plan(side: str = "BUY", price: float = 1.1, sl_points: int = 200, tp_points:
 
 
 def ctx(p: TradePlan, **kw) -> EntryContext:
+    # allowed_risk_pct is the sizer's verdict for this entry (0.5% here, like the v3.0 fixed risk).
     values = dict(symbol="EURUSD", plan=p, equity=10_000.0, spread_points=10.0, bot_positions=[],
-                  notional_money=25_000.0)
+                  notional_money=25_000.0, allowed_risk_pct=0.5)
     values.update(kw)
     return EntryContext(**values)
 
 
 @pytest.fixture
 def manager() -> RiskManager:
-    return RiskManager(Config(), is_real=False)
+    return RiskManager(Config(risk_per_trade_pct_demo=0.5, max_total_open_risk_pct=2.0), is_real=False)
 
 
 class TestCeilings:
@@ -53,13 +54,20 @@ class TestCeilings:
         cfg = dataclasses.replace(Config(), risk_per_trade_pct_demo=50.0, max_daily_loss_pct_demo=90.0,
                                   max_open_positions_total=99, max_total_open_risk_pct=80.0,
                                   max_symbol_exposure_x=500.0, max_drawdown_from_peak_pct=95.0)
-        rm = RiskManager(cfg, is_real=False)
-        assert rm.risk_pct == limits.MAX_RISK_PER_TRADE_PCT
-        assert rm.max_daily_loss_pct == limits.MAX_DAILY_LOSS_PCT
-        assert rm.max_positions == limits.MAX_OPEN_POSITIONS
-        assert rm.max_total_open_risk_pct == limits.MAX_TOTAL_OPEN_RISK_PCT
-        assert rm.max_symbol_exposure_x == limits.MAX_SYMBOL_EXPOSURE_X
-        assert rm.max_drawdown_pct == limits.MAX_DRAWDOWN_FROM_PEAK_PCT
+        # A user cap can only tighten the profile; absurd caps fall back to the profile, itself
+        # under the hard ceilings, and the risk layer clamps to the ceilings again.
+        for profile in ("conservative", "balanced", "aggressive"):
+            rm = RiskManager(dataclasses.replace(cfg, risk_profile=profile), is_real=False)
+            assert rm.risk_pct <= limits.MAX_RISK_PER_TRADE_PCT
+            assert rm.max_daily_loss_pct <= limits.MAX_DAILY_LOSS_PCT
+            assert rm.max_positions <= limits.MAX_OPEN_POSITIONS
+            assert rm.max_total_open_risk_pct <= limits.MAX_TOTAL_OPEN_RISK_PCT
+            assert rm.max_symbol_exposure_x == limits.MAX_SYMBOL_EXPOSURE_X
+            assert rm.max_drawdown_pct <= limits.MAX_DRAWDOWN_FROM_PEAK_PCT
+            # Even an allowed fraction above the ceiling cannot pass the gate.
+            big = plan(volume=1.0, loss_per_lot=300.0, risk_pct=3.0)
+            ok, _ = rm.approve_entry(ctx(big, allowed_risk_pct=50.0, notional_money=1.0))
+            assert not ok
 
     def test_plan_trade_clamps_risk_pct(self) -> None:
         result = plan_trade("BUY", 0.001, 2.0, 3.0, 1.1, 10, EURUSD_SPEC, 10_000, 50.0, 0.0, 10)
@@ -150,8 +158,16 @@ class TestForbiddenBehaviours:
                 validate_sl_change(side, current, new)
 
     def test_spread_limit(self, manager: RiskManager) -> None:
-        ok, reason = manager.approve_entry(ctx(plan(), spread_points=50.0))
-        assert not ok and "spread" in reason
+        ok, reason = manager.approve_entry(ctx(plan(), spread_points=50.0, spread_limit_points=20.0,
+                                               spread_limit_reason="cost vs stop"))
+        assert not ok and "spread" in reason and "cost vs stop" in reason
+        assert manager.approve_entry(ctx(plan(), spread_points=15.0, spread_limit_points=20.0))[0]
+
+    def test_min_lot_exception_needs_an_explicit_cap(self, manager: RiskManager) -> None:
+        exc = dataclasses.replace(plan(volume=0.01, loss_per_lot=210.0, risk_pct=0.021), exception=True)
+        assert not manager.approve_entry(ctx(exc, allowed_risk_pct=0.01))[0]          # no cap: refused
+        assert manager.approve_entry(ctx(exc, allowed_risk_pct=0.01, exception_cap_pct=0.05))[0]
+        assert not manager.approve_entry(ctx(exc, allowed_risk_pct=0.01, exception_cap_pct=0.02))[0]
 
     def test_slippage_pause(self, manager: RiskManager) -> None:
         ok, reason = manager.approve_entry(ctx(plan(), slippage_paused=True))
@@ -210,7 +226,7 @@ class TestDrawdownCircuitBreaker:
 
     def test_bot_closes_everything_and_halts(self, make_bot, fake_mt5: FakeMT5) -> None:
         mine = fake_mt5.add_position("EURUSD", "BUY", magic=510001, sl=1.09, tp=1.12)
-        bot = make_bot(max_daily_loss_pct_demo=5.0, max_drawdown_from_peak_pct=3.0)
+        bot = make_bot(risk_profile="aggressive", max_daily_loss_pct_demo=5.0, max_drawdown_from_peak_pct=3.0)
         bot.startup()
         bot.run_once()
         fake_mt5.account.equity = 9_650.0  # -3.5%: drawdown breaker trips, daily limit (5%) does not

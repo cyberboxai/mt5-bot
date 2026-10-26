@@ -183,7 +183,7 @@ def test_bot_gateway_clamps_any_multiplier(make_bot, fake_mt5) -> None:
     bot = make_bot(source=FixedSource())
     bot.startup()
     bot.run_once()
-    from mt5bot.engine import EntryIntent
+    from mt5bot.arms import EntryIntent
     from mt5bot.strategies.base import Signal
 
     intent = EntryIntent(Signal("BUY", 0.0010, 2.0, 3.0), None, "fixed", "fixed BUY")

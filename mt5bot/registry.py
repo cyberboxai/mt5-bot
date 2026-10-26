@@ -1,8 +1,9 @@
-"""SQLite registry: strategies, parameter sets, optimisation runs, candidates, promotions
-(the audit log), trades (live and shadow), equity snapshots and current champions.
+"""Registry: strategies, parameter sets, research runs, the audit log, trades (live and
+shadow), equity snapshots, the market data cache and key/value state.
 
-One database per account (``state/<server>_<login>/registry.sqlite``). WAL mode lets the
-optimiser process write while the live process reads. Every statement is parameterised.
+It lives in the account's single database (``state/<server>_<login>/mt5bot.sqlite``, see
+``db``), next to the team's office tables. WAL mode lets the research process and the
+panel read while the live process writes. Every statement is parameterised.
 """
 
 from __future__ import annotations
@@ -20,121 +21,9 @@ from typing import Any, Iterator, Optional, Sequence
 import numpy as np
 
 from . import strategies as strategy_lib
+from .db import ensure_schema
 from .strategies.base import canonical_params
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS strategies (
-    name TEXT PRIMARY KEY,
-    description TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS param_sets (
-    id INTEGER PRIMARY KEY,
-    strategy TEXT NOT NULL,
-    params_json TEXT NOT NULL,
-    UNIQUE (strategy, params_json)
-);
-CREATE TABLE IF NOT EXISTS optimization_runs (
-    id INTEGER PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    trigger TEXT NOT NULL,
-    started_at REAL NOT NULL,
-    finished_at REAL,
-    status TEXT NOT NULL,
-    trials INTEGER NOT NULL DEFAULT 0,
-    data_from INTEGER,
-    data_to INTEGER,
-    notes TEXT
-);
-CREATE TABLE IF NOT EXISTS candidate_metrics (
-    id INTEGER PRIMARY KEY,
-    run_id INTEGER NOT NULL REFERENCES optimization_runs(id),
-    symbol TEXT NOT NULL,
-    param_set_id INTEGER NOT NULL REFERENCES param_sets(id),
-    passed INTEGER NOT NULL,
-    reasons_json TEXT NOT NULL,
-    metrics_json TEXT NOT NULL,
-    score REAL NOT NULL,
-    rank INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_candidates_run ON candidate_metrics (run_id);
-CREATE TABLE IF NOT EXISTS promotions (
-    id INTEGER PRIMARY KEY,
-    ts REAL NOT NULL,
-    symbol TEXT NOT NULL,
-    action TEXT NOT NULL,
-    old_param_set_id INTEGER,
-    new_param_set_id INTEGER,
-    new_candidate_id INTEGER,
-    old_desc TEXT NOT NULL,
-    new_desc TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    metrics_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS champions (
-    symbol TEXT PRIMARY KEY,
-    param_set_id INTEGER,
-    candidate_id INTEGER,
-    since REAL NOT NULL,
-    promotion_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS challengers (
-    symbol TEXT NOT NULL,
-    param_set_id INTEGER NOT NULL,
-    candidate_id INTEGER NOT NULL,
-    added REAL NOT NULL,
-    PRIMARY KEY (symbol, param_set_id)
-);
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY,
-    mode TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    param_set_id INTEGER,
-    side TEXT NOT NULL,
-    status TEXT NOT NULL,
-    open_ts REAL NOT NULL,
-    close_ts REAL,
-    open_bar_time INTEGER,
-    close_bar_time INTEGER,
-    entry REAL NOT NULL,
-    exit REAL,
-    sl REAL NOT NULL,
-    tp REAL NOT NULL,
-    volume REAL NOT NULL,
-    risk_money REAL NOT NULL,
-    pnl REAL,
-    r REAL,
-    ticket INTEGER,
-    exit_reason TEXT,
-    extra_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS ix_trades_ps ON trades (param_set_id, mode, status);
-CREATE INDEX IF NOT EXISTS ix_trades_ticket ON trades (ticket);
-CREATE TABLE IF NOT EXISTS equity_snapshots (
-    ts REAL NOT NULL,
-    equity REAL NOT NULL,
-    balance REAL NOT NULL,
-    peak REAL,
-    open_positions INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS kv (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS bars_cache (
-    symbol TEXT NOT NULL,
-    timeframe TEXT NOT NULL,
-    time INTEGER NOT NULL,
-    open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
-    tick_volume INTEGER NOT NULL, spread INTEGER NOT NULL, real_volume INTEGER NOT NULL,
-    PRIMARY KEY (symbol, timeframe, time)
-);
-CREATE TABLE IF NOT EXISTS symbol_specs (
-    symbol TEXT PRIMARY KEY,
-    spec_json TEXT NOT NULL,
-    commission_per_lot REAL NOT NULL,
-    updated REAL NOT NULL
-);
-"""
 
 RATES_DTYPE = np.dtype([
     ("time", "<i8"), ("open", "<f8"), ("high", "<f8"), ("low", "<f8"), ("close", "<f8"),
@@ -205,6 +94,10 @@ class TradeRow:
     open_bar_time: Optional[int]
     close_bar_time: Optional[int]
     extra: dict
+    arm_id: Optional[int] = None
+    timeframe: Optional[str] = None
+    tier: Optional[str] = None
+    risk_pct: Optional[float] = None
 
 
 class _Rows:
@@ -266,6 +159,8 @@ class Registry:
         self._lock = threading.RLock()
         raw = sqlite3.connect(str(self.path), timeout=30, isolation_level=None, check_same_thread=False)
         raw.row_factory = sqlite3.Row
+        self.raw = raw  # shared with the office tables' store in the same process (see OfficeStore)
+        self.lock = self._lock
         self.conn = SerializedConnection(raw, self._lock)
         if self.durable:
             self.conn.execute("PRAGMA journal_mode=WAL")
@@ -274,10 +169,9 @@ class Registry:
         else:
             self.conn.execute("PRAGMA synchronous=OFF")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        with self._lock:
+            ensure_schema(self.conn)
         with self.tx():
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
-                    self.conn.execute(statement)
             for name, strat in strategy_lib.library().items():
                 self.conn.execute("INSERT OR REPLACE INTO strategies (name, description) VALUES (?, ?)",
                                   (name, strat.description))
@@ -296,11 +190,13 @@ class Registry:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self.conn
-            except BaseException:
-                self.conn.execute("ROLLBACK")
-                raise
-            else:
                 self.conn.execute("COMMIT")
+            except BaseException:
+                # Also when COMMIT itself fails (e.g. SQLITE_BUSY): the shared connection must
+                # never be left inside a transaction, or every later BEGIN would fail.
+                if self.raw.in_transaction:
+                    self.conn.execute("ROLLBACK")
+                raise
 
     # ---- kv
 
@@ -460,12 +356,14 @@ class Registry:
     def open_trade(self, mode: str, symbol: str, param_set_id: Optional[int], side: str, entry: float, sl: float,
                    tp: float, volume: float, risk_money: float, ticket: Optional[int] = None,
                    open_bar_time: Optional[int] = None, extra: Optional[dict] = None,
-                   open_ts: Optional[float] = None) -> int:
+                   open_ts: Optional[float] = None, arm_id: Optional[int] = None, timeframe: Optional[str] = None,
+                   tier: Optional[str] = None, risk_pct: Optional[float] = None) -> int:
         cur = self.conn.execute(
             "INSERT INTO trades (mode, symbol, param_set_id, side, status, open_ts, open_bar_time, entry, sl, tp, volume,"
-            " risk_money, ticket, extra_json) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " risk_money, ticket, extra_json, arm_id, timeframe, tier, risk_pct)"
+            " VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (mode, symbol, param_set_id, side, self.now() if open_ts is None else open_ts, open_bar_time, entry, sl,
-             tp, volume, risk_money, ticket, _json(extra or {})))
+             tp, volume, risk_money, ticket, _json(extra or {}), arm_id, timeframe, tier, risk_pct))
         return int(cur.lastrowid)
 
     def close_trade(self, trade_id: int, exit_price: float, pnl: float, r: float, reason: str,
@@ -480,19 +378,27 @@ class Registry:
 
     @staticmethod
     def _trade(row: sqlite3.Row) -> TradeRow:
+        keys = row.keys()
         return TradeRow(int(row["id"]), row["mode"], row["symbol"], row["param_set_id"], row["side"], row["status"],
                         float(row["open_ts"]), row["close_ts"], float(row["entry"]), row["exit"], float(row["sl"]),
                         float(row["tp"]), float(row["volume"]), float(row["risk_money"]), row["pnl"], row["r"],
                         row["ticket"], row["exit_reason"], row["open_bar_time"], row["close_bar_time"],
-                        json.loads(row["extra_json"] or "{}"))
+                        json.loads(row["extra_json"] or "{}"), row["arm_id"] if "arm_id" in keys else None,
+                        row["timeframe"] if "timeframe" in keys else None, row["tier"] if "tier" in keys else None,
+                        row["risk_pct"] if "risk_pct" in keys else None)
 
     def trades(self, mode: Optional[str] = None, param_set_id: Optional[int] = None, status: Optional[str] = None,
                symbol: Optional[str] = None, since: Optional[float] = None,
-               limit: Optional[int] = None) -> list[TradeRow]:
+               limit: Optional[int] = None, arm_id: Optional[int] = None, tier: Optional[str] = None,
+               closed_since: Optional[float] = None) -> list[TradeRow]:
         """Matching trades in id order; ``limit`` keeps only the most recent ones."""
         sql = "SELECT * FROM trades WHERE 1 = 1"
         args: list[Any] = []
-        for column, value in (("mode", mode), ("param_set_id", param_set_id), ("status", status), ("symbol", symbol)):
+        if closed_since is not None:
+            sql += " AND (status = 'open' OR close_ts >= ?)"
+            args.append(closed_since)
+        for column, value in (("mode", mode), ("param_set_id", param_set_id), ("status", status), ("symbol", symbol),
+                              ("arm_id", arm_id), ("tier", tier)):
             if value is not None:
                 sql += f" AND {column} = ?"  # column names come from this fixed tuple, never from input
                 args.append(value)
@@ -505,6 +411,20 @@ class Registry:
             return [self._trade(r) for r in reversed(list(self.conn.execute(sql, args)))]
         sql += " ORDER BY id"
         return [self._trade(r) for r in self.conn.execute(sql, args)]
+
+    # ---- management policies (paired replays of shadow trades, see mt5bot.management)
+
+    def record_policy_outcomes(self, arm_id: int, trade_id: int, outcomes: dict[str, float]) -> None:
+        ts = self.now()
+        for policy, r in outcomes.items():
+            self.conn.execute("INSERT OR IGNORE INTO policy_outcomes (arm_id, trade_id, policy, r, ts)"
+                              " VALUES (?, ?, ?, ?, ?)", (int(arm_id), int(trade_id), policy, float(r), ts))
+
+    def policy_outcomes(self, after_id: int = 0) -> list[tuple[int, int, int, str, float]]:
+        """(row id, arm_id, trade_id, policy, r) rows with id > ``after_id``, in id order."""
+        return [(int(r["id"]), int(r["arm_id"]), int(r["trade_id"]), r["policy"], float(r["r"]))
+                for r in self.conn.execute("SELECT id, arm_id, trade_id, policy, r FROM policy_outcomes WHERE id > ?"
+                                           " ORDER BY id", (int(after_id),))]
 
     def trade_by_ticket(self, ticket: int) -> Optional[TradeRow]:
         row = self.conn.execute("SELECT * FROM trades WHERE ticket = ? AND mode = 'live' ORDER BY id DESC LIMIT 1",

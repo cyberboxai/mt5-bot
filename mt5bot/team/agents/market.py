@@ -9,20 +9,17 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
-from ... import indicators
 from ..agent import Agent, AgentState, Opinion
 from ..context import DecisionContext
 from ..events import RegimeChanged
 
-REGIME_LABELS = ("trend", "range", "high_vol", "illiquid")
-LABEL_PT = {"trend": "tendência", "range": "lateral", "high_vol": "alta volatilidade", "illiquid": "ilíquido"}
+from ...regime import LABEL_PT, regime_features, regime_probabilities
 
 
 # ================================================================== Data Clerk
@@ -97,45 +94,6 @@ class DataClerk(Agent):
 
 
 # =============================================================== Regime Detector
-
-
-REGIME_TAIL = 700  # bars; Wilder smoothing has long forgotten its seed by then
-
-
-def regime_features(bars: np.ndarray) -> dict[str, float]:
-    bars = bars[-REGIME_TAIL:]
-    close = np.asarray(bars["close"], dtype=float)
-    high = np.asarray(bars["high"], dtype=float)
-    low = np.asarray(bars["low"], dtype=float)
-    er = indicators.efficiency_ratio(close[-60:], 20)
-    ad = indicators.adx(high[-300:], low[-300:], close[-300:], 14)
-    atr = indicators.atr(high, low, close, 14)
-    window = atr[-480:]
-    window = window[np.isfinite(window)]
-    # Only the latest percentile is needed: rank the last ATR within the last 480 values.
-    pct = np.array([float((window <= window[-1]).mean() * 100.0)]) if window.size >= 20 else np.array([50.0])
-    vol = np.asarray(bars["tick_volume"], dtype=float)
-    vol_ratio = float(np.median(vol[-4:]) / max(np.median(vol[-200:]), 1e-9)) if vol.size >= 20 else 1.0
-
-    def last(x: np.ndarray, default: float) -> float:
-        value = float(x[-1]) if x.size else default
-        return value if math.isfinite(value) else default
-
-    return {"er": last(er, 0.3), "adx": last(ad, 20.0), "atr_pct": last(pct, 50.0), "volume_ratio": vol_ratio,
-            "atr": last(atr, 0.0)}
-
-
-def regime_probabilities(f: dict[str, float], spread_ratio: float = 1.0) -> dict[str, float]:
-    scores = {
-        "trend": (f["er"] - 0.30) * 6.0 + (f["adx"] - 22.0) / 8.0,
-        "range": (0.25 - f["er"]) * 6.0 + (20.0 - f["adx"]) / 8.0,
-        "high_vol": (f["atr_pct"] - 85.0) / 6.0,
-        "illiquid": (0.45 - f["volume_ratio"]) * 6.0 + (spread_ratio - 2.5) * 1.5,
-    }
-    top = max(scores.values())
-    exp = {k: math.exp(v - top) for k, v in scores.items()}
-    total = sum(exp.values())
-    return {k: exp[k] / total for k in REGIME_LABELS}
 
 
 class RegimeDetector(Agent):

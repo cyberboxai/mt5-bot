@@ -1,4 +1,4 @@
-"""Walk-forward optimisation with anti-overfitting acceptance gates.
+"""Walk-forward research with anti-overfitting quality flags (Quant Research department).
 
 For each strategy family:
 
@@ -10,8 +10,11 @@ For each strategy family:
 4. the parameters proposed for live trading are the best on the most recent training
    window, and their grid neighbours on that window must also be acceptable.
 
-Survivors are ranked by a composite score that includes the deflated Sharpe ratio for
-the total number of trials. No survivor means ``NoTrade``.
+Candidates are ranked by a composite score that includes the deflated Sharpe ratio for
+the total number of trials. Since v3.1 the gates are QUALITY FLAGS: they are reported (panel,
+``--backtest``) but do not decide whether anything trades. The out-of-sample R series of each
+family becomes a discounted prior of its arm (see ``research`` and ``evidence``); live and
+shadow evidence then decide the arm's tier.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ log = logging.getLogger("mt5_bot")
 
 MONTH_SECONDS = int(30.4375 * 86400)
 MIN_TRAIN_TRADES = 15
+MIN_ADAPTIVE_SPAN_MONTHS = 0.75  # below about three weeks of bars there is no meaningful walk-forward
 SIM_EQUITY = 10_000.0
 
 
@@ -53,14 +57,15 @@ class Gates:
 
     @classmethod
     def from_config(cls, cfg: Any) -> "Gates":
-        return cls(**{f: getattr(cfg, f) for f in cls.__dataclass_fields__})
+        """Flags use fixed reference thresholds (the v3.0 values); they no longer gate trading."""
+        return cls()
 
 
 @dataclass(frozen=True)
 class OptimizerSettings:
-    train_months: int = 3
-    test_months: int = 1
-    step_months: int = 1
+    train_months: float = 3
+    test_months: float = 1
+    step_months: float = 1
     trials_per_strategy: int = 30
     max_trials_per_cycle: int = 300
     seed: int = 12345
@@ -108,19 +113,37 @@ class OptimizationResult:
         return survivors[0] if survivors else None
 
 
-def walk_forward_windows(times: np.ndarray, train_months: int, test_months: int,
-                         step_months: int) -> list[tuple[int, int, int, int]]:
+def adaptive_months(times: np.ndarray, train_months: float, test_months: float,
+                    step_months: float) -> tuple[float, float, float]:
+    """Walk-forward window lengths that fit the available history.
+
+    With enough history the configured lengths are used. With less (a fresh terminal, a low
+    "Max bars in chart" setting, or a short timeframe) the span is split proportionally into
+    a training window of half the span and three test windows, so research still produces a
+    prior instead of failing (the v3.0 optimiser refused to run below 4 months)."""
+    if len(times) < 2:
+        return train_months, test_months, step_months
+    span = (int(times[-1]) - int(times[0])) / MONTH_SECONDS
+    if span >= train_months + test_months or span < MIN_ADAPTIVE_SPAN_MONTHS:
+        return train_months, test_months, step_months
+    test = span / 6.0
+    return span / 2.0, test, test
+
+
+def walk_forward_windows(times: np.ndarray, train_months: float, test_months: float,
+                         step_months: float) -> list[tuple[int, int, int, int]]:
     """(train_start, train_end, test_start, test_end) index ranges, half-open, by calendar time."""
     if len(times) < 2:
         return []
     t0, t_end = int(times[0]), int(times[-1]) + 1
+    ragged = int(min(MONTH_SECONDS // 10, test_months * MONTH_SECONDS * 0.1))
     windows = []
     k = 0
     while True:
-        train_from = t0 + k * step_months * MONTH_SECONDS
-        test_from = train_from + train_months * MONTH_SECONDS
-        test_to = test_from + test_months * MONTH_SECONDS
-        if test_to > t_end + MONTH_SECONDS // 10:  # allow a 3-day ragged edge on the last window
+        train_from = int(t0 + k * step_months * MONTH_SECONDS)
+        test_from = int(train_from + train_months * MONTH_SECONDS)
+        test_to = int(test_from + test_months * MONTH_SECONDS)
+        if test_to > t_end + ragged:  # allow a ragged edge (3 days at most) on the last window
             break
         idx = np.searchsorted(times, [train_from, test_from, test_to])
         windows.append((int(idx[0]), int(idx[1]), int(idx[1]), int(min(idx[2], len(times)))))
@@ -166,7 +189,9 @@ def evaluate_strategy(strategy: Strategy, bars: np.ndarray, spec: SymbolSpec, co
     """Walk-forward evaluation of one strategy family. Pure function of its inputs (deterministic)."""
     gates = settings.gates
     times = bars["time"].astype(np.int64)
-    windows = walk_forward_windows(times, settings.train_months, settings.test_months, settings.step_months)
+    train_months, test_months, step_months = adaptive_months(times, settings.train_months, settings.test_months,
+                                                             settings.step_months)
+    windows = walk_forward_windows(times, train_months, test_months, step_months)
     rng = np.random.default_rng([settings.seed, zlib.crc32(strategy.name.encode()), zlib.crc32(symbol.encode())])
     param_sets = strategy.sample_params(rng, trials)
     # Research hypotheses (vetted grid values) join the SAME walk-forward and gates; they are
@@ -215,7 +240,7 @@ def evaluate_strategy(strategy: Strategy, bars: np.ndarray, spec: SymbolSpec, co
 
     # Parameters for live trading: best on the most recent training window.
     last_end = len(bars)
-    last_start = int(np.searchsorted(times, int(times[-1]) + 1 - settings.train_months * MONTH_SECONDS))
+    last_start = int(np.searchsorted(times, int(times[-1]) + 1 - int(train_months * MONTH_SECONDS)))
     a, b = _span(times, last_start, last_end, settings.bar_seconds)
     final_scores = [train_score(train_trades(run, last_start, last_end), a, b) for run in runs]
     final_idx = int(np.argmax(final_scores))
@@ -275,6 +300,11 @@ def evaluate_strategy(strategy: Strategy, bars: np.ndarray, spec: SymbolSpec, co
         "neighbors": float(len(neighbors)),
         "score": score,
         "windows_chosen": [c for c in chosen],
+        "oos_r_mean": float(rs.mean()) if n else None,
+        "oos_r_var": float(rs.var(ddof=1)) if n > 1 else None,
+        "oos_start_time": int(times[oos_start]) if oos_start < len(times) else None,
+        "train_months": round(train_months, 3),
+        "test_months": round(test_months, 3),
     })
     return CandidateResult(strategy.name, final_params, not reasons, reasons, metrics, score)
 

@@ -1,15 +1,18 @@
-"""``--simulate``: the REAL bot (risk layer, engine, team, advisor path) on a synthetic market.
+"""``--simulate``: the REAL bot (arms, tiers, risk layer, team, advisor path) on a synthetic market.
 
 * State lives in its own folder (default ``state_sim``), never mixed with real accounts.
-* Time is virtual: each step closes one synthetic bar, so a trading day of M15 bars runs in
-  under a minute at the default speed.
-* The champion is SEEDED (the optimiser would need months of data); the decision log says
-  so explicitly. Nothing learned in a simulation is evidence about real markets.
+* Time is virtual: each step closes one synthetic M5 bar (M15 and H1 are aggregated from it),
+  so a trading day runs in seconds at full speed.
+* Nothing is seeded: arms start in shadow (T0) and the bot explores with micro risk from the
+  first bars, exactly as on a real account. Research either runs for real in a separate
+  process (``research="subprocess"``, the panel demo) or is skipped (``"skip"``, tests).
+* Nothing learned in a simulation is evidence about real markets.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import threading
 import time
@@ -18,21 +21,15 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from ..config import Config, apply_overrides
-from ..registry import NOTRADE_CANDIDATE, Candidate
+from ..config_blocks import to_jsonable
 from .advisor import SimulatedAdvisor
-from .market import SyntheticMarket
+from .market import DEMO_SYMBOLS, SyntheticMarket
 from .terminal import SimulatedTerminal
 
 log = logging.getLogger("mt5_bot")
 
-DEMO_CHAMPIONS = (
-    ("donchian", {"channel": 40, "sl_mult": 2.0, "tp_mult": 3.0}),
-    ("ema_cross", {"fast": 15, "slow": 80, "sl_mult": 2.0, "tp_mult": 3.0}),
-    ("bollinger", {"period": 20, "width": 2.0, "mode": "reversion", "sl_mult": 1.5, "tp_mult": 2.0}),
-    ("rsi_reversion", {"rsi_period": 14, "oversold": 30, "trend_ema": 150, "sl_mult": 1.5, "tp_mult": 2.0}),
-)
-SEED_REASON = "SIMULATION: demo champion seeded on synthetic data (not validated, not a recommendation)"
-RESEED_AFTER_BARS = 48
+SIM_BAR_SECONDS = 300
+SIM_WARMUP_BARS = 9000   # about a month of M5 bars, so H1 arms have enough history
 
 
 class VirtualClock:
@@ -50,33 +47,28 @@ class _FinishedProcess:
 
 def simulation_config(cfg: Config, state_root: Path, team_mode: Optional[str]) -> Config:
     state_root = Path(state_root)
+    names = tuple(s.name for s in DEMO_SYMBOLS)
     overrides: dict[str, Any] = {
-        "symbols": ("EURUSD", "GBPUSD", "USDJPY"), "timeframe": "M15", "bars": 600, "trading_hours_server": (0, 24),
+        "symbols": ("EURUSD",), "timeframe": "M15", "bars": 600, "trading_hours_server": (0, 24),
         "state_root": str(state_root), "health_file": str(state_root / "health.json"),
         "reports_dir": str(state_root / "reports"), "kill_switch_file": str(state_root / "KILL"),
         "log_file": str(state_root / "simulation.log"), "dry_run": False, "account_mode": "demo_only",
         "real_money_confirmed": False, "news_filter_enabled": False, "commission_per_lot": 7.0,
-        "terminal_restart_enabled": False, "max_spread_points": 40, "telegram_enabled": False,
-        "team.team_mode": team_mode or "full", "max_open_positions_total": 3,
+        "terminal_restart_enabled": False, "telegram_enabled": False, "risk_profile": "balanced",
+        "team.team_mode": team_mode or "full", "universe.candidates": names, "universe.max_symbols": len(names),
+        "universe.timeframes": ("M5", "M15", "H1"), "universe.max_arms": 400, "universe.scan_every_minutes": 30.0,
+        "research.startup_history_months": 4, "research.startup_trials": 4, "history_months": 4,
+        "wf_train_months": 2, "wf_test_months": 1,
     }
     return apply_overrides(cfg, overrides)
 
 
-def seed_champion(registry: Any, symbol: str, index: int) -> None:
-    from .. import strategies as strategy_lib
-
-    name, params = DEMO_CHAMPIONS[index % len(DEMO_CHAMPIONS)]
-    params = strategy_lib.get(name).validate_params(params)
-    ps = registry.param_set_id(name, params)
-    candidate = Candidate(None, ps, name, params, {}, 0.0, True)
-    registry.record_switch(symbol, "promote", registry.champion(symbol) if not registry.champion(symbol).is_notrade
-                           else NOTRADE_CANDIDATE, candidate, SEED_REASON, {"simulation": True})
-
-
 def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, speed: float = 2.0, seed: int = 7,
-                   stop: Optional[threading.Event] = None, warmup_bars: int = 1500, advisor: str = "simulated",
-                   team_mode: Optional[str] = None, fast_forward: int = 0,
-                   on_step: Optional[Callable[[int, Any], None]] = None) -> int:
+                   stop: Optional[threading.Event] = None, warmup_bars: int = SIM_WARMUP_BARS,
+                   advisor: str = "simulated", team_mode: Optional[str] = None, fast_forward: int = 0,
+                   on_step: Optional[Callable[[int, Any], None]] = None, research: str = "skip",
+                   random_walk: bool = False, symbols: Optional[tuple] = None,
+                   config_overrides: Optional[dict[str, Any]] = None) -> int:
     """Run until ``steps`` bars (None: until stopped or the kill switch). Returns the bot's exit code."""
     from ..bot import EXIT_OK, Bot
     from ..officedb import OfficeStore
@@ -90,23 +82,36 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
     state_root.mkdir(parents=True, exist_ok=True)
     stop = stop or threading.Event()
     sim_cfg = simulation_config(cfg, state_root, team_mode)
-    market = SyntheticMarket(seed)
+    models = symbols or DEMO_SYMBOLS
+    if symbols is not None:
+        sim_cfg = apply_overrides(sim_cfg, {"universe.candidates": tuple(s.name for s in models),
+                                            "universe.max_symbols": len(models), "symbols": (models[0].name,)})
+    if config_overrides:
+        sim_cfg = apply_overrides(sim_cfg, config_overrides)
+    config_path = state_root / "simulation-config.json"
+    config_path.write_text(json.dumps(to_jsonable_config(sim_cfg), indent=1), encoding="utf-8")
+    market = SyntheticMarket(seed, symbols=models, bar_seconds=SIM_BAR_SECONDS, random_walk=random_walk)
     terminal = SimulatedTerminal(market, warmup_bars)
     clock = VirtualClock(terminal.utc_now())
     holder = SimpleNamespace(bot=None)
 
-    def spawn(args: list[str], **kwargs: Any) -> _FinishedProcess:
-        # The walk-forward optimiser needs months of history; the simulation skips it and says so.
+    def skip_research(args: list[str], **kwargs: Any) -> _FinishedProcess:
         if holder.bot is not None and holder.bot.registry is not None:
-            holder.bot.registry.set_kv("last_cycle_finished", str(clock()))
-            log.info("SIMULATION: optimisation skipped (seeded demo champions instead)")
+            reg = holder.bot.registry
+            reg.set_kv("last_research_attempt", str(clock()))
+            reg.set_kv("last_research_finished", str(clock()))
+            reg.set_kv("last_full_research", str(clock()))
+            reg.set_kv("last_research_status", json.dumps({"ok": 0, "failed": 0, "mode": "skipped",
+                                                           "trigger": "simulation without research"}))
+            log.info("SIMULATION: research skipped; arms learn from shadow and exploration evidence only")
         return _FinishedProcess()
 
+    spawn = None if research == "subprocess" else skip_research
     sim_advisor = SimulatedAdvisor(clock) if advisor == "simulated" else None
     bot = Bot(sim_cfg, api=terminal, wait=lambda seconds: None, env={}, monotonic=clock, utc_now=clock,
-              config_path=str(state_root / "simulation-config.json"), spawn=spawn, globber=lambda pattern: [],
+              config_path=str(config_path), spawn=spawn, globber=lambda pattern: [],
               terminal_killer=lambda exe: False, advisor=sim_advisor, no_claude=advisor == "none",
-              durable_files=False)
+              durable_files=False, auto_migrate=False)
     holder.bot = bot
     code = EXIT_OK
     try:
@@ -114,11 +119,6 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
         if sim_advisor is not None:
             sim_advisor.store = bot.office
         bot.registry.set_kv("simulation", "1")
-        for i, symbol in enumerate(bot.symbols.values()):
-            if bot.registry.champion(symbol).is_notrade:
-                seed_champion(bot.registry, symbol, i)
-        notrade_bars: dict[str, int] = {}
-        rotation = itertools.count(len(bot.symbols))
         log.info("SIMULATION started in %s (synthetic data, virtual time, no broker, no API key)", state_root)
         for step in itertools.count():
             if (steps is not None and step >= steps) or stop.is_set():
@@ -129,12 +129,6 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
             if result is not None:
                 code = result
                 break
-            for symbol in bot.symbols.values():
-                if bot.registry.champion(symbol).is_notrade:
-                    notrade_bars[symbol] = notrade_bars.get(symbol, 0) + 1
-                    if notrade_bars[symbol] >= RESEED_AFTER_BARS:
-                        seed_champion(bot.registry, symbol, next(rotation))
-                        notrade_bars[symbol] = 0
             if on_step is not None:
                 on_step(step, bot)
             if speed > 0 and step >= fast_forward:
@@ -143,6 +137,12 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
         bot.shutdown()
         bot.close()
     return code
+
+
+def to_jsonable_config(cfg: Config) -> dict[str, Any]:
+    import dataclasses
+
+    return {f.name: to_jsonable(getattr(cfg, f.name)) for f in dataclasses.fields(cfg)}
 
 
 def main_simulate(cfg: Config, args: Any) -> int:  # pragma: no cover - thin CLI wrapper
@@ -154,6 +154,7 @@ def main_simulate(cfg: Config, args: Any) -> int:  # pragma: no cover - thin CLI
     install_signal_handlers_for(stop.set)
     started = time.monotonic()
     code = run_simulation(cfg, state_root, steps=args.sim_bars, speed=args.sim_speed, seed=args.sim_seed, stop=stop,
-                          advisor=args.sim_advisor, team_mode=args.team_mode, fast_forward=args.sim_fast_forward)
+                          advisor=args.sim_advisor, team_mode=args.team_mode, fast_forward=args.sim_fast_forward,
+                          research="subprocess")
     log.info("SIMULATION finished after %.0f s (exit code %s)", time.monotonic() - started, code)
     return code

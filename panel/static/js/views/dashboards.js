@@ -45,9 +45,6 @@ function deltaTile(label, value, note) {
   return node;
 }
 
-// The bot's per-symbol status line, without repeating the champion shown next to it.
-function statusText(line) { return line && line.startsWith("champion ") ? "a negociar" : reasonText(line); }
-
 function statusChip(text, level) { return el("span", { class: `status-chip ${level}`, text }); }
 
 // ------------------------------------------------------------------ overview
@@ -84,8 +81,14 @@ export function mountOverview(root, app) {
         text: `${num(g.drawdown_pct, 2)}% / ${num(g.drawdown_limit_pct, 1)}%`, note: "o disjuntor fecha tudo e pára ao atingir o limite" }));
     }
     grid.append(gauges);
-    const champs = Object.entries(strategies.symbols || {}).map(([sym, v]) => ({ símbolo: sym, campeão: v.champion, estado: statusText(v.status_line) }));
-    grid.append(card(t("overview.champions"), null, champs.length ? dataTable(champs) : empty(t("common.nodata"))));
+    const tiers = strategies.tiers || {};
+    const best = (strategies.arms || []).filter((a) => a.tier !== "T0").slice(0, 8).map((a) => ({ braço: `#${a.id} ${a.strategy}`,
+      símbolo: `${a.symbol} ${a.timeframe}`, nível: `${a.tier} ${t(`tier.${a.tier}`)}`, "P(E>0)": num(a.p_positive, 2),
+      trades: `${a.live_trades} reais, ${a.shadow_trades} sombra` }));
+    grid.append(card(t("overview.champions"), reasonText(strategies.status_line),
+      el("div", { class: "tier-strip" }, ["T0", "T1", "T2", "T3"].map((k) => el("span", { class: `tier-pill tier-${k}` },
+        el("strong", { text: num(tiers[k] || 0, 0) }), ` ${t(`tier.${k}`)}`))),
+      best.length ? dataTable(best) : el("p", { class: "small muted", text: t("strat.no_tiered") })));
     const screens = (office.screens || {}).symbols || {};
     const openRows = (open.rows || []).map((r) => {
       const sc = screens[r.symbol] || {};
@@ -143,7 +146,7 @@ export function mountPerformance(root) {
       grid.append(chartCard({ title: t("perf.baseline"), sub: reasonText(bt.report && bt.report.verdict) || "a recolher evidência",
         rows: base.map((v, i) => ({ decisão: i + 1, núcleo_base: v, equipa: team[i] })), csvName: "baseline_vs_team.csv",
         n: base.length, min: 2, render: (n) => lineChart(n, { series: [
-          { name: "Núcleo base (v2)", color: S[0], points: base.map((v, i) => ({ x: i + 1, y: v })) },
+          { name: t("mode.baseline"), color: S[0], points: base.map((v, i) => ({ x: i + 1, y: v })) },
           { name: "Equipa completa", color: S[1], points: team.map((v, i) => ({ x: i + 1, y: v })) }],
         zeroLine: true, xFormat: (v) => `#${Math.round(v)}`, yFormat: (v) => `${num(v, 1)}R` }) }));
       const bh = d.buy_and_hold || {};
@@ -248,45 +251,37 @@ export function mountTeam(root) {
 // ---------------------------------------------------------------- strategies
 
 export function mountStrategies(root) {
-  return view(root, t("tab.strategies"), "Optimização walk-forward, portões anti-sobreajuste, campeão/desafiador e modo sombra.",
-    () => getJSON("/api/strategies"), (body, d) => {
-      const grid = el("div", { class: "grid cols-2" });
-      for (const [sym, s] of Object.entries(d.symbols || {})) {
-        const ch = (s.challengers || []).map((c) => meter({ label: c.candidate, value: c.shadow_trades, max: Math.max(30, c.shadow_trades),
-          text: `${c.shadow_trades} trades sombra, ${signed(c.shadow_expectancy_r, 3)} R`, note: c.enough_evidence ? "evidência suficiente" : "a recolher" }));
-        grid.append(card(`${sym}: ${s.champion}`, statusText(s.status_line), ...(ch.length ? ch : [el("p", { class: "small muted", text: "sem desafiadores" })])));
-      }
-      body.append(grid);
-      const runs = (d.runs || []).map((r) => ({ id: r.id, símbolo: r.symbol, motivo: r.trigger, início: dateTime(r.started_at), estado: r.status,
-        ensaios: r.trials, notas: r.notes || "" }));
-      body.append(card(t("strat.runs"), null, runs.length ? dataTable(runs) : empty("Ainda sem ciclos de optimização (normal nos primeiros dias).")));
-      const cands = (d.candidates || []).map((c) => ({ ciclo: c.run_id, estratégia: c.strategy, passou: c.passed ? "sim" : "não",
-        score: num(c.score, 3), trades: c.metrics.trades, "exp. R": num(c.metrics.expectancy_r, 3), PF: num(c.metrics.profit_factor, 2),
-        DSR: num(c.metrics.deflated_sharpe, 2), "janelas +": num(c.metrics.profitable_window_ratio, 2), ensaios: c.metrics.total_trials }));
-      const lower = el("div", { class: "grid cols-2" });
-      lower.append(card(t("strat.candidates"), null, cands.length ? dataTable(cands) : empty(t("common.nodata"))));
-      lower.append(card(t("strat.rejected"), null, (d.rejected || []).length ? dataTable(d.rejected.map((r) => ({ ciclo: r.run_id,
-        estratégia: r.strategy, portão: r.gate }))) : empty("Nenhuma rejeição registada.")));
-      const best = (d.candidates || []).find((c) => Object.keys(c.stability || {}).length);
-      if (best) {
-        const params = Object.keys(best.stability);
-        const values = [...new Set(params.flatMap((p) => Object.keys(best.stability[p])))];
-        lower.append(chartCard({ title: `${t("strat.stability")}: ${best.strategy}`, sub: "quantas janelas escolheram cada valor",
-          rows: params.flatMap((p) => Object.entries(best.stability[p]).map(([v, c]) => ({ parâmetro: p, valor: v, janelas: c }))),
-          csvName: "stability.csv", n: params.length, min: 1, render: (n) => heatmap(n, { rows: params, cols: values,
-            values: params.map((p) => values.map((v) => best.stability[p][v] ?? null)), format: (x) => String(x) }) }));
-      }
-      lower.append(card(t("strat.promotions"), null, (d.promotions || []).length ? dataTable(d.promotions.map((p) => ({ "#": p.id,
-        data: dateTime(p.ts), símbolo: p.symbol, acção: tv("promo", p.action), de: p.old_desc, para: p.new_desc, motivo: p.reason }))) : empty(t("common.nodata"))));
-      lower.append(card(t("strat.shadow"), null, (d.shadow_progress || []).length ? dataTable(d.shadow_progress, [
-        { key: "param_set_id", label: t("col.param_set_id") }, { key: "symbol", label: t("col.symbol") },
-        { key: "trades", label: t("col.trades"), num: true },
-        { key: "mean_r", label: t("col.mean_r"), num: true, format: (x) => signed(x, 3) }]) : empty(t("common.nodata"))));
-      lower.append(card(t("strat.hypotheses"), "vindas do conselheiro; passam pelos mesmos portões, sem atalhos",
-        (d.hypotheses || []).length ? dataTable(d.hypotheses.map((h) => ({ data: dateTime(h.ts), estratégia: h.strategy, parâmetro: h.param,
-          valor: h.value, estado: h.status, nota: h.note || "" }))) : empty("Sem hipóteses.")));
-      body.append(lower);
-    }, 30000);
+  return view(root, t("tab.strategies"), t("strat.sub"), () => getJSON("/api/strategies"), (body, d) => {
+    const tiers = d.tiers || {};
+    body.append(el("div", { class: "grid tiles" }, ["T0", "T1", "T2", "T3"].map((k) =>
+      tile(`${k} · ${t(`tier.${k}`)}`, num(tiers[k] || 0, 0), t(`strat.tier_note.${k}`)))));
+    const arms = (d.arms || []).map((a) => ({ id: a.id, braço: a.strategy, símbolo: a.symbol, tf: a.timeframe,
+      nível: a.tier, "P(E>0)": a.p_positive, "E[R] (int. 90%)": a.mean_r === null ? "n/d"
+        : `${signed(a.mean_r, 3)} [${signed(a.lo, 2)}, ${signed(a.hi, 2)}]`, sombra: a.shadow_trades, reais: a.live_trades,
+      política: a.policy, origem: a.source }));
+    body.append(card(t("strat.champions"), t("strat.arms_sub"), arms.length ? dataTable(arms, [
+      { key: "id", label: "#", num: true }, { key: "braço", label: t("strat.col.arm") }, { key: "símbolo", label: t("col.symbol") },
+      { key: "tf", label: "TF" }, { key: "nível", label: t("strat.col.tier") },
+      { key: "P(E>0)", label: "P(E>0)", num: true, format: (x) => num(x, 2) },
+      { key: "E[R] (int. 90%)", label: t("strat.col.expectancy") }, { key: "sombra", label: t("trades.shadow"), num: true },
+      { key: "reais", label: t("trades.live"), num: true }, { key: "política", label: t("strat.col.policy") },
+      { key: "origem", label: t("strat.col.source") }]) : empty(t("strat.no_arms"))));
+    const lower = el("div", { class: "grid cols-2" });
+    const changes = (d.tier_changes || []).map((p) => ({ "#": p.id, data: dateTime(p.ts), símbolo: p.symbol,
+      acção: tv("promo", p.action), de: p.old_desc, para: p.new_desc, motivo: reasonText(p.reason) }));
+    lower.append(card(t("strat.promotions"), t("strat.promotions_sub"), changes.length ? dataTable(changes) : empty(t("common.nodata"))));
+    const research = (d.research || []).slice(0, 40).map((r) => ({ data: dateTime(r.ts), símbolo: `${r.symbol} ${r.timeframe}`,
+      estratégia: r.strategy, "trades OOS": r.n_oos, "R médio": signed(r.mean_r, 3), PF: num(r.metrics.profit_factor, 2),
+      alertas: (r.flags || []).join(", ") }));
+    lower.append(card(t("strat.research"), t("strat.research_sub"), research.length ? dataTable(research) : empty(t("strat.no_research"))));
+    const runs = (d.runs || []).map((r) => ({ id: r.id, símbolo: r.symbol, motivo: r.trigger, início: dateTime(r.started_at), estado: r.status,
+      ensaios: r.trials, notas: r.notes || "" }));
+    lower.append(card(t("strat.runs"), null, runs.length ? dataTable(runs) : empty(t("strat.no_runs"))));
+    lower.append(card(t("strat.hypotheses"), t("strat.hypotheses_sub"),
+      (d.hypotheses || []).length ? dataTable(d.hypotheses.map((h) => ({ data: dateTime(h.ts), estratégia: h.strategy, parâmetro: h.param,
+        valor: h.value, estado: h.status, nota: h.note || "" }))) : empty(t("strat.no_hypotheses"))));
+    body.append(lower);
+  }, 30000);
 }
 
 // ---------------------------------------------------------------------- risk

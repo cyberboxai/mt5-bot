@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
-from mt5bot.officedb import OFFICE_DB, OfficeStore
+from mt5bot.db import db_path
+from mt5bot.officedb import OfficeStore
 
 from .data import PAUSE_MARKER, PanelData, StateLocator
 from .security import SECURE_HEADERS, SESSION_COOKIE, SESSION_SECONDS, PanelSecurity, same_origin
@@ -60,7 +61,7 @@ class PanelContext:
         if state is None:
             return
         try:
-            store = OfficeStore(state / OFFICE_DB)
+            store = OfficeStore(db_path(state))
             try:
                 store.add_control_audit(action, client, ok, detail)
                 if ok:
@@ -130,8 +131,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._static("index.html")
             elif path == "/login":
                 self._static("login.html")
-            elif path == "/favicon.svg":
-                self._static("favicon.svg")
+            elif path == "/favicon.ico":
+                self._static("img/favicon-48.png")
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
             elif path == "/api/stream":
@@ -217,6 +218,9 @@ class Handler(BaseHTTPRequestHandler):
                                                      int(_num(q.get("limit"), 50, 1, 500)),
                                                      int(_num(q.get("offset"), 0, 0, 1e9))),
             "/api/strategies": data.strategies,
+            "/api/arms": data.strategies,
+            "/api/funnel": lambda: data.funnel(_num(q.get("hours"), 24.0, 1.0, 24.0 * 30)),
+            "/api/flow": data.flow,
             "/api/risk": data.risk,
             "/api/markets": data.markets,
             "/api/advisor": data.advisor,

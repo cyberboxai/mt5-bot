@@ -7,7 +7,10 @@ Powers, in one place:
 * GATES can only block or shrink an entry (data health, news, exposure, session); they do
   not vote and are not weighted.
 * The Risk Manager and the Guardian are final: nothing outvotes, tilts or benches them.
-* Only the CIO submits a trade request, and only for a proposal from the v2 champion.
+* Only the CIO submits a trade request, and only for a proposal from an arm the allocation
+  stage selected (tier T1 to T3, or a budgeted exploration trade).
+* The Flow Doctor moves bounded knobs only; it can never touch a hard ceiling, SL/TP rules,
+  the drawdown breaker or a Risk Manager / Guardian veto.
 """
 
 from __future__ import annotations
@@ -97,6 +100,10 @@ ROSTER: tuple[AgentInfo, ...] = (
     AgentInfo("claude_strategist", "Ciro", "Estratega Claude (ligação ao conselheiro)", "Claude Strategist",
               "operations_leadership", "advisor_booth", "spark",
               "pedir ao conselheiro para reduzir ou vetar", "aumentar o tamanho, criar trades ou mexer em ordens"),
+    AgentInfo("flow_doctor", "Flávio", "Doutor de Fluxo (governador de actividade)", "Flow Doctor",
+              "operations_leadership", "analytics", "pulse",
+              "aliviar um filtro limitado quando o sistema está parado sem razão, e reverter",
+              "mexer em tectos de risco, SL/TP, disjuntores ou vetos"),
     AgentInfo("cio", "Isabel", "Directora de Investimentos (Orquestradora)", "Chief Investment Officer",
               "operations_leadership", "boardroom", "crown",
               "conduzir o protocolo e submeter o pedido de trade", "ultrapassar o Risco ou o Guardião"),
@@ -109,7 +116,7 @@ VOTERS: tuple[str, ...] = ("trend_analyst", "mean_reversion_analyst", "breakout_
                            "meta_labeler")
 GATES: tuple[str, ...] = ("data_clerk", "news_sentinel", "correlation_analyst", "session_analyst")
 DESK: tuple[str, ...] = ("trend_analyst", "mean_reversion_analyst", "breakout_analyst", "mtf_analyst")
-NEVER_BENCHED = frozenset({"risk_manager", "guardian", "data_clerk", "ops_engineer"})
+NEVER_BENCHED = frozenset({"risk_manager", "guardian", "data_clerk", "ops_engineer", "flow_doctor"})
 NEVER_DISABLED = frozenset({"risk_manager", "guardian", "data_clerk", "ops_engineer", "cio", "execution_trader"})
 # Weight tilts from the advisor may only touch voters, never the final authorities.
 TILTABLE = frozenset(VOTERS)

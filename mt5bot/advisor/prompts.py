@@ -104,10 +104,10 @@ def _word(value: Any) -> Optional[str]:
 NUMERIC_FEATURES = (
     "spread_points", "spread_vs_typical", "atr_pct_rank", "daily_loss_used_pct_of_limit", "open_risk_pct",
     "drawdown_pct", "drawdown_limit_pct", "team_multiplier", "aggregate_confidence", "disagreement",
-    "news_minutes_to_next", "recent_win_rate", "champion_oos_expectancy_r", "equity_change_today_pct",
+    "news_minutes_to_next", "recent_win_rate", "arm_expectancy_r", "p_positive", "equity_change_today_pct",
     "agreement_count", "risk_pct", "unrealized_r", "bars_open", "stop_distance_atr",
 )
-WORD_FEATURES = ("timeframe", "side", "strategy", "regime", "position_side", "purpose")
+WORD_FEATURES = ("timeframe", "side", "strategy", "regime", "position_side", "purpose", "tier")
 
 
 def sanitize_features(features: Mapping[str, Any]) -> dict[str, Any]:
