@@ -1,4 +1,4 @@
-# Bot de negociação para MetaTrader 5, versão 3.1 (Python, Windows)
+# Bot de negociação para MetaTrader 5, versão 4.0 (Python, Windows)
 
 Guia de instalação e operação do bot `mt5_bot.py`, que negoceia automaticamente através do terminal MetaTrader 5 (MT5) instalado no seu PC Windows. Foi pensado para a corretora STARTRADER, mas funciona com qualquer corretora MT5. A versão 3.1 junta tudo num único sistema: braços com níveis de risco ganhos por evidência, exploração com micro risco desde o primeiro dia, adaptação ao tamanho da conta, protecção dos lucros, uma equipa de 22 agentes, um conselheiro de IA opcional e o painel **CYBERBOX Trading Office**.
 
@@ -7,7 +7,12 @@ Guia de instalação e operação do bot `mt5_bot.py`, que negoceia automaticame
 | Documento | Para quê |
 |---|---|
 | [docs/DIAGNOSIS.md](docs/DIAGNOSIS.md) | Porque é que a 3.0 observava para sempre sem negociar, com evidência e o que foi corrigido. |
-| [docs/UPGRADE.md](docs/UPGRADE.md) | Actualizar da 3.0 (ou anterior) e voltar atrás, passo a passo. |
+| [docs/UPGRADE.md](docs/UPGRADE.md) | Actualizar para a 4.0 e voltar atrás, passo a passo. |
+| [docs/AUDIT.md](docs/AUDIT.md) | Auditoria técnica: o que foi medido, encontrado e corrigido. |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Decisões de arquitectura e orçamento de complexidade. |
+| [docs/METHODOLOGY.md](docs/METHODOLOGY.md) | CPCV, registo de ensaios, Sharpe deflacionado, PBO, distância à realidade e regra de paragem, em linguagem simples. |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Medições antes e depois, incluindo o que não melhorou. |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | O que cada alerta significa e o que fazer. |
 | [docs/EVIDENCE_AND_RISK.md](docs/EVIDENCE_AND_RISK.md) | Braços, evidência, níveis T0 a T3, exploração, perfis de risco, piso de lucros, contas pequenas e grandes, gestão de posições, Doutor de Fluxo. |
 | [docs/CONFIG.md](docs/CONFIG.md) | Referência completa do `config.json`. |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Cada código de bloqueio e o que fazer. |
@@ -15,6 +20,33 @@ Guia de instalação e operação do bot `mt5_bot.py`, que negoceia automaticame
 | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) | O que não foi verificado, pressupostos e limitações. |
 | [docs/ux/UX_NOTES.md](docs/ux/UX_NOTES.md) | O painel: disposição, escritório, acessibilidade, capturas. |
 | [panel/BRAND.md](panel/BRAND.md) | Identidade visual CYBERBOX no painel. |
+
+## O que mudou na 4.0
+
+A 4.0 não acrescenta funcionalidades de negociação. Torna o que existe mais correcto, mais honesto e mais focado. Numa frase: o sistema passa a medir o que paga, a admitir quando não tem vantagem e a parar sozinho.
+
+| Tema | O que há de novo | Onde ler |
+|---|---|---|
+| Execução | Máquina de estados gravada antes do envio, sem duplicados, sem estados desconhecidos, SL e TP confirmados logo após o preenchimento | [docs/AUDIT.md](docs/AUDIT.md) |
+| Um só kernel | Real, sombra, simulação e replay correm o mesmo código; replay determinístico | [docs/DECISIONS.md](docs/DECISIONS.md) |
+| Custos | Análise de cada ordem, modelo calibrado com os seus preenchimentos, porta de custo contra vantagem, guardas de rollover e de fim de semana | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) |
+| Rigor | CPCV, registo de ensaios, Sharpe deflacionado, PBO, distância à realidade | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) |
+| Cauda | Guarda de margem, tamanho com gaps, testes de stress nocturnos, CVaR, escada de redução de risco | secção 9 |
+| Governo | Veredicto contínuo e regra de paragem: sem vantagem depois de custos, a conta real passa a só investigação | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) |
+| Painel | Separadores Verdade e Máquina do tempo, cartão de saúde do projecto | secção 12 |
+| Operação | Registos estruturados, métricas, alertas, cópias verificadas, manual de operação | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+
+**Mudanças de comportamento que deve conhecer:**
+
+- Em conta real, um braço só negoceia se a parte provada da vantagem cobrir 2 vezes o custo total. Espere muito menos trades no início. É intencional.
+- A exploração T1 em conta real fica bloqueada pela mesma porta. Em demo continua, porque é assim que se medem os seus custos reais.
+- Sem novas entradas entre as 23:50 e as 00:20 do servidor, nem depois das 21:00 de sexta-feira. Contas abaixo de 25 000 ficam sem posições ao fim de semana, salvo braços T3.
+- Reversão à média só negoceia em regime lateral.
+- O conselheiro Claude deixou de rever trades por omissão. Serve para relatórios e explicações.
+- Só um braço com veredicto "vantagem plausível" pode chegar a T2.
+- O universo por omissão passou a M15, H1, H4 e D1. Se quiser manter M5, escreva-o em `universe.timeframes`.
+
+Para actualizar, siga [docs/UPGRADE.md](docs/UPGRADE.md): há cópia de segurança automática e caminho de volta.
 
 ## Índice
 
@@ -284,7 +316,7 @@ estão em [docs/EVIDENCE_AND_RISK.md](docs/EVIDENCE_AND_RISK.md).
    momentum_pullback, vwap_reversion, range_fade, vol_contraction, e versões filtradas
             |
             v
- Braços = estratégia x parâmetros x símbolo (universo até 6) x período (M5, M15, H1)
+ Braços = estratégia x parâmetros x símbolo (universo até 6) x período (M15, H1, H4, D1)
    cada um com livro em SOMBRA (trades em papel, nunca enviados)
             |
    Investigação walk-forward em segundo plano -> expectativa inicial DESCONTADA (peso 0,3)
@@ -459,11 +491,14 @@ Cada reunião produz um dossier em `mt5bot.sqlite`, visível no painel (separado
 
 ## 11. O conselheiro Claude (opcional)
 
-O conselheiro é um segundo par de olhos baseado no modelo Claude, da Anthropic. **Está desligado por omissão** e o bot é completo sem ele. Quando está ligado:
+O conselheiro é um segundo par de olhos baseado no modelo Claude, da Anthropic. **Está desligado por omissão** e o bot é completo sem ele.
+
+**Na 4.0 o conselheiro fica onde é forte:** relatórios diários e semanais, explicação de incidentes e de decisões. Não revê trades por omissão. Se ligar `review_trades`, as revisões ficam registadas sem alterar nada até a ablação mostrar valor depois do custo. Os relatórios usam processamento em lote, a metade do preço, com limite diário e limite mensal (`max_monthly_cost_usd`). Quando está ligado:
 
 | Tarefa | Modelo por omissão | O que pode fazer |
 |---|---|---|
-| Revisão antes de cada entrada (só quando a equipa já quer entrar) | `claude-haiku-5-5` (rápido) | Confirmar, reduzir o tamanho (x0 a x1) ou vetar. |
+| Revisão antes de cada entrada (desligado: `review_trades`; só em sombra até provar valor) | `claude-haiku-5-5` (rápido) | Confirmar, reduzir o tamanho (x0 a x1) ou vetar. |
+| Notas diárias, semanais e de incidentes (em lote) | `claude-haiku-5-5` | Texto de leitura, sem qualquer efeito na negociação. |
 | Explicação de um dossier, em português | `claude-haiku-5-5` | Texto de leitura, marcado como comentário de IA. |
 | Revisão depois de uma operação fechar | `claude-haiku-5-5` | Notas e hipóteses (ver abaixo). |
 | Briefing diário | `claude-opus-5-5` (mais forte) | Inclinar os pesos dos votantes **só para baixo**, no máximo 20% e por no máximo 24 horas. |
@@ -679,7 +714,7 @@ A referência completa de todas as chaves está em [docs/CONFIG.md](docs/CONFIG.
 | `risk_profile` | `"balanced"` | `conservative`, `balanced` ou `aggressive` (tabela em [docs/EVIDENCE_AND_RISK.md](docs/EVIDENCE_AND_RISK.md#5-perfis-de-risco)). Em conta real comece por `conservative`. |
 | `symbols` | `["EURUSD"]` | Símbolos sempre incluídos. |
 | `universe.candidates` / `universe.max_symbols` | 9 pares e ouro / 6 | De onde o bot escolhe os símbolos viáveis para o capital da conta. |
-| `universe.timeframes` | `["M5", "M15", "H1"]` | Períodos dos braços. |
+| `universe.timeframes` | `["M15", "H1", "H4", "D1"]` | Períodos dos braços. M5 continua elegível se o acrescentar. |
 | `trading_hours_server` | `[2, 22]` | Janela de entradas na hora do **servidor**. |
 | `tiers.exploration_enabled` / `tiers.exploration_slots` | `true` / 2 | Trades de exploração com micro risco. |
 | `flow_doctor.enabled` | `true` | Ajustes automáticos limitados quando o bot está parado sem razão. |
@@ -705,7 +740,7 @@ Um `config.json` de uma versão anterior é migrado com avisos: as chaves que de
    .venv\Scripts\activate
    python mt5_bot.py --dry-run
    ```
-   **Sucesso:** aparece a faixa com `DEMO`, o universo escolhido (`Universe: EURUSD, ... on M5, M15, H1`), os braços criados em sombra e, ao fim de alguns minutos, linhas de sinais e de exploração. Em seco nada é enviado (`DRY RUN: would send ...`).
+   **Sucesso:** aparece a faixa com `DEMO`, o universo escolhido (`Universe: EURUSD, ... on M15, H1, H4, D1`), os braços criados em sombra e, ao fim de alguns minutos, linhas de sinais e de exploração. Em seco nada é enviado (`DRY RUN: would send ...`).
 2. Noutra janela:
    ```
    python mt5_bot.py --status
@@ -857,6 +892,28 @@ Com várias contas com estado, os comandos que lêem o estado usam a conta regis
 **O piso de lucros:** quando o capital toca o piso, as entradas novas param nesse dia; as posições mantêm SL/TP.
 
 ---
+
+### Comandos novos da 4.0
+
+```cmd
+.venv\Scripts\python mt5_bot.py --truth
+.venv\Scripts\python mt5_bot.py --shadow
+.venv\Scripts\python mt5_bot.py --board-report
+.venv\Scripts\python mt5_bot.py --complexity-report
+.venv\Scripts\python mt5_bot.py --secret-scan
+.venv\Scripts\python mt5_bot.py --reenable-real
+```
+
+| Comando | Para quê |
+|---|---|
+| `--truth` | Custo contra vantagem, distância à realidade e veredicto de cada braço. |
+| `--shadow` | Todo o kernel com cotações reais e preenchimentos simulados. Nada chega ao corretor. |
+| `--board-report` | Relatório semanal do conselho, agora. |
+| `--complexity-report` | Valor medido de cada componente opcional. |
+| `--secret-scan` | Procura segredos em registos, relatórios e bases de dados. |
+| `--reenable-real` | Volta a negociar em real depois da regra de paragem, por decisão sua. |
+
+O que fazer perante cada alerta está em [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## 17. Estender o bot
 

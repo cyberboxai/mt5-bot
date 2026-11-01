@@ -213,12 +213,14 @@ class TestDiagnose:
 
 
 FD = FlowDoctorConfig()
+# Counterfactual replay of the blocked signals: enough of them, and they would have made money.
+SHADOWED = {"OUTSIDE_HOURS": {"n": 12, "virtual_mean_r": 0.2}, "SPREAD_LIMIT": {"n": 12, "virtual_mean_r": 0.2}}
 
 
 def inputs(**kw) -> flow.FlowInputs:
     values = dict(now=NOW, is_real=False, markets_open=True, last_order_ts=NOW - 7 * 3600, started_ts=NOW - 86400,
                   signals_in_window=12, top_blockers=[{"reason": "OUTSIDE_HOURS", "count": 9, "share": 0.75, "knob": "hours_extend"}],
-                  counterfactuals={}, trades_since={}, daily_loss_used_frac=0.0, drawdown_frac=0.0,
+                  counterfactuals=SHADOWED, trades_since={}, daily_loss_used_frac=0.0, drawdown_frac=0.0,
                   tier_counts={"T0": 10}, min_agreement_cfg=1)
     values.update(kw)
     return flow.FlowInputs(**values)
@@ -250,6 +252,20 @@ class TestFlowDoctor:
         capped = flow.FlowState()
         capped.knobs["spread_mult"] = flow.KNOBS["spread_mult"][3]
         assert flow.evaluate(inputs(top_blockers=blockers), capped, [], FD) == []
+
+    def test_a_relaxation_needs_counterfactual_proof(self) -> None:
+        for cf in ({}, {"OUTSIDE_HOURS": {"n": 3, "virtual_mean_r": 0.5}},
+                   {"OUTSIDE_HOURS": {"n": 30, "virtual_mean_r": -0.05}}):
+            assert flow.evaluate(inputs(counterfactuals=cf), flow.FlowState(), [], FD) == []
+
+    def test_relaxations_are_rate_limited_per_week(self) -> None:
+        assert flow.evaluate(inputs(relaxations_last_week=FD.max_relaxations_per_week), flow.FlowState(), [], FD) == []
+        assert flow.evaluate(inputs(relaxations_last_week=FD.max_relaxations_per_week - 1), flow.FlowState(), [], FD)
+
+    def test_reverting_is_never_rate_limited(self) -> None:
+        adj = flow.Adjustment(1, NOW - 100, "hours_extend", 0.0, 1.0, "relax", "x", NOW - 1)
+        made = flow.evaluate(inputs(relaxations_last_week=99, trades_since={1: [-1.0] * 12}), flow.FlowState(), [adj], FD)
+        assert [a.direction for a in made] == ["revert"]
 
     def test_rare_blockers_never_loosen_a_filter(self) -> None:
         """Regression (seen in the demo): one SPREAD_LIMIT block in 284 relaxed the spread filter."""

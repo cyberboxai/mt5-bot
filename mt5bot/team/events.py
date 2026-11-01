@@ -285,6 +285,7 @@ class EventBus:
         self._sub_ids = itertools.count(1)
         self._queue: "queue.Queue[Optional[Event]]" = queue.Queue(maxsize=queue_size)
         self._batch_size = batch_size
+        self._wake = threading.Event()     # flush() and close() skip the coalescing wait
         self._flush_interval = flush_interval
         self.recent: deque[Event] = deque(maxlen=recent_size)
         self.dropped = 0
@@ -384,6 +385,9 @@ class EventBus:
                 return
             batch = [first]
             stop = False
+            # Coalesce: one transaction per quarter second instead of one per burst of events.
+            self._wake.wait(self._flush_interval)
+            self._wake.clear()
             while len(batch) < self._batch_size:
                 try:
                     item = self._queue.get_nowait()
@@ -406,6 +410,7 @@ class EventBus:
         """Wait until every queued event is written (tests, shutdown)."""
         if self._writer is None:
             return True
+        self._wake.set()
         with self._done:
             return self._done.wait_for(lambda: self._pending == 0, timeout)
 

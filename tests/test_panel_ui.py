@@ -48,11 +48,11 @@ def test_app_css_uses_tokens_not_raw_brand_hex() -> None:
 def test_fonts_are_vendored_with_their_licences() -> None:
     fonts_css = (STATIC / "css" / "fonts.css").read_text(encoding="utf-8")
     files = re.findall(r'url\("\.\./fonts/([^"]+)"\)', fonts_css)
-    assert len(files) == 6
+    assert len(files) == 8
     for name in files:
         data = (STATIC / "fonts" / name).read_bytes()
         assert data[:4] == b"wOF2", name
-    for licence in ("OFL-Syne.txt", "OFL-SpaceMono.txt"):
+    for licence in ("OFL-Syne.txt", "OFL-SpaceGrotesk.txt", "OFL-SpaceMono.txt"):
         assert "SIL OPEN FONT LICENSE" in (STATIC / "fonts" / licence).read_text(encoding="utf-8").upper()
 
 

@@ -14,7 +14,6 @@ Scenarios always include ZERO edge (only costs), because nothing guarantees an e
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -165,7 +164,3 @@ def estimate_inputs(registry: Any) -> tuple[float, dict[str, float]]:
         counts[tier] = counts.get(tier, 0) + 1
     total = sum(counts.values())
     return max(0.2, len(rows) / span * 5 / 7), {k: v / total for k, v in counts.items()} or dict(DEFAULT_MIX)
-
-
-def recovery_text(days: Optional[float]) -> str:
-    return "n/d" if days is None or not math.isfinite(days) else f"{days:.0f}"

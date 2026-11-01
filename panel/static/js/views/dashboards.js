@@ -5,11 +5,21 @@ import { getJSON } from "../api.js";
 import { barChart, chartCard, dataTable, heatmap, lineChart, meter, sparkline } from "../charts.js";
 import { openControlModal, openDossier } from "../drawer.js";
 import { reasonText, t, tv } from "../i18n.js";
-import { ago, card, clear, dateTime, downloadCsv, el, empty, num, pct, signed, tile } from "../util.js";
+import { ago, axisTime, card, clear, dateTime, downloadCsv, el, empty, num, pct, signed, tile } from "../util.js";
+import { projectCard, servicesCard } from "./truth.js";
 
 const S = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)"];
 const VOTERS = ["trend_analyst", "mean_reversion_analyst", "breakout_analyst", "mtf_analyst", "meta_labeler"];
-const day = (ts) => dateTime(ts).slice(0, 10);
+// x-axis options for a time series: labels as precise as the span needs, full date and time in the tooltip.
+function timeAxis(xs) {
+  const span = xs.length ? Math.max(...xs) - Math.min(...xs) : 0;
+  return { xFormat: (v) => axisTime(v, span), xTip: (v) => dateTime(v) };
+}
+// A titled group of KPI tiles.
+function tileSection(title, ...tiles) {
+  return el("section", { class: "tile-section" }, el("h3", { class: "tile-section-title", text: title }),
+    el("div", { class: "grid tiles" }, ...tiles));
+}
 // Quotes as MT5 shows them: 3 decimals for JPY-like prices, 5 otherwise.
 const price = (x) => (x === null || x === undefined || x === "" ? "" : Number(x).toFixed(Math.abs(Number(x)) >= 20 ? 3 : 5));
 
@@ -51,24 +61,28 @@ function statusChip(text, level) { return el("span", { class: `status-chip ${lev
 
 export function mountOverview(root, app) {
   return view(root, t("tab.overview"), null, async () => {
-    const [equity, office, open, strategies] = await Promise.all([getJSON("/api/equity?days=90"), getJSON("/api/office/state"),
-      getJSON("/api/trades?mode=live&status=open&limit=50"), getJSON("/api/strategies")]);
-    return { equity, office, open, strategies };
-  }, (body, { equity, office, open, strategies }) => {
+    const [equity, office, open, strategies, project] = await Promise.all([getJSON("/api/equity?days=90"), getJSON("/api/office/state"),
+      getJSON("/api/trades?mode=live&status=open&limit=50"), getJSON("/api/strategies"), getJSON("/api/project")]);
+    return { equity, office, open, strategies, project };
+  }, (body, { equity, office, open, strategies, project }) => {
     const s = equity.summary || {};
     const status = app.status || {};
-    body.append(el("div", { class: "grid tiles" },
-      tile(t("overview.equity"), s.equity === null || s.equity === undefined ? "n/d" : num(s.equity, 2), `${t("overview.drawdown")}: ${num(s.drawdown_pct, 2)}%`, "hero"),
+    const pts = equity.points || [];
+    const hero = tile(t("overview.equity"), s.equity === null || s.equity === undefined ? "n/d" : num(s.equity, 2), `${t("overview.drawdown")}: ${num(s.drawdown_pct, 2)}%`, "hero");
+    if (pts.length >= 2) hero.append(sparkline(pts.map((p) => p.equity), S[0]));
+    body.append(tileSection(t("overview.sec_capital"), hero,
       deltaTile(t("overview.today"), s.today), deltaTile(t("overview.week"), s.week), deltaTile(t("overview.month"), s.month),
-      deltaTile(t("overview.all"), s.all_time), tile(t("overview.positions"), String(status.open_positions ?? open.rows.length)),
+      deltaTile(t("overview.all"), s.all_time)),
+    tileSection(t("overview.sec_state"), tile(t("overview.positions"), String(status.open_positions ?? open.rows.length)),
       tile(t("overview.team"), t(`mode.${(status.team || {}).effective_mode || "baseline"}`), reasonText((status.team || {}).mode_reason)),
       tile(t("tab.advisor"), t(`advisor.${(status.advisor || {}).state || "DISABLED"}`), reasonText((status.advisor || {}).reason))));
-    const pts = equity.points || [];
     const rows = pts.map((p) => ({ utc: dateTime(p.ts), equity: p.equity, balance: p.balance, peak: p.peak }));
     const grid = el("div", { class: "grid cols-2" });
+    grid.append(projectCard(project), servicesCard(project));
     grid.append(chartCard({ title: t("overview.curve"), rows, csvName: "equity.csv", n: pts.length, render: (n) =>
       lineChart(n, { series: [{ name: t("overview.equity"), color: S[0], points: pts.map((p) => ({ x: p.ts, y: p.equity })) },
-        { name: "Saldo", color: S[1], points: pts.map((p) => ({ x: p.ts, y: p.balance })) }], xFormat: day, yFormat: (v) => num(v, 0) }) }));
+        { name: "Saldo", color: S[1], secondary: true, points: pts.map((p) => ({ x: p.ts, y: p.balance })) }],
+      ...timeAxis(pts.map((p) => p.ts)), area: true, yFormat: (v) => num(v, 0) }) }));
     const g = (office.screens || {}).risk || {};
     const gauges = el("section", { class: "card" }, el("h3", { text: t("overview.gauges") }));
     if (g.daily_loss_used_pct_of_limit === undefined) gauges.append(empty(t("common.nodata")));
@@ -112,13 +126,17 @@ export function mountPerformance(root) {
       const live = d.live || {};
       const eq = d.equity || {};
       const note = live.insufficient ? t("common.insufficient", { n: live.trades || 0, min: live.min_trades || 10 }) : null;
-      body.append(el("div", { class: "grid tiles" },
+      body.append(tileSection(t("perf.sec_results"),
         tile(t("perf.net"), num(live.net_profit, 2), note), tile(t("perf.win"), live.win_rate === null ? "n/d" : pct(live.win_rate)),
         tile(t("perf.avg_r"), signed(live.avg_r, 3)), tile(t("perf.exp"), live.expectancy_r === null ? "n/d" : `${signed(live.expectancy_r, 3)} R`),
-        tile(t("perf.pf"), num(live.profit_factor, 2)), tile(t("perf.sharpe"), num(eq.sharpe, 2), eq.insufficient ? "dias insuficientes" : "diário, anualizado"),
-        tile(t("perf.sortino"), num(eq.sortino, 2)), tile(t("perf.calmar"), num(eq.calmar, 2)),
-        tile(t("perf.maxdd"), eq.max_drawdown_pct === null ? "n/d" : `${num(eq.max_drawdown_pct, 2)}%`, `${live.max_drawdown_r ?? 0} R`),
-        tile(t("perf.dddays"), eq.max_drawdown_days === null || eq.max_drawdown_days === undefined ? "n/d" : `${eq.max_drawdown_days} dias`),
+        tile(t("perf.pf"), num(live.profit_factor, 2))),
+      el("div", { class: "tile-sections" },
+        tileSection(t("perf.sec_risk_adj"), tile(t("perf.sharpe"), num(eq.sharpe, 2), eq.insufficient ? "dias insuficientes" : "diário, anualizado"),
+          tile(t("perf.sortino"), num(eq.sortino, 2)), tile(t("perf.calmar"), num(eq.calmar, 2))),
+        tileSection(t("perf.sec_drawdown"),
+          tile(t("perf.maxdd"), eq.max_drawdown_pct === null ? "n/d" : `${num(eq.max_drawdown_pct, 2)}%`, `${live.max_drawdown_r ?? 0} R`),
+          tile(t("perf.dddays"), eq.max_drawdown_days === null || eq.max_drawdown_days === undefined ? "n/d" : `${eq.max_drawdown_days} dias`))),
+      tileSection(t("perf.sec_extremes"),
         tile(t("perf.best"), signed(live.best_r, 2) + " R", num(live.best_pnl, 2)), tile(t("perf.worst"), signed(live.worst_r, 2) + " R", num(live.worst_pnl, 2)),
         tile(t("perf.wstreak"), String(live.longest_win_streak ?? 0)), tile(t("perf.lstreak"), String(live.longest_loss_streak ?? 0))));
       const grid = el("div", { class: "grid cols-2" });
@@ -135,7 +153,7 @@ export function mountPerformance(root) {
       const cum = live.cumulative_r || [];
       grid.append(chartCard({ title: t("perf.cum"), rows: cum.map((v, i) => ({ trade: i + 1, r_acumulado: v })), csvName: "cum_r.csv",
         n: cum.length, render: (n) => lineChart(n, { series: [{ name: "R", color: S[0], points: cum.map((v, i) => ({ x: i + 1, y: v })) }],
-          zeroLine: true, xFormat: (v) => `#${Math.round(v)}` }) }));
+          zeroLine: true, area: true, xFormat: (v) => `#${Math.round(v)}` }) }));
       const roll = live.rolling || [];
       grid.append(chartCard({ title: t("perf.rolling"), rows: roll, csvName: "rolling.csv", n: roll.length, render: (n) =>
         lineChart(n, { series: [{ name: "expectativa", color: S[0], points: roll.map((r) => ({ x: r.i, y: r.expectancy_r })) }],
@@ -152,7 +170,8 @@ export function mountPerformance(root) {
       const bh = d.buy_and_hold || {};
       grid.append(chartCard({ title: t("perf.bh"), sub: bh.note, rows: bh.curve || [], csvName: "buy_and_hold.csv",
         n: bh.available ? (bh.curve || []).length : 0, render: (n) => lineChart(n, { series: [{ name: bh.symbol, color: S[0],
-          points: bh.curve.map((p) => ({ x: p.time, y: p.pct })) }], zeroLine: true, xFormat: day, yFormat: (v) => `${num(v, 1)}%` }) }));
+          points: bh.curve.map((p) => ({ x: p.time, y: p.pct })) }], zeroLine: true, ...timeAxis(bh.curve.map((p) => p.time)),
+          yFormat: (v) => `${num(v, 1)}%` }) }));
       const sh = d.shadow || {};
       grid.append(card(t("perf.shadow"), "virtuais, com as regras de preenchimento do backtester",
         el("div", { class: "grid tiles" }, tile("Trades", String(sh.trades || 0)), tile(t("perf.exp"), signed(sh.expectancy_r, 3)),
@@ -226,8 +245,12 @@ export function mountTeam(root) {
         peso: a.weight === null || a.weight === undefined ? "1,00" : num(a.weight, 2),
         valor: a.value_added === null || a.value_added === undefined ? "n/d" : signed(a.value_added, 4),
         disponibilidade: a.uptime === null ? "n/d" : pct(a.uptime, 1) }));
+      // The state column reads as a chip (text plus a shaped dot); the CSV keeps plain text.
+      const stateLevel = (v) => (v === t("state.error") ? "critical" : v === t("state.idle") || v === t("state.resting") ? "" : "good");
+      const columns = Object.keys(rows[0] || {}).map((key) => ({ key, label: key,
+        ...(key === "estado" ? { num: false, format: (v) => statusChip(v, stateLevel(v)) } : {}) }));
       body.append(card(t("team.leaderboard"), "acerto: votos direccionais certos; brier: menor é melhor; valor: Sharpe com o agente menos sem ele",
-        dataTable(rows)));
+        dataTable(rows, rows.length ? columns : undefined)));
       const grid = el("div", { class: "grid cols-2" });
       const series = VOTERS.filter((id) => (d.weights_over_time || {})[id]).map((id, i) => ({
         name: (d.leaderboard.find((a) => a.id === id) || { name: id }).name, color: S[i],
@@ -235,7 +258,8 @@ export function mountTeam(root) {
       const flat = series.flatMap((s) => s.points.map((p) => ({ agente: s.name, utc: dateTime(p.x), peso: p.y })));
       grid.append(chartCard({ title: t("team.weights"), sub: "1,0 = uniforme; limitados entre w_min e w_max", rows: flat,
         csvName: "weights.csv", n: series.length ? Math.min(...series.map((s) => s.points.length)) : 0,
-        render: (n) => lineChart(n, { series, xFormat: day, yFormat: (v) => num(v, 2) }) }));
+        render: (n) => lineChart(n, { series, ...timeAxis(series.flatMap((s) => s.points.map((p) => p.x))), yFormat: (v) => num(v, 2),
+          refLine: { value: 1, label: "1,0" } }) }));
       const benched = d.benched.map((a) => ({ agente: a.name, motivo: a.bench_reason || "" }));
       grid.append(card(t("team.benched"), "observam em sombra e podem regressar com evidência",
         benched.length ? dataTable(benched) : empty("Ninguém no banco.")));
@@ -420,7 +444,7 @@ export function mountHealth(root, app) {
       const lastV = series.length ? series[series.length - 1].value : null;
       grid.append(chartCard({ title: label, sub: lastV === null ? "sem amostras" : `actual ${num(lastV, 2)}`, rows: series.map((p) => ({ utc: dateTime(p.ts), valor: p.value })),
         csvName: `${key}.csv`, n: series.length, render: (n) => lineChart(n, { series: [{ name: label, color: S[0],
-          points: series.map((p) => ({ x: p.ts, y: p.value })) }], height: 150, xFormat: (v) => dateTime(v).slice(11, 16) }) }));
+          points: series.map((p) => ({ x: p.ts, y: p.value })) }], height: 150, ...timeAxis(series.map((p) => p.ts)) }) }));
     }
     body.append(grid);
     const controls = el("section", { class: "card" }, el("h3", { text: t("health.controls") }));

@@ -50,6 +50,16 @@ class Advisor(ABC):
     def take_research(self) -> Optional[ResearchNote]:
         return None
 
+    def submit_report(self, kind: str, facts: Mapping[str, Any]) -> bool:
+        """Queue non-urgent commentary (daily, weekly, incidents). False when nothing was queued."""
+        return False
+
+    def poll_reports(self) -> None:
+        return None
+
+    def take_reports(self) -> list[tuple[str, str]]:
+        return []
+
     def take_explanations(self) -> list[tuple[str, str]]:
         return []
 

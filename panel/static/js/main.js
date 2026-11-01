@@ -14,9 +14,11 @@ import { mountAdvisor, mountDecisions, mountHealth, mountMarkets, mountOverview,
   mountStrategies, mountTeam, mountTrades } from "./views/dashboards.js";
 import { mountFunnel } from "./views/funnel.js";
 import { describe, mountOffice } from "./views/office.js";
+import { mountTimeMachine, mountTruth } from "./views/truth.js";
 
 const VIEWS = [
-  ["office", mountOffice], ["why", mountFunnel], ["overview", mountOverview], ["performance", mountPerformance],
+  ["office", mountOffice], ["why", mountFunnel], ["truth", mountTruth], ["timemachine", mountTimeMachine],
+  ["overview", mountOverview], ["performance", mountPerformance],
   ["trades", mountTrades], ["team", mountTeam], ["strategies", mountStrategies], ["risk", mountRisk],
   ["markets", mountMarkets], ["advisor", mountAdvisor], ["health", mountHealth], ["decisions", mountDecisions],
 ];

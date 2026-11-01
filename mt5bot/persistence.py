@@ -43,3 +43,9 @@ def account_state_dir(state_root: str | os.PathLike[str], server: str, login: in
     path = Path(state_root) / account_key(server, login)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def mask(login: Any) -> str:
+    """An account number safe for logs and notifications."""
+    text = str(login)
+    return "***" + text[-3:] if len(text) > 3 else "***"

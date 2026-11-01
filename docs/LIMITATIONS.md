@@ -21,6 +21,17 @@ falso e um mercado sintético. **Não foi verificado:**
 * a evidência, os níveis, o Doutor de Fluxo e a equipa com dados reais de uma corretora: só
   foram exercitados em simulação e em testes, onde nada prova valor em mercados reais.
 
+### Novo na versão 4.0: também não verificado
+
+* **Nada da execução da 4.0 correu contra um terminal real.** A máquina de estados, a reconciliação e a verificação pós-preenchimento foram provadas com simulação de falhas, não com a STARTRADER. As assinaturas de `order_send`, `history_deals_get` e `account_info` e a lista de retcodes foram confirmadas na documentação oficial do MQL5 em 2026-11-01.
+* **A documentação não diz o que `order_send` faz em todos os casos.** Não indica quando devolve `None` nem o limite do comentário. O bot trata `None` como incerto e usa 16 caracteres. Não está confirmado se a STARTRADER preserva o comentário em todas as ordens. Se não preservar, a reconciliação cai para a adopção por símbolo, lado e magic.
+* `history_deals_get` devolver `None` em vez de vazio quando não há negócios é tratado como vazio só se `last_error()` indicar sucesso. Isto vem de experiência, não da documentação.
+* **Não há relatório de realidade.** Não existem preenchimentos reais nesta máquina. O modelo de custos arranca de valores iniciais e todas as distâncias à realidade reais estão por medir.
+* **Nenhum veredicto sobre braços reais.** Só foram usados dados sintéticos. Nenhuma estratégia desta versão tem vantagem demonstrada, e isto inclui `ts_momentum` e `asian_range`.
+* Os Message Batches e a API da Anthropic não foram chamados a sério: sem chave nesta máquina. O formato segue a referência oficial do SDK e foi testado com um cliente falso.
+* O bloco `--shadow` não correu com cotações reais. Os ficheiros `requirements.lock` foram gerados em Linux para todas as plataformas, e não foram instalados em Windows.
+* A consulta NTP foi testada só no caminho de falha.
+
 ## Pressupostos
 
 * As velas do MT5 são preços BID. Em sombra e na investigação a compra paga o spread da
@@ -43,6 +54,16 @@ falso e um mercado sintético. **Não foi verificado:**
 * Contas "contest" são tratadas como demo. Python 3.10 a 3.12, 64 bits.
 
 ## Limitações
+
+* **Um kernel, mas com uma excepção.** A investigação usa `backtest.simulate`, mais rápido, e não o `Bot` inteiro (ADR-002).
+* **O simulador trabalha por barras.** Ordem dentro da barra é pessimista, e latência é parâmetro, não tempo real.
+* **O registo de eventos não reconstrói tudo.** Reconstrói ordens; trades e braços são tabelas gravadas directamente (ADR-005).
+* **O Sharpe deflacionado depende do número de ensaios** e usa uma aproximação para correlação entre eles. A distribuição de resultados de trading tem caudas pesadas, que os intervalos normais subestimam.
+* **A regra de paragem pode parar sem necessidade**, porque repete um teste a cada hora. É a direcção segura do erro.
+* **Testes de stress aplicam-se à carteira do momento** e só correm com posições abertas. Reduzem risco novo, não fecham posições.
+* **Em simulação, o desempenho só foi medido por barras.** Latências reais de IPC do terminal não foram medidas.
+* **`bot.py` continua a ser o maior módulo**, e o `Bot` continua a ser um só objecto (ADR-017).
+* **A prova de determinismo cobre o modo `baseline`.** Em modo `full`, a equipa corre em paralelo.
 
 * **Nada garante lucro.** Mais exploração significa mais trades de micro risco, e trades de
   exploração sem vantagem perdem os custos. O orçamento limita essa perda; não a elimina.

@@ -14,12 +14,13 @@ import logging
 import logging.handlers
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from mt5bot.advisor.redact import RedactingFormatter
 from mt5bot.config import Config, apply_overrides
@@ -122,6 +123,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     serve = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, name="panel-http",
                              daemon=True)
     serve.start()
+
+    def stop_on_term(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt      # so the demo's simulator is stopped too, not orphaned
+
+    try:
+        signal.signal(signal.SIGTERM, stop_on_term)
+    except ValueError:
+        pass                         # not the main thread (tests): nothing to install
     try:
         while serve.is_alive():
             serve.join(0.5)

@@ -24,7 +24,6 @@ pauses until the next window.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Sequence
@@ -197,9 +196,3 @@ def tier_counts(tiers: Sequence[str]) -> dict[str, int]:
         if t in out:
             out[t] += 1
     return out
-
-
-def p_label(p: float) -> str:
-    if not math.isfinite(p):
-        return "?"
-    return f"{p:.0%}"

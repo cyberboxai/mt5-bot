@@ -127,7 +127,7 @@ class Learner:
                 self.log_w[key] = [float(logw), int(n)]
             for agent, row in store.load_calibration().items():
                 self.calibration[agent] = (float(row["a"]), float(row["b"]), int(row["n"]))
-            for (agent, regime), (_w, n) in self.log_w.items():
+            for (_agent, regime), (_w, n) in self.log_w.items():
                 self.regime_counts[regime] = max(self.regime_counts[regime], n)
 
     def update_settings(self, team: Any) -> None:
@@ -224,7 +224,7 @@ class Learner:
     def snapshot(self) -> dict[str, Any]:
         weights: dict[str, dict[str, float]] = defaultdict(dict)
         lo, hi = self._bounds()
-        for (agent, regime), (logw, n) in self.log_w.items():
+        for (agent, regime), (logw, _n) in self.log_w.items():
             weights[agent][regime] = round(math.exp(min(max(logw, lo), hi)), 4)
         return {"weights": dict(weights), "regime_counts": dict(self.regime_counts),
                 "calibration": {a: {"a": p[0], "b": p[1], "n": p[2]} for a, p in self.calibration.items()},

@@ -1,4 +1,4 @@
-# Referência do config.json (versão 3.1)
+# Referência do config.json (versão 4.0)
 
 O `config.json` na pasta do projecto. Chaves em falta usam a omissão indicada. Chaves
 desconhecidas são recusadas com uma mensagem que diz qual é. Chaves que começam por `_`
@@ -104,6 +104,9 @@ chave e o tecto rígido do código.
 | `revert_mean_r` | `-0.25` | Média em R abaixo da qual um ajuste é revertido. |
 | `tighten_daily_loss_used` | `0.6` | Fracção da perda diária a partir da qual aperta. |
 | `min_hours_between_adjustments` | `2` | Intervalo mínimo entre ajustes. |
+| `max_relaxations_per_week` | `3` | Máximo de alívios por semana. Reverter e apertar nunca têm limite. |
+| `min_counterfactual_signals` | `10` | Sinais bloqueados com repetição contrafactual exigidos antes de aliviar. |
+| `min_counterfactual_r` | `0.0` | Média em R que esses sinais têm de atingir. |
 
 ## 8. Gestão de posições: bloco `management`
 
@@ -156,9 +159,99 @@ Iguais aos da versão 3.0, com estas notas:
   amostra), `full` ou `baseline` (a equipa só regista opiniões). A equipa tem 22 agentes,
   incluindo o Doutor de Fluxo.
 * `claude.enabled` é `false` por omissão; sem chave o bot funciona igual. Limites:
-  `max_calls_per_hour` (20), `max_daily_cost_usd` (0,50), `latency_budget_ms` (1500).
+  `max_calls_per_hour` (20), `max_daily_cost_usd` (0,50), `max_monthly_cost_usd` (5,00),
+  `latency_budget_ms` (1500).
+* `claude.review_trades` é `false` por omissão. Com `true`, as revisões ficam em sombra até a
+  ablação mostrar valor depois do custo (`review_requires_ablation`, `true`).
+  `claude.batch_reports` (`true`) usa processamento em lote nos relatórios.
 * `panel`: `host` `127.0.0.1`, `port` 8765, `control_actions_enabled` `false`,
   `token_env` `MT5BOT_PANEL_TOKEN`.
+
+## 12. Execução: bloco `execution`
+
+O que nenhuma configuração muda: uma entrada incerta nunca é reenviada.
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `max_attempts` | `3` | Tentativas em rejeições transitórias. |
+| `backoff_seconds` / `backoff_max_seconds` | `0.5` / `8` | Recuo exponencial entre tentativas. |
+| `confirm_polls` / `confirm_poll_seconds` | `6` / `0.25` | Espera limitada por uma confirmação tardia. |
+| `uncertain_grace_seconds` | `120` | Tempo sem nada no corretor para provar que não executou. |
+| `protect_attempts` / `protect_retry_seconds` | `3` / `0.5` | Tentativas de anexar SL e TP. Depois, fecha. |
+| `stop_tolerance_points` | `2` | Tolerância ao comparar stops. |
+| `retryable_retcodes` | `[10004, 10020, 10021, 10024]` | Só aceita não execuções definitivas; o resto é rejeitado ao carregar. |
+| `breaker_failures` / `breaker_open_seconds` / `breaker_half_open_probes` | `5` / `300` / `1` | Disjuntor do corretor. |
+
+## 13. Custos: bloco `costs`
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `k` | `2.0` | Vantagem exigida em múltiplos do custo total. Limites 1 a 10. |
+| `edge_z` | `1.645` | Que quantil inferior conta como vantagem provada: 1,645 é o quantil de 5%, 0,67 é o de 25%. Limites 0,67 a 2,33. Valores mais baixos negoceiam mais e provam menos. |
+| `gate_enabled` | `true` | Porta de custo e guardas de calendário. |
+| `exploration_exempt_demo` / `_real` | `true` / `false` | Exploração T1 isenta da porta. |
+| `expected_hold_bars` | `20` | Barras de permanência assumidas para swap e gaps. |
+| `calibrate_every_hours` | `24` | Reajuste do modelo de custos. |
+| `rollover_start` / `rollover_end` | `"23:50"` / `"00:20"` | Hora do servidor. O que se aprende com os dados só pode alargar a janela. |
+| `friday_cutoff_hour` | `21.0` | Sem novas entradas a partir daqui. |
+| `flat_before_weekend` | `true` | Contas pequenas fecham antes do fim de semana, salvo braços T3. |
+
+## 14. Carteira: bloco `portfolio`
+
+Tudo aqui só reduz posições.
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `max_concurrent_arms` | `4` | Braços abertos ao mesmo tempo. Máximo 5. |
+| `correlation_cap` | `0.7` | Correlação a partir da qual dois símbolos são um grupo. |
+| `max_cluster_weight` | `0.5` | Peso máximo de um grupo. |
+| `max_currency_risk_pct` | `2.0` | Risco máximo por moeda. |
+| `target_correlated_risk_pct` | `2.5` | Alvo de risco da carteira, com correlação. |
+
+## 15. Cauda: bloco `tail`
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `margin_stop_out_multiple` | `3.0` | Nível de margem projectado mínimo, em múltiplos do stop-out. Mínimo 2. |
+| `margin_call_multiple` | `1.5` | Abaixo disto em relação à chamada, novas entradas param. |
+| `gap_quantile` | `0.99` | Quantil dos gaps históricos usado no tamanho. |
+| `overnight_hours` | `6` | Permanência a partir da qual se conta com gaps. |
+| `small_account_equity` | `25000` | Abaixo disto, sem posições ao fim de semana. |
+| `ladder_recovery_days` | `3` | Dias entre subidas na escada de risco. |
+| `stress_reduction` | `0.5` | Multiplicador de risco novo depois de um cenário violar limites. |
+
+## 16. Governo: bloco `governance`
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `enabled` | `true` | Regra de paragem da conta real. |
+| `horizon_trades` / `horizon_days` | `200` / `91` | Horizonte de avaliação: o que vier primeiro. |
+| `rolling_min_trades` | `30` | Trades em T2 ou acima para haver veredicto. |
+| `confidence` | `0.95` | Confiança do intervalo. |
+
+## 17. Investigação com rigor: chaves novas em `research`
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `cpcv_groups` / `cpcv_test_groups` | `6` / `2` | Divisão da CPCV. |
+| `embargo_bars` | `20` | Barras de embargo depois de cada bloco de teste. |
+| `min_dsr` / `max_pbo` | `0.95` / `0.5` | Limites do veredicto. |
+| `min_trades` | `30` | Trades para haver veredicto. |
+| `require_verdict` | `true` | T2 exige "vantagem plausível". |
+| `retire_failed` | `true` | Braços sem vantagem voltam à investigação. |
+| `capture_ticks` / `tick_retention_days` | `true` / `30` | Captura contínua de ticks e barras. |
+
+## 18. Operações: bloco `ops`
+
+| Chave | Omissão | Descrição |
+|---|---|---|
+| `cycle_budget_ms` | `2000` | Orçamento por ciclo; acima dele saltam etapas opcionais. |
+| `json_logs` | `false` | Registos estruturados com id de correlação. |
+| `metrics_enabled` | `false` | `/metrics` no formato Prometheus, no painel. |
+| `clock_drift_warn_seconds` | `5` | Alerta de relógio. |
+| `ntp_server` | `null` | Referência NTP opcional. |
+| `backup_enabled` / `backup_hour_server` / `backup_keep_days` | `true` / `3` / `14` | Cópia diária verificada por restauração. |
+| `symbol_info_ttl_seconds` | `30` | Cache de especificações do símbolo no terminal real. |
 
 ## Exemplo mínimo
 

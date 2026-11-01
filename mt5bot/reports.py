@@ -14,7 +14,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from .backtest import longest_losing_streak, max_drawdown, profit_factor
-from .persistence import atomic_write_json, atomic_write_text
+from .persistence import atomic_write_text
 from .registry import Registry, TradeRow
 
 
@@ -162,7 +162,8 @@ def self_review(registry: Registry, live: Sequence[TradeRow], since: float, unti
 def write_health(path: Path, payload: dict[str, Any], durable: bool = True) -> None:
     payload = dict(payload)
     payload["written_utc"] = _fmt_ts(time.time())
-    atomic_write_json(path, payload, durable)
+    # Compact on purpose: this runs every minute, and the C encoder has no indentation path.
+    atomic_write_text(path, json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")), durable)
 
 
 def format_health(payload: dict[str, Any]) -> str:

@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from . import limits
-from .config_blocks import (BLOCKS, CapitalConfig, ClaudeConfig, FlowDoctorConfig, ManagementConfig, NewsConfig,
+from .config_blocks import (BLOCKS, CapitalConfig, ClaudeConfig, CostsConfig, ExecutionConfig, GovernanceConfig,
+                            OpsConfig, PortfolioConfig, TailConfig, FlowDoctorConfig, ManagementConfig, NewsConfig,
                             NotificationsConfig, PanelConfig, ResearchConfig, TeamConfig, TiersConfig, UniverseConfig,
                             parse_block)
 from .profiles import PROFILE_NAMES
@@ -28,8 +29,8 @@ from .profiles import PROFILE_NAMES
 log = logging.getLogger("mt5_bot")
 
 CONFIG_VERSION = "3.1"
-TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4")
-TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
+TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
+TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
 ACCOUNT_MODES = ("any", "demo_only", "real_only")
 
 # v1 keys that no longer exist, with what replaces them. A clear message beats "unknown key".
@@ -184,6 +185,12 @@ class Config:
     flow_doctor: FlowDoctorConfig = dc_field(default_factory=FlowDoctorConfig)
     management: ManagementConfig = dc_field(default_factory=ManagementConfig)
     research: ResearchConfig = dc_field(default_factory=ResearchConfig)
+    execution: ExecutionConfig = dc_field(default_factory=ExecutionConfig)
+    costs: CostsConfig = dc_field(default_factory=CostsConfig)
+    portfolio: PortfolioConfig = dc_field(default_factory=PortfolioConfig)
+    tail: TailConfig = dc_field(default_factory=TailConfig)
+    governance: GovernanceConfig = dc_field(default_factory=GovernanceConfig)
+    ops: OpsConfig = dc_field(default_factory=OpsConfig)
     claude: ClaudeConfig = dc_field(default_factory=ClaudeConfig)
     team: TeamConfig = dc_field(default_factory=TeamConfig)
     news: NewsConfig = dc_field(default_factory=NewsConfig)
@@ -376,6 +383,26 @@ class Config:
                 "trading_hours_server must be [start, end) with 0 <= start <= 23, "
                 f"0 <= end <= 24 and start != end; got {list(window)}"
             )
+
+
+# Where files live says nothing about how decisions are made: a replay in another folder must match.
+_LOCATION_KEYS = frozenset({"state_root", "reports_dir", "health_file", "log_file", "kill_switch_file", "mt5_path"})
+
+
+def config_hash(cfg: Any) -> str:
+    """Hash of the effective settings, stamped on every decision. No secrets live in the config."""
+    from .config_blocks import to_jsonable
+    from .core.stamp import json_hash
+
+    return json_hash({f.name: to_jsonable(getattr(cfg, f.name)) for f in dataclasses.fields(cfg)
+                      if f.name not in _LOCATION_KEYS})
+
+
+def config_snapshot(cfg: Any, locations: bool = False) -> dict[str, Any]:
+    from .config_blocks import to_jsonable
+
+    return {f.name: to_jsonable(getattr(cfg, f.name)) for f in dataclasses.fields(cfg)
+            if locations or f.name not in _LOCATION_KEYS}
 
 
 def in_trading_hours(hour: int, window: tuple[int, int]) -> bool:

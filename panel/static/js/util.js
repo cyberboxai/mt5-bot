@@ -67,6 +67,15 @@ export function dateTime(ts, withSeconds = false) {
   }) + " UTC";
 }
 
+// Short axis label for a timestamp, precise enough for the span the axis covers (UTC):
+// hours and minutes within a day and a half, day and month within four months, else month and year.
+export function axisTime(ts, spanSeconds) {
+  if (!ts) return "";
+  const opts = spanSeconds < 36 * 3600 ? { hour: "2-digit", minute: "2-digit" }
+    : spanSeconds < 120 * 86400 ? { day: "2-digit", month: "2-digit" } : { month: "2-digit", year: "numeric" };
+  return new Date(ts * 1000).toLocaleString(locale, { ...opts, timeZone: "UTC" });
+}
+
 export function timeOnly(ts) {
   if (!ts) return "";
   return new Date(ts * 1000).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
@@ -127,7 +136,8 @@ export function cssVar(name) {
 
 export function tile(label, value, note, cls = "") {
   const long = String(value ?? "").length > 10;
-  return el("div", { class: `tile ${cls}` }, el("div", { class: "label", text: label }),
+  const missing = /^n\/d\b/.test(String(value ?? "")); // "n/d", "n/d R": shown quieter than real values
+  return el("div", { class: `tile ${cls}${missing ? " na" : ""}` }, el("div", { class: "label", text: label }),
     el("div", { class: long ? "value long" : "value", text: value }), note ? el("div", { class: "note", text: note }) : null);
 }
 

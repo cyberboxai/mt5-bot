@@ -16,7 +16,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import numpy as np
 
 from ..officedb import OfficeStore, office_path
-from .ablation import ablation_report, select_mode
+from .ablation import ablation_report, advisor_gating_earned, select_mode
 from .agent import Agent, AgentState, TeamServices
 from .agents import AGENT_CLASSES
 from .agents.cio import TeamDecision, TradeGateway
@@ -85,6 +85,21 @@ class TeamRuntime:
         log.info("Team ready: %d agents, mode %s (%s)", len(self.agents), self.effective_mode, self.mode_reason)
 
     # ----------------------------------------------------------------- queries
+
+    def advisor_gate_active(self) -> bool:
+        """May an advisor review change the trade, or is it only recorded (shadow)?"""
+        claude = self.cfg.claude
+        if not claude.review_requires_ablation:
+            return True
+        try:
+            spend, risk = self.store.advisor_review_spend(), 0.0
+            if self.registry is not None:
+                row = self.registry.conn.execute("SELECT AVG(risk_money) AS r FROM trades WHERE mode = 'live' AND"
+                                                 " status = 'closed'").fetchone()
+                risk = float(row["r"] or 0.0)
+            return advisor_gating_earned(self.last_report, spend, risk, self.cfg.team.ablation_min_samples)
+        except Exception:  # noqa: BLE001 - unknown means not earned
+            return False
 
     def active_tilts(self) -> dict[str, float]:
         try:
@@ -309,13 +324,6 @@ class TeamRuntime:
                 changed = True
         if changed:
             self.store.set_kv("perf_benched", json.dumps(sorted(self.perf_benched)))
-
-    def reset_learning(self) -> None:
-        self.learner.reset()
-        self.perf_benched.clear()
-        self.store.set_kv("perf_benched", "[]")
-        for agent in self.agents.values():
-            agent.benched = None
 
     # ----------------------------------------------------------------- config
 

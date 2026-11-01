@@ -101,6 +101,7 @@ class ClaudeConfig:
     latency_budget_ms: int = 1500
     max_calls_per_hour: int = 20
     max_daily_cost_usd: float = 0.50
+    max_monthly_cost_usd: float = 5.0
     cache_ttl_seconds: float = 300.0
     # Stored as sorted (model, price) pairs so the frozen config stays hashable.
     prices: tuple[tuple[str, ModelPrice], ...] = tuple(
@@ -110,7 +111,11 @@ class ClaudeConfig:
     probe_offline_seconds: float = 1800.0
     probe_offline_max_seconds: float = 21600.0
     key_recheck_seconds: float = 300.0
-    review_trades: bool = True
+    # Per-trade gating is off: language models earn their keep on reports and explanations. When it
+    # is switched on, reviews stay shadow-only until ablation shows value after the advisor's cost.
+    review_trades: bool = False
+    review_requires_ablation: bool = True
+    batch_reports: bool = True
     manage_positions: bool = False
     daily_briefing: bool = True
     post_trade_reviews: bool = True
@@ -150,6 +155,9 @@ class ClaudeConfig:
         _int("claude.latency_budget_ms", self.latency_budget_ms, 50, limits.MAX_ADVISOR_LATENCY_BUDGET_MS)
         _int("claude.max_calls_per_hour", self.max_calls_per_hour, 1, limits.MAX_CLAUDE_CALLS_PER_HOUR)
         _num("claude.max_daily_cost_usd", self.max_daily_cost_usd, 0.0, limits.MAX_CLAUDE_DAILY_COST_USD)
+        _num("claude.max_monthly_cost_usd", self.max_monthly_cost_usd, 0.0, limits.MAX_CLAUDE_MONTHLY_COST_USD)
+        _bool("claude.review_requires_ablation", self.review_requires_ablation)
+        _bool("claude.batch_reports", self.batch_reports)
         _num("claude.cache_ttl_seconds", self.cache_ttl_seconds, 0.0, 86400.0)
         _num("claude.probe_degraded_base_seconds", self.probe_degraded_base_seconds, 5.0, 3600.0)
         _num("claude.probe_degraded_max_seconds", self.probe_degraded_max_seconds,
@@ -524,7 +532,7 @@ class CapitalConfig:
 
 
 DEFAULT_CANDIDATES = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "XAUUSD")
-UNIVERSE_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4")
+UNIVERSE_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 
 
 @dataclass(frozen=True)
@@ -532,7 +540,7 @@ class UniverseConfig:
     """Opportunity engine: which symbols and timeframes the arms may use."""
 
     candidates: tuple[str, ...] = DEFAULT_CANDIDATES
-    timeframes: tuple[str, ...] = ("M5", "M15", "H1")
+    timeframes: tuple[str, ...] = ("M15", "H1", "H4", "D1")
     max_symbols: int = 6
     max_arms: int = 400
     default_arms: bool = True
@@ -594,6 +602,9 @@ class FlowDoctorConfig:
     revert_mean_r: float = -0.25
     tighten_daily_loss_used: float = 0.6
     min_hours_between_adjustments: float = 2.0
+    max_relaxations_per_week: int = 3
+    min_counterfactual_signals: int = 10
+    min_counterfactual_r: float = 0.0
 
     @classmethod
     def from_dict(cls, data: Any) -> "FlowDoctorConfig":
@@ -602,6 +613,9 @@ class FlowDoctorConfig:
         return cfg
 
     def validate(self) -> None:
+        _int("flow_doctor.max_relaxations_per_week", self.max_relaxations_per_week, 0, 14)
+        _int("flow_doctor.min_counterfactual_signals", self.min_counterfactual_signals, 3, 1000)
+        _num("flow_doctor.min_counterfactual_r", self.min_counterfactual_r, 0.0, 2.0)
         _bool("flow_doctor.enabled", self.enabled)
         _num("flow_doctor.max_idle_hours_demo", self.max_idle_hours_demo, 1.0, 24.0 * 14)
         _num("flow_doctor.max_idle_hours_real", self.max_idle_hours_real, 1.0, 24.0 * 14)
@@ -646,6 +660,16 @@ class ResearchConfig:
     retry_minutes: float = 60.0
     reference_equity: float = 10_000.0
     reference_risk_pct: float = 1.0
+    cpcv_groups: int = 6
+    cpcv_test_groups: int = 2
+    embargo_bars: int = 20
+    min_dsr: float = 0.95
+    max_pbo: float = 0.5
+    min_trades: int = 30
+    require_verdict: bool = True      # an arm needs an "edge plausible" verdict to reach T2
+    retire_failed: bool = True
+    capture_ticks: bool = True
+    tick_retention_days: int = 30
 
     @classmethod
     def from_dict(cls, data: Any) -> "ResearchConfig":
@@ -659,6 +683,253 @@ class ResearchConfig:
         _num("research.retry_minutes", self.retry_minutes, 5.0, 24 * 60.0)
         _num("research.reference_equity", self.reference_equity, 1000.0, 1e9)
         _num("research.reference_risk_pct", self.reference_risk_pct, 0.1, limits.MAX_RISK_PER_TRADE_PCT)
+        _int("research.cpcv_groups", self.cpcv_groups, 4, 12)
+        _int("research.cpcv_test_groups", self.cpcv_test_groups, 1, 4)
+        _int("research.embargo_bars", self.embargo_bars, 0, 500)
+        _num("research.min_dsr", self.min_dsr, 0.5, 0.999)
+        _num("research.max_pbo", self.max_pbo, 0.05, 1.0)
+        _int("research.min_trades", self.min_trades, 10, 10_000)
+        _bool("research.require_verdict", self.require_verdict)
+        _bool("research.retire_failed", self.retire_failed)
+        _bool("research.capture_ticks", self.capture_ticks)
+        _int("research.tick_retention_days", self.tick_retention_days, 1, 3650)
+
+    def rigor(self, k_cost: float) -> Any:
+        from .rigor import RigorSettings
+
+        return RigorSettings(self.cpcv_groups, self.cpcv_test_groups, self.embargo_bars, min_trades=self.min_trades,
+                             min_dsr=self.min_dsr, max_pbo=self.max_pbo, k_cost=k_cost)
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Order execution. ``retryable_retcodes`` may only name definite non-executions: the rule
+    that an uncertain order is never re-sent is not configurable."""
+
+    max_attempts: int = 3
+    backoff_seconds: float = 0.5
+    backoff_max_seconds: float = 8.0
+    confirm_polls: int = 6
+    confirm_poll_seconds: float = 0.25
+    uncertain_grace_seconds: float = 120.0
+    protect_attempts: int = 3
+    protect_retry_seconds: float = 0.5
+    stop_tolerance_points: float = 2.0
+    retryable_retcodes: tuple[int, ...] = (10004, 10020, 10021, 10024)
+    breaker_failures: int = 5
+    breaker_open_seconds: float = 300.0
+    breaker_half_open_probes: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ExecutionConfig":
+        cfg = _build(cls, "execution", data)
+        if isinstance(cfg.retryable_retcodes, list):
+            cfg = dataclasses.replace(cfg, retryable_retcodes=tuple(cfg.retryable_retcodes))
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        from .core.orders import validate_retryable
+
+        _int("execution.max_attempts", self.max_attempts, 1, 10)
+        _num("execution.backoff_seconds", self.backoff_seconds, 0.0, 30.0)
+        _num("execution.backoff_max_seconds", self.backoff_max_seconds, 0.0, 120.0)
+        _int("execution.confirm_polls", self.confirm_polls, 1, 40)
+        _num("execution.confirm_poll_seconds", self.confirm_poll_seconds, 0.0, 5.0)
+        _num("execution.uncertain_grace_seconds", self.uncertain_grace_seconds, 10.0, 3600.0)
+        _int("execution.protect_attempts", self.protect_attempts, 1, 10)
+        _num("execution.protect_retry_seconds", self.protect_retry_seconds, 0.0, 5.0)
+        _num("execution.stop_tolerance_points", self.stop_tolerance_points, 0.0, 100.0)
+        _int("execution.breaker_failures", self.breaker_failures, 1, 100)
+        _num("execution.breaker_open_seconds", self.breaker_open_seconds, 1.0, 86400.0)
+        _int("execution.breaker_half_open_probes", self.breaker_half_open_probes, 1, 10)
+        validate_retryable(self.retryable_retcodes)
+
+    def settings(self) -> Any:
+        from .core.breaker import BreakerSettings
+        from .execution import ExecutionSettings
+
+        return ExecutionSettings(self.max_attempts, self.backoff_seconds, self.backoff_max_seconds, self.confirm_polls,
+                                 self.confirm_poll_seconds, self.uncertain_grace_seconds, self.protect_attempts,
+                                 self.protect_retry_seconds, self.stop_tolerance_points,
+                                 frozenset(self.retryable_retcodes),
+                                 BreakerSettings(self.breaker_failures, self.breaker_open_seconds,
+                                                 self.breaker_half_open_probes))
+
+
+@dataclass(frozen=True)
+class CostsConfig:
+    """Cost-to-edge gate and schedule hygiene. ``k`` has bounds: it can be tuned, not disabled."""
+
+    k: float = 2.0
+    edge_z: float = 1.645                    # which posterior lower quantile counts as proven edge: 1.645 is 5%
+    gate_enabled: bool = True
+    exploration_exempt_demo: bool = True     # demo micro-trades are how own fills get measured
+    exploration_exempt_real: bool = False
+    expected_hold_bars: int = 20
+    calibrate_every_hours: float = 24.0
+    rollover_start: str = "23:50"            # server time; learned windows can only widen this
+    rollover_end: str = "00:20"
+    friday_cutoff_hour: float = 21.0
+    flat_before_weekend: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "CostsConfig":
+        cfg = _build(cls, "costs", data)
+        cfg.validate()
+        return cfg
+
+    @staticmethod
+    def minutes(text: str) -> int:
+        hour, minute = text.split(":")
+        return int(hour) * 60 + int(minute)
+
+    def validate(self) -> None:
+        _num("costs.k", self.k, 1.0, 10.0)
+        _num("costs.edge_z", self.edge_z, 0.67, 2.33)
+        _bool("costs.gate_enabled", self.gate_enabled)
+        _bool("costs.exploration_exempt_demo", self.exploration_exempt_demo)
+        _bool("costs.exploration_exempt_real", self.exploration_exempt_real)
+        _int("costs.expected_hold_bars", self.expected_hold_bars, 1, 1000)
+        _num("costs.calibrate_every_hours", self.calibrate_every_hours, 1.0, 24.0 * 30)
+        _num("costs.friday_cutoff_hour", self.friday_cutoff_hour, 12.0, 24.0)
+        _bool("costs.flat_before_weekend", self.flat_before_weekend)
+        for name, value in (("rollover_start", self.rollover_start), ("rollover_end", self.rollover_end)):
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(value)):
+                raise ValueError(f"costs.{name} must be HH:MM, got {value!r}")
+
+    def rules(self) -> Any:
+        from .core.costs import ScheduleRules
+
+        return ScheduleRules(self.minutes(self.rollover_start), self.minutes(self.rollover_end),
+                             self.friday_cutoff_hour, self.flat_before_weekend)
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    """Portfolio construction. Every number here can only shrink a position."""
+
+    max_concurrent_arms: int = 4
+    correlation_cap: float = 0.7
+    max_cluster_weight: float = 0.5
+    max_currency_risk_pct: float = 2.0
+    target_correlated_risk_pct: float = 2.5
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PortfolioConfig":
+        cfg = _build(cls, "portfolio", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _int("portfolio.max_concurrent_arms", self.max_concurrent_arms, 1, limits.MAX_OPEN_POSITIONS)
+        _num("portfolio.correlation_cap", self.correlation_cap, 0.3, 0.95)
+        _num("portfolio.max_cluster_weight", self.max_cluster_weight, 0.1, 1.0)
+        _num("portfolio.max_currency_risk_pct", self.max_currency_risk_pct, 0.1, limits.MAX_TOTAL_OPEN_RISK_PCT)
+        _num("portfolio.target_correlated_risk_pct", self.target_correlated_risk_pct, 0.1,
+             limits.MAX_TOTAL_OPEN_RISK_PCT)
+
+    def rules(self) -> Any:
+        from .core.portfolio import PortfolioRules
+
+        return PortfolioRules(self.max_concurrent_arms, self.correlation_cap, self.max_cluster_weight,
+                              self.max_currency_risk_pct, self.target_correlated_risk_pct)
+
+
+@dataclass(frozen=True)
+class TailConfig:
+    """Tail risk. The margin multiple has a floor: 1x stop-out would be no guard at all."""
+
+    margin_stop_out_multiple: float = 3.0
+    margin_call_multiple: float = 1.5
+    gap_quantile: float = 0.99
+    overnight_hours: float = 6.0
+    small_account_equity: float = 25_000.0
+    ladder_recovery_days: float = 3.0
+    stress_reduction: float = 0.5
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "TailConfig":
+        cfg = _build(cls, "tail", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("tail.margin_stop_out_multiple", self.margin_stop_out_multiple, 2.0, 20.0)
+        _num("tail.margin_call_multiple", self.margin_call_multiple, 1.0, 10.0)
+        _num("tail.gap_quantile", self.gap_quantile, 0.5, 1.0)
+        _num("tail.overnight_hours", self.overnight_hours, 0.0, 48.0)
+        _num("tail.small_account_equity", self.small_account_equity, 0.0, 1e9)
+        _num("tail.ladder_recovery_days", self.ladder_recovery_days, 0.0, 60.0)
+        _num("tail.stress_reduction", self.stress_reduction, 0.05, 1.0)
+
+    def rules(self) -> Any:
+        from .core.tail import TailRules
+
+        return TailRules(self.margin_stop_out_multiple, self.margin_call_multiple, self.gap_quantile,
+                         self.overnight_hours, self.small_account_equity,
+                         ladder_recovery_days=self.ladder_recovery_days)
+
+
+@dataclass(frozen=True)
+class GovernanceConfig:
+    """The evaluation horizon and the stop rule of the real account."""
+
+    enabled: bool = True
+    horizon_trades: int = 200
+    horizon_days: float = 91.0
+    rolling_min_trades: int = 30
+    confidence: float = 0.95
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "GovernanceConfig":
+        cfg = _build(cls, "governance", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _bool("governance.enabled", self.enabled)
+        _int("governance.horizon_trades", self.horizon_trades, 30, 100_000)
+        _num("governance.horizon_days", self.horizon_days, 7.0, 3650.0)
+        _int("governance.rolling_min_trades", self.rolling_min_trades, 20, 100_000)
+        _num("governance.confidence", self.confidence, 0.5, 0.999)
+
+    def rules(self) -> Any:
+        from .core.governance import GovernanceRules
+
+        return GovernanceRules(self.horizon_trades, self.horizon_days, self.rolling_min_trades, self.confidence)
+
+
+@dataclass(frozen=True)
+class OpsConfig:
+    """Operations: time budget, logs, metrics, clock discipline and backups."""
+
+    cycle_budget_ms: float = 2000.0
+    json_logs: bool = False
+    metrics_enabled: bool = False
+    clock_drift_warn_seconds: float = 5.0
+    ntp_server: Optional[str] = None
+    backup_enabled: bool = True
+    backup_hour_server: int = 3
+    backup_keep_days: int = 14
+    symbol_info_ttl_seconds: float = 30.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "OpsConfig":
+        cfg = _build(cls, "ops", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("ops.cycle_budget_ms", self.cycle_budget_ms, 50.0, 60_000.0)
+        _bool("ops.json_logs", self.json_logs)
+        _bool("ops.metrics_enabled", self.metrics_enabled)
+        _num("ops.clock_drift_warn_seconds", self.clock_drift_warn_seconds, 0.5, 600.0)
+        _optional_text("ops.ntp_server", self.ntp_server)
+        _bool("ops.backup_enabled", self.backup_enabled)
+        _int("ops.backup_hour_server", self.backup_hour_server, 0, 23)
+        _int("ops.backup_keep_days", self.backup_keep_days, 1, 3650)
+        _num("ops.symbol_info_ttl_seconds", self.symbol_info_ttl_seconds, 0.0, 3600.0)
 
 
 BLOCKS: dict[str, type] = {
@@ -673,6 +944,12 @@ BLOCKS: dict[str, type] = {
     "flow_doctor": FlowDoctorConfig,
     "management": ManagementConfig,
     "research": ResearchConfig,
+    "execution": ExecutionConfig,
+    "costs": CostsConfig,
+    "portfolio": PortfolioConfig,
+    "tail": TailConfig,
+    "governance": GovernanceConfig,
+    "ops": OpsConfig,
 }
 
 

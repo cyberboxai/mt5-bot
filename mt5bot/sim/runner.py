@@ -20,24 +20,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from ..config import Config, apply_overrides
-from ..config_blocks import to_jsonable
+from ..adapters.exchange import SimCosts
+from ..adapters.sim_broker import SimBroker
+from ..clock import VirtualClock
+from ..config import Config, apply_overrides, config_snapshot
 from .advisor import SimulatedAdvisor
 from .market import DEMO_SYMBOLS, SyntheticMarket
-from .terminal import SimulatedTerminal
 
 log = logging.getLogger("mt5_bot")
 
 SIM_BAR_SECONDS = 300
 SIM_WARMUP_BARS = 9000   # about a month of M5 bars, so H1 arms have enough history
-
-
-class VirtualClock:
-    def __init__(self, t: float) -> None:
-        self.t = float(t)
-
-    def __call__(self) -> float:
-        return self.t
 
 
 class _FinishedProcess:
@@ -58,7 +51,9 @@ def simulation_config(cfg: Config, state_root: Path, team_mode: Optional[str]) -
         "team.team_mode": team_mode or "full", "universe.candidates": names, "universe.max_symbols": len(names),
         "universe.timeframes": ("M5", "M15", "H1"), "universe.max_arms": 400, "universe.scan_every_minutes": 30.0,
         "research.startup_history_months": 4, "research.startup_trials": 4, "history_months": 4,
-        "wf_train_months": 2, "wf_test_months": 1,
+        "wf_train_months": 2, "wf_test_months": 1, "research.capture_ticks": False,
+        # The demo office shows the advisor at work; it is simulated, so there is no cost to justify.
+        "claude.review_trades": True, "claude.review_requires_ablation": False,
     }
     return apply_overrides(cfg, overrides)
 
@@ -68,7 +63,8 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
                    advisor: str = "simulated", team_mode: Optional[str] = None, fast_forward: int = 0,
                    on_step: Optional[Callable[[int, Any], None]] = None, research: str = "skip",
                    random_walk: bool = False, symbols: Optional[tuple] = None,
-                   config_overrides: Optional[dict[str, Any]] = None) -> int:
+                   config_overrides: Optional[dict[str, Any]] = None, costs: Optional[SimCosts] = None,
+                   feed: Any = None) -> int:
     """Run until ``steps`` bars (None: until stopped or the kill switch). Returns the bot's exit code."""
     from ..bot import EXIT_OK, Bot
     from ..officedb import OfficeStore
@@ -90,8 +86,8 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
         sim_cfg = apply_overrides(sim_cfg, config_overrides)
     config_path = state_root / "simulation-config.json"
     config_path.write_text(json.dumps(to_jsonable_config(sim_cfg), indent=1), encoding="utf-8")
-    market = SyntheticMarket(seed, symbols=models, bar_seconds=SIM_BAR_SECONDS, random_walk=random_walk)
-    terminal = SimulatedTerminal(market, warmup_bars)
+    market = feed or SyntheticMarket(seed, symbols=models, bar_seconds=SIM_BAR_SECONDS, random_walk=random_walk)
+    terminal = SimBroker(market, warmup_bars, costs or SimCosts(), seed=seed)
     clock = VirtualClock(terminal.utc_now())
     holder = SimpleNamespace(bot=None)
 
@@ -108,7 +104,8 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
 
     spawn = None if research == "subprocess" else skip_research
     sim_advisor = SimulatedAdvisor(clock) if advisor == "simulated" else None
-    bot = Bot(sim_cfg, api=terminal, wait=lambda seconds: None, env={}, monotonic=clock, utc_now=clock,
+    bot = Bot(sim_cfg, broker=terminal, market=terminal, wait=lambda seconds: None, env={}, monotonic=clock,
+              utc_now=clock,
               config_path=str(config_path), spawn=spawn, globber=lambda pattern: [],
               terminal_killer=lambda exe: False, advisor=sim_advisor, no_claude=advisor == "none",
               durable_files=False, auto_migrate=False)
@@ -140,9 +137,7 @@ def run_simulation(cfg: Config, state_root: Path, steps: Optional[int] = None, s
 
 
 def to_jsonable_config(cfg: Config) -> dict[str, Any]:
-    import dataclasses
-
-    return {f.name: to_jsonable(getattr(cfg, f.name)) for f in dataclasses.fields(cfg)}
+    return config_snapshot(cfg, locations=True)
 
 
 def main_simulate(cfg: Config, args: Any) -> int:  # pragma: no cover - thin CLI wrapper

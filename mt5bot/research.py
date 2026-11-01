@@ -32,10 +32,15 @@ import numpy as np
 from . import strategies as strategy_lib
 from .backtest import CostModel, simulate
 from .config import TIMEFRAME_SECONDS
+from .core.validation import n_paths
+from .datastore import DataStore
 from .limits import WIDEST_TRADING_HOURS
 from .optimizer import OptimizerSettings, hypothesis_params, optimize_symbol
 from .registry import Registry, _json
+from .rigor import NO_EDGE, TrialLedger, evaluate_family, sample_params
 from .risk import SymbolSpec
+from .tca import TcaStore
+from .tiers import TierDecision
 
 log = logging.getLogger("mt5_bot")
 
@@ -45,13 +50,15 @@ MONTH = int(30.4375 * 86400)
 MIN_RESEARCH_BARS = 600
 
 
-def cost_model(cfg: Any, commission_per_lot: float, symbol: Optional[str] = None) -> CostModel:
+def cost_model(cfg: Any, commission_per_lot: float, symbol: Optional[str] = None,
+               slippage_points: Optional[float] = None) -> CostModel:
     """Costs and entry filters shared by research and the shadow books.
 
     Evidence is gathered over the widest tradable hours (the live window may be narrower:
     signals outside it are counterfactuals that tell the Flow Doctor what the window costs)."""
     cap = cfg.universe.spread_cap(symbol) if symbol else None
-    return CostModel(commission_per_lot=commission_per_lot, slippage_points=cfg.backtest_slippage_points,
+    slippage = cfg.backtest_slippage_points if slippage_points is None else slippage_points
+    return CostModel(commission_per_lot=commission_per_lot, slippage_points=slippage,
                      max_spread_points=cap if cap is not None else 1e9, trading_hours=WIDEST_TRADING_HOURS,
                      close_on_opposite=cfg.close_on_opposite, max_spread_to_stop=cfg.universe.max_spread_to_stop)
 
@@ -157,16 +164,18 @@ def run_research(cfg: Any, registry: Registry, trigger: str, mode: str = "full",
                 if len(bars) < MIN_RESEARCH_BARS:
                     raise RuntimeError(f"only {len(bars)} cached {tf} bars for {symbol} (need {MIN_RESEARCH_BARS}); "
                                        "check Tools > Options > Charts > Max bars in chart")
-                costs = cost_model(cfg, spec_row[1], symbol)
+                slippage = TcaStore(registry, clock).slippage_points(symbol, cfg.backtest_slippage_points)
+                costs = cost_model(cfg, spec_row[1], symbol, slippage)
                 settings = research_settings(cfg, tf, mode)
                 result = optimize_symbol(symbol, bars, spec, costs, settings, cfg.strategy_names(),
                                          workers or cfg.optimizer_workers, lower_priority, extra_params=extra)
                 registry.finish_run(run_id, result)
                 arms = apply_priors(registry, store, symbol, tf, result, bars, spec, costs, settings, run_id, clock)
+                verdicts = apply_rigor(cfg, registry, store, symbol, tf, bars, spec, costs, settings, run_id, mode, clock)
                 ok += 1
                 out.append({"symbol": symbol, "timeframe": tf, "run_id": run_id, "status": "done",
                             "families": len(result.candidates), "arms_with_prior": arms,
-                            "seconds": round(result.seconds, 1)})
+                            "seconds": round(result.seconds, 1), "verdicts": verdicts})
                 log.info("%s %s: research run %d finished in %.0fs (%d families, %d arm priors)", symbol, tf, run_id,
                          result.seconds, len(result.candidates), arms)
             except Exception as exc:  # noqa: BLE001 - record and continue with the other pairs
@@ -219,6 +228,55 @@ def apply_priors(registry: Registry, store: Any, symbol: str, timeframe: str, re
             store.set_prior(int(row["id"]), n_d, mean_d, var_d)
             count += 1
     return count
+
+
+def apply_rigor(cfg: Any, registry: Registry, store: Any, symbol: str, timeframe: str, bars: np.ndarray,
+                spec: SymbolSpec, costs: CostModel, settings: OptimizerSettings, run_id: int, mode: str,
+                clock: Callable[[], float]) -> dict[str, int]:
+    """Snapshot the data, judge every family with the CPCV pipeline and act on the verdicts:
+    priors come from the out-of-sample distribution, and arms without an edge go back to research."""
+    data = DataStore(registry.path.parent, registry, clock)
+    snapshot, quality = data.snapshot(symbol, timeframe, bars, settings.bar_seconds)
+    if not quality.ok:
+        log.warning("%s %s: data quality issues in %s: %s", symbol, timeframe, snapshot, "; ".join(quality.issues))
+    ledger = TrialLedger(registry, clock)
+    rigor = cfg.research.rigor(cfg.costs.k)
+    tally: dict[str, int] = {}
+    seconds = TIMEFRAME_SECONDS[timeframe]
+    nights = cfg.costs.expected_hold_bars * seconds / 86400.0
+    for name in cfg.strategy_names():
+        params = sample_params(name, settings.trials_per_strategy, cfg.optimizer_seed + run_id)
+
+        def count(p: Any, stats: Any, strategy: str = name) -> None:
+            ledger.record(run_id, symbol, timeframe, strategy, p, snapshot, stats)
+
+        try:
+            verdict = evaluate_family(bars, name, params, spec, costs, settings.equity, settings.risk_pct, rigor,
+                                      ledger.count(), count, nights)
+        except Exception as exc:  # noqa: BLE001 - one family must not stop the others
+            log.warning("%s %s %s: rigor evaluation failed: %s", symbol, timeframe, name, exc)
+            continue
+        if verdict is None:
+            continue
+        ps = registry.param_set_id(name, strategy_lib.get(name).validate_params(verdict.params))
+        ledger.store_verdict(run_id, symbol, timeframe, ps, verdict, snapshot)
+        tally[verdict.verdict] = tally.get(verdict.verdict, 0) + 1
+        paths = n_paths(rigor.n_groups, rigor.k_test)
+        unique = verdict.cpcv_n // paths
+        rows = registry.conn.execute("SELECT id FROM arms WHERE symbol = ? AND timeframe = ? AND strategy = ?",
+                                     (symbol, timeframe, name)).fetchall()
+        for row in rows:
+            arm = store.get(int(row["id"]))
+            if arm is None:
+                continue
+            if unique > 0 and verdict.cpcv_mean_r is not None and arm.param_set_id == ps:
+                store.set_prior(arm.id, unique, verdict.cpcv_mean_r, verdict.cpcv_var_r)
+            if verdict.verdict == NO_EDGE and mode == "full" and cfg.research.retire_failed and arm.active:
+                reason = "; ".join(verdict.reasons)[:400]
+                store.change_tier(arm, TierDecision("T0", arm.tier, f"retired by research: {reason}"), clock(),
+                                  action="retire")
+                store.set_active(arm.id, False)
+    return tally
 
 
 class ResearchScheduler:

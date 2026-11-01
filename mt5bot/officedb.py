@@ -279,22 +279,6 @@ class OfficeStore:
 
     # ---------------------------------------------------------- agent state
 
-    def set_agent_state(self, agent: str, state: str, task: Optional[str] = None, last_message: Optional[str] = None,
-                        benched: Optional[bool] = None, bench_reason: Optional[str] = None,
-                        errors: Optional[int] = None, stats: Optional[Mapping[str, Any]] = None) -> None:
-        row = self._one("SELECT * FROM agent_state WHERE agent = ?", (agent,))
-        current = dict(row) if row else {"task": None, "last_message": None, "benched": 0, "bench_reason": None,
-                                         "errors": 0, "stats_json": "{}"}
-        self._exec(
-            "INSERT OR REPLACE INTO agent_state (agent, state, task, last_message, updated_ts, benched, bench_reason,"
-            " errors, stats_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (agent, state, task if task is not None else current["task"],
-             last_message if last_message is not None else current["last_message"], self.now(),
-             int(benched) if benched is not None else current["benched"],
-             bench_reason if benched is not None else current["bench_reason"],
-             errors if errors is not None else current["errors"],
-             to_json(stats) if stats is not None else current["stats_json"]))
-
     def set_agent_states(self, rows: Iterable[Mapping[str, Any]]) -> None:
         """Upsert many agents' state in ONE transaction (one commit per housekeeping pass)."""
         now = self.now()
@@ -385,6 +369,10 @@ class OfficeStore:
         calls = [float(r["ts"]) for r in self._all("SELECT ts FROM advisor_calls WHERE ts >= ?", (calls_since,))]
         row = self._one("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM advisor_calls WHERE ts >= ?", (cost_since,))
         return calls, float(row["c"]) if row else 0.0
+
+    def advisor_review_spend(self) -> float:
+        row = self._one("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM advisor_calls WHERE purpose = 'review'")
+        return float(row["c"]) if row else 0.0
 
     def advisor_calls(self, limit: int = 100, since_ts: Optional[float] = None) -> list[dict]:
         sql = "SELECT * FROM advisor_calls"

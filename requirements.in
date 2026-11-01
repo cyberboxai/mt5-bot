@@ -1,0 +1,4 @@
+# Runtime dependencies. Compile with: uv pip compile requirements.in --generate-hashes --universal -o requirements.lock
+# MetaTrader5 ships Windows wheels only; the marker keeps the lock installable on Linux for tests.
+numpy>=1.26
+MetaTrader5>=5.0.5430; sys_platform == "win32"

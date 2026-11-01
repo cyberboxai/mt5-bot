@@ -35,6 +35,18 @@ REASONS: dict[str, tuple[str, str, Optional[str]]] = {
     "SIGNAL": ("signal", "sinal gerado por um braço", None),
     "SELECTED": ("tier", "sinal escolhido para proposta de entrada", None),
     "EXPLORATION": ("exploration", "entrada de exploração (T1) escolhida por amostragem de Thompson", None),
+    "COST_TO_EDGE": ("risk", "vantagem provada não cobre k vezes o custo total", None),
+    "ROLLOVER_GUARD": ("data", "janela de rollover do servidor (spreads largos)", None),
+    "PRE_WEEKEND": ("data", "sem novas entradas antes do fecho de sexta-feira", None),
+    "ORDER_UNCERTAIN": ("execution", "ordem anterior com resultado desconhecido: a reconciliar", None),
+    "DUPLICATE_BLOCKED": ("execution", "ordem duplicada bloqueada (mesma decisão)", None),
+    "BROKER_BREAKER_OPEN": ("execution", "disjuntor do corretor aberto: falhas de infraestrutura", None),
+    "MARGIN_GUARD": ("risk", "margem projectada demasiado perto do stop-out", None),
+    "MARGIN_PRESSURE": ("risk", "nível de margem a aproximar-se da chamada", None),
+    "PORTFOLIO_MAX_ARMS": ("risk", "número máximo de braços em simultâneo", None),
+    "CURRENCY_CAP": ("risk", "risco por moeda no limite", None),
+    "RESEARCH_ONLY": ("risk", "conta real em modo só investigação (regra de paragem)", None),
+    "REGIME_MEAN_REVERSION": ("tier", "reversão à média só em regime lateral", None),
     "NO_TICK": ("data", "sem cotação válida", None),
     "MARKET_CLOSED": ("data", "mercado fechado ou sem ticks recentes", None),
     "DATA_UNHEALTHY": ("data", "dados de mercado com problemas", None),
@@ -99,19 +111,22 @@ def knob_for(code: str) -> Optional[str]:
 def risk_reason_code(reason: str) -> str:
     """Map a risk-layer / execution message to a reason code."""
     text = reason.lower()
-    table = (("trading halted: daily", "HALTED_DAILY"), ("daily loss limit", "HALTED_DAILY"),
+    table = (("cost-to-edge", "COST_TO_EDGE"), ("projected margin level", "MARGIN_GUARD"),
+             ("rollover", "ROLLOVER_GUARD"), ("antes do fecho de sexta", "PRE_WEEKEND"),
+             ("trading halted: daily", "HALTED_DAILY"), ("daily loss limit", "HALTED_DAILY"),
              ("drawdown circuit breaker", "HALTED_DRAWDOWN"), ("paused from the panel", "PAUSED"),
              ("guardian", "GUARDIAN_FREEZE"), ("spread", "SPREAD_LIMIT"), ("slippage", "SLIPPAGE_PAUSE"),
              ("news blackout", "NEWS_BLACKOUT"), ("already has a position", "ONE_PER_SYMBOL"),
              ("netting account", "FOREIGN_NETTING"), ("bot positions open", "RISK_MAX_POSITIONS"),
-             ("total open risk", "RISK_OPEN_RISK"), ("exposure", "RISK_EXPOSURE"),
+             ("total open risk", "RISK_OPEN_RISK"), ("% would exceed", "CURRENCY_CAP"), ("exposure", "RISK_EXPOSURE"),
              ("planned risk", "RISK_PER_TRADE"), ("sl/tp", "RISK_STOPS"), ("stop", "RISK_STOPS"),
              ("minimum volume", "MIN_LOT_EXCEEDS_RISK"), ("below broker minimum", "SL_BELOW_BROKER_MIN"),
              ("outside trading window", "OUTSIDE_HOURS"), ("order_check", "ORDER_CHECK_FAIL"),
              ("order_send", "ORDER_SEND_FAIL"), ("market reported closed", "MARKET_CLOSED"),
              ("trading mode is restricted", "TRADE_MODE_RESTRICTED"), ("no symbol info", "NO_TICK"),
              ("symbol quarantined", "SYMBOL_QUARANTINED"),
-             ("order_calc_margin", "MARGIN_UNKNOWN"), ("halted", "HALTED_DAILY"))
+             ("order_calc_margin", "MARGIN_UNKNOWN"), ("research-only", "RESEARCH_ONLY"),
+             ("margin pressure", "MARGIN_PRESSURE"), ("halted", "HALTED_DAILY"))
     for needle, code in table:
         if needle in text:
             return code
@@ -268,7 +283,7 @@ def report(conn: Any, since: float, until: float) -> dict[str, Any]:
     bars = signals = orders = 0
     last_order = last_signal = None
     examples: dict[str, dict] = {}
-    for ts, symbol, timeframe, arm_id, stage, outcome, reason, bar_time, values_json in rows:
+    for ts, symbol, timeframe, _arm_id, stage, outcome, reason, _bar_time, values_json in rows:
         by_stage[stage][outcome] += 1
         if reason == "BAR_EVALUATED":
             bars += 1

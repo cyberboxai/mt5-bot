@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Sequence
+from typing import Any, Literal, Mapping, Optional
 
 import numpy as np
 
@@ -244,7 +244,3 @@ def sides_from(buy: np.ndarray, sell: np.ndarray) -> np.ndarray:
 def describe(strategy: Strategy, params: Params) -> str:
     inner = ", ".join(f"{k}={v}" for k, v in canonical_params(params).items())
     return f"{strategy.name}({inner})"
-
-
-def param_names(space: Sequence[Param]) -> list[str]:
-    return [p.name for p in space]

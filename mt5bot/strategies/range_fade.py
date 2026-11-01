@@ -33,7 +33,7 @@ class RangeFade(Strategy):
         n = int(params["channel"])
         upper = indicators.rolling_max_prev(high, n)
         lower = indicators.rolling_min_prev(low, n)
-        trendless = indicators.cached(bars, "adx14", lambda: indicators.adx(high, low, close, 14)) < float(params["adx_max"])
+        trendless = indicators.bars_adx(bars, 14) < float(params["adx_max"])
         with np.errstate(invalid="ignore"):
             buy = (low < lower) & (close > lower) & trendless
             sell = (high > upper) & (close < upper) & trendless

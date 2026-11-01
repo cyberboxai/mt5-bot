@@ -83,8 +83,9 @@ def allocate(inp: AllocationInputs, rng: np.random.Generator,
         if view is not None:
             values.update(p_regime=round(view.p_positive, 4), n_regime=view.n)
 
-        def block(stage: str, reason: str, **extra: Any) -> None:
-            record(stage, "block", reason, arm_id=arm.id, bar_time=sig.bar_time, values=dict(values, **extra))
+        def block(stage: str, reason: str, *, arm_id: int = arm.id, bar_time: int = sig.bar_time,
+                  base: dict[str, Any] = values, **extra: Any) -> None:
+            record(stage, "block", reason, arm_id=arm_id, bar_time=bar_time, values=dict(base, **extra))
 
         if chosen is not None:
             block("risk", "ONE_PER_SYMBOL", detail="another arm was selected on this bar")

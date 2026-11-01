@@ -1,0 +1,9 @@
+# Test, lint and audit tools. Compile with: uv pip compile requirements-dev.in --generate-hashes --universal -o requirements-dev.lock
+numpy>=1.26
+pytest>=8.0
+hypothesis>=6.100
+mypy>=1.10
+ruff>=0.4
+coverage>=7.5
+pip-tools>=7.4
+pip-audit>=2.7

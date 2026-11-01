@@ -7,6 +7,11 @@ evidence and gets an automatic review: if the trades made under the relaxed sett
 poorly it is reverted. When the daily loss or the drawdown degrades, it tightens by reverting
 the most recent relaxation.
 
+A relaxation is never a guess: it is limited to a few per week, and the change is first "shadowed"
+by counterfactual replay. The signals the filter blocked were paper traded by their arms' shadow
+books, so what relaxing it would have done on recent data is known. Without enough of them, or if
+they would have lost money, the filter stays as it is. Reverting and tightening are never limited.
+
 Hard limits (code): every knob has a floor and a ceiling below. The Flow Doctor can never
 touch the hard ceilings, SL/TP rules, the drawdown breaker, the daily loss limit, the
 exploration budget or any Risk Manager / Guardian veto: none of them is a knob.
@@ -95,6 +100,7 @@ class FlowInputs:
     tier_counts: Mapping[str, int]
     min_agreement_cfg: int
     can_add_symbol: bool = True
+    relaxations_last_week: int = 0
 
 
 # A relaxation needs a material blocker: seen at least this often and this share of all blocks.
@@ -149,6 +155,8 @@ def evaluate(inp: FlowInputs, state: FlowState, active: Sequence[Adjustment], cf
         return out
     if inp.now - state.last_adjustment_ts < cfg.min_hours_between_adjustments * 3600:
         return out
+    if inp.relaxations_last_week >= cfg.max_relaxations_per_week:
+        return out
     for blocker in inp.top_blockers:
         knob = blocker.get("knob")
         reason = blocker.get("reason")
@@ -157,8 +165,8 @@ def evaluate(inp: FlowInputs, state: FlowState, active: Sequence[Adjustment], cf
         if int(blocker.get("count") or 0) < MIN_BLOCKER_COUNT or float(blocker.get("share") or 0.0) < MIN_BLOCKER_SHARE:
             continue  # a rare blocker is not why the bot is idle: never loosen a filter for it
         cf = inp.counterfactuals.get(reason) or {}
-        if cf.get("n", 0) >= 10 and cf.get("virtual_mean_r", 0.0) < -0.10:
-            continue  # this filter demonstrably protects value: never relax it
+        if cf.get("n", 0) < cfg.min_counterfactual_signals or cf.get("virtual_mean_r", -1.0) < cfg.min_counterfactual_r:
+            continue  # shadowed on recent data: unproven, or this filter protects value. It stays.
         if knob == "universe_extra" and not inp.can_add_symbol:
             continue
         current = state.knobs.get(knob, KNOBS[knob][0])
