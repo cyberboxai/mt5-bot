@@ -1,14 +1,12 @@
 {
-  "config_version": "3.1",
+  "config_version": "4.2",
 
-  "symbols": ["EURUSD"],
-  "timeframe": "M15",
   "bars": 1000,
   "history_months": 12,
   "magic": 510001,
 
-  "account_mode": "any",
-  "real_money_confirmed": false,
+  "account_mode": "real",
+  "real_money_confirmed": true,
 
   "risk_profile": "balanced",
 
@@ -22,11 +20,21 @@
   "news_filter_enabled": false,
 
   "universe": {
-    "candidates": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "XAUUSD"],
-    "timeframes": ["M15", "H1", "H4", "D1"],
+    "candidates": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "BTCUSD", "XAUUSD"],
+    "timeframes": ["M5", "M15", "H1", "H4"],
+    "always_include": [],
+    "exclude": [],
     "max_symbols": 6
   },
-  "tiers": {"exploration_enabled": true, "exploration_slots": 2},
+  "tiers": {"exploration_enabled": true, "exploration_slots": 2, "exploration_threshold": -0.02},
+  "sizing": {"min_viable_enabled": true, "min_viable_risk_cap_pct": null},
+  "budget": {"min_trades_per_day": null, "min_trades_per_week": null, "weekly_soft_limit_pct": null},
+  "startup": {"research_sprint_minutes": 20},
+  "entry_gates": {"min_mean_r": 0.0, "min_p": 0.55, "min_cost_to_edge": 1.2, "min_oos_trades": 30},
+  "scaling_gates": {"min_cost_to_edge": 2.0, "require_verdict": true, "max_reality_gap_r": 0.15},
+  "learning": {"half_life_days": 60, "drift_detector": "page_hinkley", "nightly_research": true},
+  "slo": {"first_trade_hours": 2.0},
+  "capacity": {"max_child_orders": 4, "child_interval_seconds": 30, "lots_per_tick": 0.25},
   "costs": {"k": 2.0, "gate_enabled": true, "rollover_start": "23:50", "rollover_end": "00:20", "friday_cutoff_hour": 21.0},
   "portfolio": {"max_concurrent_arms": 4},
   "tail": {"margin_stop_out_multiple": 3.0},

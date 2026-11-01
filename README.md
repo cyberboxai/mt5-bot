@@ -1,4 +1,132 @@
-# Bot de negociação para MetaTrader 5, versão 4.0 (Python, Windows)
+# Bot de negociação para MetaTrader 5, versão 4.2 (Python, Windows)
+
+> **Dinheiro real em risco por omissão.** Este sistema vem configurado para uma conta real. Os primeiros trades fazem-se com pouca evidência e podem perder. Contas pequenas sofrem muito com a granularidade dos lotes e com os custos. O bot não pode garantir lucro. Se quer apenas testar, use `start_bot_demo.bat`.
+
+## Começar em 5 minutos
+
+### Conta real (omissão)
+
+1. No MT5, abra **Ficheiro > Iniciar sessão na conta de negociação** e entre na conta real. Active o botão **Algo Trading**.
+2. Verifique sem enviar nenhuma ordem:
+
+   ```
+   preflight.bat
+   ```
+
+   Mostra o tipo de conta, as permissões, os símbolos, o que pode ser negociado agora, o piso de viabilidade e os primeiros candidatos.
+3. Arranque:
+
+   ```
+   start_bot.bat
+   ```
+
+**O que aparece.** Uma faixa com a conta mascarada, o servidor, REAL, o capital, a moeda, a alavancagem, o tipo de margem, o perfil e os limites em dinheiro. A primeira vez numa conta há uma contagem de 10 segundos para cancelar com Ctrl+C. Reinícios sem supervisão nunca esperam.
+
+**Sucesso nas primeiras duas horas.** A investigação inicial corre até 20 minutos em segundo plano. Depois, com mercado aberto e pelo menos um braço a passar as portas de entrada, o primeiro trade acontece no primeiro sinal que se qualifique, e o objectivo são 2 horas de mercado activo. Se nenhum braço passar as portas, **o bot não negoceia**, e é a decisão certa: o painel diz porquê em "Porque não estou a negociar?". A exploração pode ainda fazer alguns trades, limitados pelo orçamento.
+
+### Conta demo
+
+1. No MT5, entre numa conta demo.
+2. Corra:
+
+   ```
+   start_bot_demo.bat
+   ```
+
+   ou `python mt5_bot.py --account demo`.
+
+Para voltar à conta real: pare o bot, entre na conta real no MT5 e corra `start_bot.bat`. O painel nunca muda de modo, por segurança.
+
+### Conta errada
+
+| Modo | Conta no terminal | Resultado |
+|---|---|---|
+| `real` | demo | não negoceia, explica o que fazer, sai com o código 3 |
+| `demo` | real | não negoceia, explica o que fazer, sai com o código 3 |
+| `auto` | qualquer | aceita, com a faixa correcta |
+
+O tipo de conta vem de `account_info().trade_mode`, nunca do nome do servidor. O supervisor não reinicia depois de um código 3.
+
+## Actualizar a partir da versão anterior
+
+1. Pare o bot: Ctrl+C na janela, ou desligue a tarefa de arranque automático.
+2. Faça uma cópia da pasta do projecto.
+3. Instale a versão nova por cima e corra `.venv\Scripts\python -m pip install -r requirements.lock`.
+4. Corra `preflight.bat`. Confirme o capital e o que é negociável.
+5. Corra `start_bot.bat`. A configuração é migrada sozinha, com cópia datada `config.json.bak-...`; a base de dados recebe as tabelas novas depois de uma cópia de segurança.
+6. No painel confirme o selo REAL, o modo, os trades restantes e a contagem do primeiro trade.
+7. Se usa o arranque automático, volte a correr `install_autostart.bat`, para registar `--account real`.
+
+Reverter: `python mt5_bot.py --rollback-upgrade`.
+
+## O que cada trade arrisca, com os seus números
+
+> **Isto é uma estimativa.** O capital de 65,09 USD foi inferido dos números do painel, não lido da conta (`docs/DIAGNOSIS_v4_2.md`). `preflight.bat` mostra os valores reais. O perfil é `aggressive`.
+
+| Limite | % | Em dinheiro |
+|---|---|---|
+| Alvo de risco T1 | 0,50 | 0,33 USD |
+| Máximo por trade (tecto) | 2,00 | 1,30 USD |
+| Perda diária: fecha tudo e pára até ao dia seguinte | 5,00 | 3,25 USD |
+| Limite semanal: sem novas entradas até segunda-feira | 10,00 | 6,51 USD |
+| Risco aberto total | 4,00 | 2,60 USD |
+| Disjuntor: fecha tudo e exige intervenção | 18,00 | 11,72 USD |
+
+| Símbolo e período | Risco do lote mínimo | % do capital | Negociável agora | Capital mínimo |
+|---|---|---|---|---|
+| EURUSD M5 | 0,41 USD | 0,63 | sim | 38,67 USD |
+| EURUSD M15 | 0,98 USD | 1,51 | sim | 49,15 USD |
+| EURUSD H1 | 2,36 USD | 3,63 | não | 118,05 USD |
+| BTCUSD M5 | 0,73 USD | 1,13 | sim | 36,75 USD |
+| BTCUSD M15 | 1,21 USD | 1,85 | sim, por pouco | 60,35 USD |
+| BTCUSD H1 | 4,25 USD | 6,53 | não | 212,45 USD |
+| XAUUSD | 6,23 USD ou mais | 9,6 ou mais | não | 311,30 USD ou mais |
+
+Com estes valores, cada dia paga cerca de **3 trades** de exploração e cada semana cerca de **6**. Duas ou três perdas seguidas consomem o dia.
+
+**Piso de viabilidade.** É o menor capital em que pelo menos um candidato líquido cabe: o risco do lote mínimo dentro do limite do perfil, a margem dentro da guarda e a exposição dentro do tecto. Com os seus números ronda 37 USD. Abaixo dele o bot não coloca ordens, diz exactamente porquê, lista o capital mínimo por símbolo e continua a aprender em sombra. Acima, por exemplo depois de um depósito, começa a negociar sozinho, sem reiniciar.
+
+**Tecto de capacidade.** É o maior capital que o sistema consegue usar sem mover o mercado, calculado de `volume_max`, limites da corretora, liquidez observada e margem. Acima dele as ordens dividem-se e o painel diz: "capital acima da capacidade de execução: X permanece sem uso". Não há nenhum saldo fixo no código, nem mínimo nem máximo.
+
+**Modo de operação.** Vem de duas razões, recalculadas a cada decisão: risco alvo sobre risco do lote mínimo (abaixo de 1, mínimo viável) e volume pretendido sobre capacidade (acima de 1, capacidade).
+
+## Como o bot aprende
+
+* **Sombra em tudo.** Cada braço, em cada símbolo e período, faz trades virtuais com custos desde o primeiro minuto, incluindo sinais bloqueados e símbolos ainda inviáveis. Continua abaixo do piso.
+* **Do primeiro dia ao último.** Toda a evidência conta, mas a recente conta mais (meia-vida de 60 dias). Cada trade fechado actualiza as estimativas na passagem seguinte, no máximo em um minuto.
+* **Encolhimento.** Um braço aproxima-se da média da sua família, do seu grupo de símbolos e do seu tipo de período, o que protege contra braços com sorte.
+* **Regime.** A estimativa muda com o regime actual.
+* **Deriva.** Uma queda detectada desce o braço um nível de imediato e pede investigação.
+* **Investigação contínua.** Corre todas as noites e, com mais profundidade, ao fim de semana. Cada versão fica guardada e pode ser reposta: `--models`, `--rollback-model ID`.
+
+**Ler o separador Aprendizagem.** Trades reais e em sombra por braço, intervalos ao longo do tempo (um intervalo estreito significa mais evidência, não mais lucro), braços que subiram ou desceram, alertas de deriva e versões do modelo.
+
+## Comandos novos
+
+| Comando | O que faz |
+|---|---|
+| `python mt5_bot.py --preflight` | Verificação só de leitura. Não envia ordens. |
+| `python mt5_bot.py --account demo` | Escolhe o modo: `real`, `demo` ou `auto`. |
+| `python mt5_bot.py --recommend-config` | Escreve `config.recommended.json` para o saldo detectado. Não o aplica. |
+| `python mt5_bot.py --replay-day 2026-10-30` | Mostra o que esta versão teria feito nesse dia, com as velas em cache. Usa as posteriores de hoje, por isso sabe mais do que esse dia sabia. |
+| `python mt5_bot.py --models` | Lista as versões do modelo. |
+| `python mt5_bot.py --rollback-model 3` | Repõe os priores de uma versão. Os trades observados não mudam. |
+
+O antigo `--account <pasta>` chama-se agora `--account-dir <pasta>`.
+
+## O que mudou na 4.2
+
+* Diagnóstico com os seus números em `docs/DIAGNOSIS_v4_2.md`: o capital ronda 65 USD, e havia mais dois bloqueios escondidos atrás do lote mínimo.
+* Conta real por omissão, demo por opção, código 3 no tipo errado, verificação prévia só de leitura.
+* Tamanho consciente da granularidade: trades `MIN_VIABLE_SIZE` até ao limite do perfil, nunca acima de 2 %.
+* Orçamento em trades e em dinheiro. Sem saldos fixos: piso e tecto calculados da corretora.
+* Investigação inicial por tempo limitado, portas de entrada e de escala separadas, objectivo para o primeiro trade.
+* Selecção por valor esperado depois de custos.
+* Aprendizagem contínua com deriva, regime, recência e versões.
+* Perfis que chegam a todas as camadas e relatório de risco em dinheiro.
+* Doutor de Fluxo v2. Configuração migrada com cópia. Painel novo.
+
+---
 
 Guia de instalação e operação do bot `mt5_bot.py`, que negoceia automaticamente através do terminal MetaTrader 5 (MT5) instalado no seu PC Windows. Foi pensado para a corretora STARTRADER, mas funciona com qualquer corretora MT5. A versão 3.1 junta tudo num único sistema: braços com níveis de risco ganhos por evidência, exploração com micro risco desde o primeiro dia, adaptação ao tamanho da conta, protecção dos lucros, uma equipa de 22 agentes, um conselheiro de IA opcional e o painel **CYBERBOX Trading Office**.
 
@@ -240,64 +368,41 @@ Verifique o Python (depois de o instalar, secção 4) numa janela `cmd`:
 
 ---
 
-## 8. Selecção de conta: demo ou real
+## 8. Selecção de conta: real por omissão, demo por opção
 
-O bot negoceia na conta que estiver com sessão iniciada no terminal (ou na conta indicada pelas variáveis de ambiente da secção 18). Ao arrancar mostra uma faixa com o número da conta (mascarado no registo, por exemplo `***321`), o servidor, `DEMO` ou `REAL MONEY`, o capital, a moeda, a alavancagem e o tipo de conta (hedging ou netting).
+O bot só negoceia a conta permitida pelo modo. Ao arrancar mostra sempre uma faixa, na consola, no registo e no painel, com a conta mascarada, o servidor, REAL ou DEMO, o capital, a moeda, a alavancagem, o tipo de margem, o perfil e os limites em dinheiro.
 
-### 8.1 A chave `account_mode`
+### 8.1 O modo
 
 | Valor | Efeito |
 |---|---|
-| `"any"` (omissão) | Aceita a conta que estiver no terminal, demo ou real. |
-| `"demo_only"` | Recusa contas reais (sai com o código 3). |
-| `"real_only"` | Recusa contas demo (sai com o código 3). |
+| `"real"` (omissão) | Só uma conta real. Conta demo: sai com o código 3. |
+| `"demo"` | Só uma conta demo. Conta real: sai com o código 3 e nunca envia ordens. |
+| `"auto"` | Aceita a conta que estiver no terminal. |
 
-### 8.2 Confirmar dinheiro real (uma única vez, de propósito)
+`python mt5_bot.py --account real|demo|auto` tem prioridade sobre a configuração. Lançadores: `start_bot.bat` (real), `start_bot_demo.bat` (demo), `preflight.bat`. O painel mostra o modo mas não o pode mudar.
 
-Numa conta real, o bot só negoceia depois de uma confirmação explícita. Sem ela, mostra esta mensagem e sai com o código 3:
+### 8.2 Confirmação de dinheiro real
 
-```
-This terminal is logged in to a REAL MONEY account. The bot only trades real money after one deliberate confirmation...
-```
+`config.json` traz `"real_money_confirmed": true`. Um ficheiro sem essa chave recusa contas reais com o código 3: dinheiro real tem de estar escrito em algum sítio. `--confirm-real-money` confirma uma vez.
 
-Escolha **uma** das formas:
+### 8.3 Contagem de 10 segundos
 
-1. Na linha de comandos (vale para essa execução):
-   ```
-   cd /d C:\mt5-bot
-   .venv\Scripts\activate
-   python mt5_bot.py --confirm-real-money
-   ```
-2. Ou de forma permanente no `config.json` (recomendado para arranque automático):
-   ```
-   "real_money_confirmed": true
-   ```
+Aparece só na primeira vez que uma conta (número e servidor) é usada, ou depois de 30 dias sem arrancar (`startup.ack_max_age_days`). `--no-countdown` salta-a. O registo fica na pasta de estado da conta.
 
-Na primeira execução numa conta real aparece uma contagem decrescente de 10 segundos (`REAL MONEY trading starts in 10 s`). Ctrl+C durante a contagem cancela sem negociar. Para reinícios sem supervisão use `--no-countdown` (o supervisor já o acrescenta sozinho nos reinícios).
+### 8.4 Separação entre contas
 
-**Porque é um passo deliberado:** uma predefinição escondida ou uma confirmação automática tornaria fácil arrancar em dinheiro real por engano (por exemplo depois de trocar de conta no terminal). Uma confirmação explícita, feita por si, é a protecção mais simples contra esse erro, e depois dela o bot não pede mais nada.
+Diários, orçamentos, níveis, posteriores de trades reais, calibração de custos, distância à realidade, piso e máximo ficam em `state/<servidor>_<conta>/`. **Resultados de uma conta demo nunca promovem níveis, aumentam risco ou calibram custos numa conta real, nem o contrário.**
 
-### 8.3 Risco mais baixo em contas reais
+Só os dados de mercado são partilhados, em `state/_shared/`: velas descarregadas e a contagem de ensaios de investigação. Nada de conta vive aí.
 
-O perfil de risco (secção 13) tem números próprios para contas reais: no equilibrado, os trades de exploração e de probação (T1) arriscam 0,05% em real contra 0,10% em demo, e o orçamento de exploração é 0,10% por dia e 0,30% por semana em real contra 0,20% e 0,50% em demo. Os tectos rígidos do código são iguais para todos: 2,0% por operação, 5,0% de perda diária, 4,0% de risco aberto, 20% de drawdown. Tabela completa em [docs/EVIDENCE_AND_RISK.md](docs/EVIDENCE_AND_RISK.md#5-perfis-de-risco).
+### 8.5 Verificação prévia
 
-### 8.4 Estado separado por conta
+`preflight.bat` lê e não escreve estado nem envia ordens: tipo de conta, permissões, símbolos e sufixos, desvio da hora do servidor, capital, o que pode ser negociado agora, primeiros candidatos e problemas. Termina em menos de um minuto.
 
-Cada conta tem a sua pasta `state\<servidor>_<login>\`, por exemplo `state\STARTRADER-Demo_12345678\`. Lá ficam:
+### 8.6 Credenciais
 
-* `mt5bot.sqlite`: diário de operações (reais e em sombra), braços e evidência, investigação, funil de decisão, capital, fluxos de caixa, equipa e auditoria;
-* `risk_state.json`: capital do início do dia e pico de capital;
-* `RESUME_REQUIRED.txt`: só existe se o disjuntor de drawdown disparou;
-* `optimizer.log`: registo da investigação em segundo plano.
-
-O histórico da demo **nunca** influencia as decisões da conta real e vice-versa. Os relatórios também ficam separados em `reports\<servidor>_<login>\`.
-
-### 8.5 Contas hedging e netting
-
-O bot detecta o tipo de conta (`margin_mode`):
-
-* **hedging:** pode haver várias posições no mesmo símbolo; o bot fecha a sua posição pelo número (ticket);
-* **netting:** há uma única posição por símbolo; o bot fecha com uma ordem oposta do mesmo volume, altera SL/TP com `TRADE_ACTION_SLTP` e **não abre** se já existir uma posição de outra origem (manual ou outro robô) nesse símbolo.
+Por omissão usa a conta com sessão iniciada. Opcionalmente use `MT5_LOGIN`, `MT5_PASSWORD` e `MT5_SERVER` (secção 18). Nunca ficam em ficheiros, registos, base de dados ou painel.
 
 ---
 
@@ -718,7 +823,7 @@ A referência completa de todas as chaves está em [docs/CONFIG.md](docs/CONFIG.
 | `trading_hours_server` | `[2, 22]` | Janela de entradas na hora do **servidor**. |
 | `tiers.exploration_enabled` / `tiers.exploration_slots` | `true` / 2 | Trades de exploração com micro risco. |
 | `flow_doctor.enabled` | `true` | Ajustes automáticos limitados quando o bot está parado sem razão. |
-| `account_mode` / `real_money_confirmed` | `"any"` / `false` | Secção 8. |
+| `account_mode` / `real_money_confirmed` | `"real"` / `true` no `config.json` | Secção 8. |
 | `dry_run` | `false` | Tudo menos enviar ordens. |
 | `team.team_mode` | `"auto"` | Secção 10.5. |
 | `claude.enabled` | `false` | Secção 11. |
@@ -883,7 +988,7 @@ Siga [docs/UPGRADE.md](docs/UPGRADE.md): parar, copiar a pasta inteira, copiar o
 | Recomeçar o piso de lucros | `python mt5_bot.py --rebase-floor` (fica na auditoria) | Nenhum efeito directo; o risco passa a contar a partir do capital actual. |
 | Mudar de perfil de risco | `"risk_profile"` no `config.json`. Para um perfil mais conservador basta guardar; para um mais agressivo reinicie o bot. | As posições abertas mantêm o risco com que abriram. |
 
-Com várias contas com estado, os comandos que lêem o estado usam a conta registada no `health.json`. Para escolher outra: `--account STARTRADER-Demo_12345678`.
+Com várias contas com estado, os comandos que lêem o estado usam a conta registada no `health.json`. Para escolher outra: `--account-dir STARTRADER-Demo_12345678`.
 
 **O disjuntor de drawdown:** se o capital cair mais do que o limite do perfil (12% no equilibrado, nunca mais de 20%) face ao pico, o bot fecha as suas posições, deixa de abrir novas, notifica e cria `RESUME_REQUIRED.txt`. Nem um novo dia, nem um reinício o desligam. Depósitos e levantamentos não contam como lucro nem como drawdown.
 

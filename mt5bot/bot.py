@@ -40,8 +40,16 @@ from .bot_orders import (EntryOutcome, OrdersMixin, MARKET_CLOSED_BACKOFF_SECOND
 from .bot_oversight import OversightMixin
 from .allocation import AllocationInputs, allocate
 from .arms import ArmEngine, ArmSignal, EntryIntent
-from .capital import CapitalState, SizingDecision, SizingInputs, affordability, anti_martingale_cap, size_risk, \
-    split_volume
+from . import feasibility as fz
+from . import features as feature_lib
+from .account_mode import REAL_MONEY_HELP, account_policy_problem, banner_data, banner_lines  # noqa: F401
+from .bot_feasibility import ChildOrder, FeasibilityMixin
+from .capital import CapitalState, SizingDecision, SizingInputs, affordability, anti_martingale_cap, \
+    anti_martingale_money, size_risk
+from .expected_value import EvEstimate, rank_key
+from .shared import SharedMarket
+from .slo import FirstTradeClock
+from .expected_value import estimate as ev_estimate
 from .config import (TIMEFRAME_SECONDS, Config, apply_overrides, config_hash, config_snapshot, in_trading_hours,
                      reload_decision)
 from .core import broker as br
@@ -58,12 +66,13 @@ from .observability import AlertEngine, evaluate_rules
 from .funnel import Funnel
 from .market import ServerClock, fmt_server_time, is_weekend, market_expected_open, server_datetime
 from .notify import Notifier
-from .opportunity import STOP_ATR, affordability_rows, atr_and_spread, rank, score_symbol
-from .persistence import account_key, account_state_dir, mask
+from .opportunity import atr_and_spread, rank, score_symbol
+from .persistence import account_state_dir, mask
 from .ports import BrokerPort, MarketDataPort
 from .registry import Registry
 from .reports import trade_stats, write_health, write_report
 from .research import ResearchScheduler, cost_model
+from .research import sprint_key
 from .risk import (EntryContext, EquityGuard, NewsCalendar, OpenRisk, RiskManager, SymbolSpec,
                    plan_trade)
 from .tca import TcaStore
@@ -86,14 +95,6 @@ CASH_FLOW_SECONDS = 600.0
 FLOW_SECONDS = 300.0
 FUNNEL_RETENTION_DAYS = 30.0
 
-REAL_MONEY_HELP = (
-    "This terminal is logged in to a REAL MONEY account. The bot only trades real money after one "
-    "deliberate confirmation. Either start it once with:\n"
-    "    python mt5_bot.py --confirm-real-money\n"
-    "or set \"real_money_confirmed\": true in config.json. Read the README risk section first: "
-    "losses are possible and no profit is guaranteed."
-)
-
 PAUSE_MARKER = "PAUSE_ENTRIES"
 MEAN_REVERSION = frozenset({"rsi_reversion", "bollinger", "range_fade", "vwap_reversion"})
 
@@ -109,17 +110,6 @@ class AccountPolicyError(RuntimeError):
 def select_filling_mode(filling_flags: int, api: Any = None) -> int:
     """Pick a filling type the symbol supports: IOC, then FOK, else RETURN."""
     return select_filling(filling_flags)
-
-
-def account_policy_problem(mode: str, is_real: bool, confirmed: bool) -> Optional[str]:
-    """Reason the account may not be used, or None."""
-    if mode == "demo_only" and is_real:
-        return "account_mode is \"demo_only\" but the terminal is logged in to a REAL account."
-    if mode == "real_only" and not is_real:
-        return "account_mode is \"real_only\" but the terminal is logged in to a DEMO account."
-    if is_real and not confirmed:
-        return REAL_MONEY_HELP
-    return None
 
 
 def resolve_symbol(market: MarketDataPort, wanted: str) -> Optional[str]:
@@ -143,7 +133,7 @@ def resolve_symbol(market: MarketDataPort, wanted: str) -> Optional[str]:
     return tradable[0].name
 
 
-class Bot(OversightMixin, GatesMixin, OrdersMixin):
+class Bot(OversightMixin, GatesMixin, FeasibilityMixin, OrdersMixin):
     """Trading loop wiring the arms, the team, the risk layer and the broker."""
 
     def __init__(
@@ -266,6 +256,22 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         self.flow_active: list[flow.Adjustment] = []
         self.opportunity: list[dict[str, Any]] = []
         self.affordability: list[dict[str, Any]] = []
+        self.feasibility: dict[str, Any] = {}
+        self.modes = fz.ModeTracker(cfg.capacity.hysteresis)
+        self._typical_risk: Optional[float] = None
+        self._weekly_block: Optional[str] = None
+        self._children: list[ChildOrder] = []
+        self._pending_entries: list[tuple[str, EntryIntent, Any, Any]] = []
+        self.banner_info: dict[str, Any] = {}
+        self._last_trade_day: Optional[int] = None
+        self._gap_detector: Any = None
+        self._gap_seen = 0
+        self.shared: Optional[SharedMarket] = None
+        self.slo = FirstTradeClock()
+        self.risk_view: dict[str, Any] = {}
+        self._risk_view_key: Optional[tuple[str, str, bool]] = None
+        self._next_risk_view = 0.0
+        self._next_learning_point = 0.0
         self._spread_hourly: dict[str, dict[int, float]] = {}
         self._research_running = False
         self._rng = np.random.default_rng(int(cfg.tiers.seed))
@@ -374,6 +380,8 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         acc = self.broker.account()
         if acc is None:
             raise StartupError(f"account_info() returned nothing: {self._last_error()}. Log in to an account.")
+        if not _valid_number(getattr(acc, "equity", None)):
+            raise StartupError(f"account_info() returned no usable equity ({acc.equity!r}). Check the terminal.")
         if not acc.trade_allowed:
             raise StartupError(
                 "Trading is not allowed on this account (logged in with the investor/read-only password?)."
@@ -389,6 +397,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             == br.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
 
         self.state_dir = account_state_dir(self.cfg.state_root, acc.server, acc.login)
+        self.shared = SharedMarket(self.cfg.state_root)
         self._migrate_if_needed()
         self.registry = Registry(db_path(self.state_dir), clock=self._utc_now)
         self.funnel = Funnel(self.registry.tx, clock=self._utc_now)
@@ -399,6 +408,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         self.capital.observe(float(acc.equity), self._utc_now())
         self.flow_state = flow.FlowState.from_json(self.registry.get_kv("flow_state"))
         self.flow_active = self._load_flow_adjustments()
+        self.slo = FirstTradeClock.from_json(self.registry.get_kv("slo_state"))
         offset = self.registry.get_kv("server_offset")
         if offset is not None:
             self.clock.offset = int(offset)
@@ -415,6 +425,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             self.symbols[wanted] = name
             self._refresh_spec(name)
         self.universe = list(self.symbols.values())
+        for wanted in self.cfg.universe.always_include:
+            name = self.symbols.get(wanted) or resolve_symbol(self.market, wanted)
+            if name is not None and name not in self.universe and self.market.select_symbol(name):
+                self._refresh_spec(name)
+                self.universe.append(name)
         if self._signal_source is None:
             self._select_universe(acc)
         self.registry.set_kv("resolved_symbols", json.dumps(self.symbols))
@@ -427,14 +442,19 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         if self._signal_source is None:
             self.arms = ArmEngine(self.registry, self.cfg.tiers, self.cfg.research, clock=self._utc_now,
                                   notify=self.notifier.send, on_tier_change=self._on_tier_change,
-                                  management_cfg=self.cfg.management)
+                                  management_cfg=self.cfg.management, half_life_days=self.cfg.learning.half_life_days,
+                                  entry_gates=self.cfg.entry_gates, scaling_gates=self.cfg.scaling_gates,
+                                  learning_cfg=self.cfg.learning, on_drift=self._on_drift)
             if self.cfg.universe.default_arms:
                 created = self.arms.ensure_default_arms(self.universe, self.timeframes(), self.cfg.strategy_names(),
-                                                        self.cfg.universe.max_arms)
+                                                        self.cfg.universe.max_arms, self.cfg.learning.stop_variants)
                 if created:
                     log.info("%d new arm(s) created in shadow (T0); evidence decides their tiers", created)
             self.scheduler = ResearchScheduler(self.cfg, self.registry, self.state_dir, self.config_path,
                                                self.refresh_market_data, clock=self._utc_now, spawn=self._spawn)
+            known = self.registry.get_kv("sprint_key")
+            if known is not None and known != sprint_key(self.universe, float(self._utc_now())):
+                self.scheduler.request("*", "the code, the universe or the week changed", mode="sprint")
         self._apply_flow_knobs(log_changes=False)
         self._start_team()
         if self.arms is not None:
@@ -511,13 +531,14 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         log.warning("Migration done. Backup: %s. Rollback: python mt5_bot.py --rollback-upgrade", report["backup"])
 
     def _select_universe(self, acc: Any) -> None:
-        """Core symbols plus the most attractive feasible candidates the broker offers."""
+        """Core symbols plus the best candidates the broker offers: feasible ones first, then the
+        rest as shadow-only symbols, so evidence accumulates for the day the balance allows them."""
         cap = self.cfg.universe.max_symbols
         extra = int(self.flow_state.knobs.get("universe_extra", 0))
         scored: list[tuple[float, str]] = []
         self._universe_skipped = set()
         for wanted in self.cfg.universe.candidates:
-            if wanted in self.symbols:
+            if wanted in self.symbols or wanted in self.cfg.universe.exclude:
                 continue
             name = resolve_symbol(self.market, wanted)
             if name is None or name in self.universe:
@@ -535,22 +556,19 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                 log.debug("candidate %s skipped", wanted, exc_info=True)
                 continue
             atr, spread, vol_ratio = atr_and_spread(bars)
-            lim = self.risk.limits
-            afford = affordability(name, self.cfg.timeframe, (atr or 0.0) * STOP_ATR, spec.value_per_price,
-                                   spec.volume_min, self.commission.get(name, 0.0), float(acc.equity),
-                                   lim.t1_risk_pct, lim.explore_trade_pct) if atr else None
-            if afford is not None and not afford.feasible:
+            feasible = self._any_stop_feasible(name, atr, acc)
+            if not feasible:
                 self._universe_skipped.add(name)
-                log.info("Universe: %s skipped: its minimum lot risks %.3f%% of equity at a %.1f ATR stop "
-                         "(needs equity >= %.0f for exploration)", name, afford.min_lot_risk_pct, STOP_ATR,
-                         afford.min_equity)
-                continue
-            s = score_symbol(name, spread, atr, spec.point, vol_ratio, True, True, 0.0, None)
+            s = score_symbol(name, spread, atr, spec.point, vol_ratio, True, feasible, 0.0, None)
             scored.append((s.total, name))
         for _score, name in sorted(scored, reverse=True):
             if len(self.universe) >= cap + extra:
+                if name in self._universe_skipped:
+                    log.info("Universe: %s not tracked: every slot is taken and it is not feasible at this balance", name)
                 break
             self.universe.append(name)
+            if name in self._universe_skipped:
+                log.info("Universe: %s is shadow only for now: its minimum lot does not fit this balance", name)
         log.info("Universe: %s on %s", ", ".join(self.universe), ", ".join(self.timeframes()))
 
     def _can_add_symbol(self) -> bool:
@@ -593,6 +611,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             log.exception("The specialist team could not start; its review stage is skipped (neutral)")
             self.team = None
 
+    def _on_drift(self, arm: Any, detail: str) -> None:
+        self.registry.log_event(arm.symbol, "drift", detail, {"arm_id": arm.id})
+        if self.scheduler is not None:
+            self.scheduler.request(arm.symbol, f"drift: {detail}", mode="nightly")
+
     def _on_tier_change(self, arm: Any, decision: Any, audit_id: int) -> None:
         if decision.tier in ("T2", "T3") or decision.previous in ("T2", "T3"):
             self.notifier.send(f"{arm.symbol}: {arm.short()} {decision.previous} -> {decision.tier} (#{audit_id})",
@@ -618,6 +641,8 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             return "new entries paused from the panel (PAUSE_ENTRIES marker in the state folder)"
         if self._guardian_freeze:
             return f"Guardian freeze: {self._guardian_freeze}"
+        if self._weekly_block:
+            return self._weekly_block
         if self.cfg.capital.floor_soft_stop and self.capital.soft_stop_day is not None and self.guard is not None \
                 and self.capital.soft_stop_day == self.guard.state.day:
             return "profit floor reached: new entries stopped for today (soft breaker; --rebase-floor to override)"
@@ -628,24 +653,12 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         return bool(self.confirm_real_money or self.cfg.real_money_confirmed)
 
     def banner(self, acc: Any) -> None:
-        kind = "REAL MONEY" if self.is_real else "DEMO"
-        lim = self.risk.limits
-        lines = [
-            "=" * 72,
-            f"  ACCOUNT {mask(acc.login)} on {acc.server}: {kind}",
-            f"  equity {acc.equity:.2f} {acc.currency}, leverage 1:{getattr(acc, 'leverage', '?')}, "
-            f"{'hedging' if self.hedging else 'netting'} account",
-            f"  risk profile {lim.profile}: per trade T1 {lim.t1_risk_pct:.2f}% / T2 {lim.t2_risk_pct:.2f}% / "
-            f"T3 {lim.t3_risk_pct:.2f}%, daily loss {lim.daily_loss_pct:.2f}%, breaker {lim.drawdown_breaker_pct:.1f}%",
-            f"  exploration budget {lim.explore_day_pct:.2f}% per day, {lim.explore_week_pct:.2f}% per week; "
-            f"profit floor {self.capital.floor(lim):.2f}",
-            f"  state folder {self.cfg.state_root}/{account_key(acc.server, acc.login).replace(str(acc.login), mask(acc.login))}",
-            f"  mode: {'DRY RUN (no orders will be sent)' if self.cfg.dry_run else 'LIVE ORDERS'}",
-            "=" * 72,
-        ]
+        self.banner_info = banner_data(acc, self.is_real, self.cfg.account_mode, self.hedging, self.risk.limits,
+                                       self.cfg.dry_run)
         level = logging.WARNING if self.is_real else logging.INFO
-        for line in lines:
+        for line in banner_lines(self.banner_info):
             log.log(level, line)
+        self.registry.set_kv("banner", json.dumps(self.banner_info))
         arms = self.arms.counts() if self.arms is not None else {}
         log.info("Config: universe=%s timeframes=%s magic=%d arms=%s", ",".join(self.universe),
                  ",".join(self.timeframes()), self.cfg.magic, arms or "external source")
@@ -736,9 +749,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         return spec
 
     def _detect_commission(self, symbol: str) -> float:
-        """Round-turn commission per lot: config, else from this account's deal history, else fallback."""
-        if self.cfg.commission_per_lot is not None:
-            return float(self.cfg.commission_per_lot)
+        """Round-turn commission per lot: this account's deal history, else config, else fallback.
+
+        History wins because it is what the broker actually charges; a configured value that
+        disagrees with it is logged, so a wrong cost model cannot stay hidden."""
+        configured = self.cfg.commission_per_lot
         try:
             now = float(self._utc_now()) + 2 * 86400
             deals = self.broker.deals_between(now - 120 * 86400, now) or ()
@@ -746,10 +761,18 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             commission = sum(abs(d.commission) for d in deals if d.symbol == symbol)
             if lots > 0:
                 value = commission / lots
-                log.info("%s: commission detected from history: %.2f per lot round turn", symbol, value)
+                if configured is not None and abs(configured - value) > 0.01:
+                    log.warning("%s: commission_per_lot in the config is %.2f but the deal history shows %.2f per lot; "
+                                "using the history", symbol, configured, value)
+                else:
+                    log.info("%s: commission detected from history: %.2f per lot round turn", symbol, value)
                 return float(value)
         except Exception:  # noqa: BLE001 - fall back below
             log.debug("commission detection failed", exc_info=True)
+        if configured is not None:
+            log.info("%s: no deal history to check commission; using commission_per_lot %.2f from the config", symbol,
+                     configured)
+            return float(configured)
         log.info("%s: no deal history to detect commission; using commission_fallback_per_lot %.2f (pessimistic)",
                  symbol, self.cfg.commission_fallback_per_lot)
         return float(self.cfg.commission_fallback_per_lot)
@@ -796,6 +819,12 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         if acc is None:
             log.warning("account_info() returned nothing: %s", self._last_error())
             return None
+        if not _valid_number(getattr(acc, "equity", None)):
+            log.error("account_info() returned no usable equity (%r): no decisions this cycle", acc.equity)
+            self.notifier.send("Capital desconhecido: sem novas entradas até voltar a ser válido.", key="no-equity")
+            return None
+        if float(acc.equity) <= 0:
+            self.notifier.send(f"Capital {float(acc.equity):.2f}: sem novas entradas até ser positivo.", key="no-equity")
         problem = self._runtime_account_problem(acc)
         if problem:
             log.critical(problem)
@@ -825,6 +854,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         self._weekend_flatten(acc, server_now)
 
         self._timed("symbols", self._process_universe, acc)
+        try:
+            self._timed("children", self._drain_children, acc)
+        except Exception:  # noqa: BLE001 - the open part of the entry keeps its SL/TP
+            log.exception("Sending the remaining slices failed; they are dropped")
+            self._children = []
         self._next_wait = self.cfg.poll_seconds if any_fresh else self.cfg.closed_market_poll_seconds
         self._loop_ms = (time.perf_counter() - loop_started) * 1000.0
         over = self._loop_ms > self.cfg.ops.cycle_budget_ms
@@ -851,6 +885,18 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                 log.exception("%s: error while processing; continuing with other symbols", symbol)
                 self.notifier.send(f"{symbol}: repeated processing error ({type(exc).__name__}); see bot.log",
                                    key=f"error-{symbol}")
+        self._enter_ranked(acc)
+
+    def _enter_ranked(self, acc: Any) -> None:
+        """Simultaneous candidates compete: the best EV per unit of risk goes first, and the
+        portfolio limits decide where the list stops."""
+        pending, self._pending_entries = self._pending_entries, []
+        for symbol, intent, closed, _ev in sorted(pending, key=lambda p: rank_key(p[3])):
+            try:
+                self._enter(symbol, intent, acc, closed)
+            except Exception as exc:  # noqa: BLE001 - one entry must never stop the others
+                log.exception("%s: error while entering; continuing", symbol)
+                self.notifier.send(f"{symbol}: entry error ({type(exc).__name__}); see bot.log", key=f"error-{symbol}")
 
     def _update_capital(self, acc: Any) -> None:
         """Risk capital is re-evaluated every loop: deposits, withdrawals and P&L move it at once."""
@@ -874,6 +920,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                 log.warning(text)
                 self.notifier.send(text, key="floor")
                 self.registry.set_kv("capital_state", self.capital.to_json())
+        self._update_weekly_limit(acc)
 
     def _observe_ticks(self) -> bool:
         stale = self.cfg.stale_tick_minutes * 60
@@ -1043,7 +1090,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                     self.arms.reload()
                     self.arms.refresh(force=True)
                     log.info("Research results loaded: %s", self.arms.counts())
-                if self.scheduler.maybe_launch(weekend=weekend):
+                if self.scheduler.maybe_launch(weekend=weekend, server_now=server_now):
                     self._research_running = True
             except Exception:  # noqa: BLE001 - research must never break trading
                 log.exception("Could not schedule research")
@@ -1068,6 +1115,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                 self.registry.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception:  # noqa: BLE001
                 log.debug("funnel prune failed", exc_info=True)
+        try:
+            self._update_slo(acc)
+            self._learning_housekeeping(acc)
+        except Exception:  # noqa: BLE001 - reports and objectives must never break trading
+            log.exception("First-trade objective or learning report failed")
         self._maybe_calibrate()
         self._tail_checks(acc, positions, server_now)
         self._check_reality_gap()
@@ -1144,7 +1196,9 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                      "mark and profit floor rebased (not counted as profit or loss)", amount)
             self.guard.adjust_for_cash_flow(amount)
             self.capital.apply_cash_flow(amount)
+            self._rebase_week(amount)
             self.registry.set_kv("capital_state", self.capital.to_json())
+            self._next_scan = 0.0   # a deposit may have crossed the feasibility floor
         self.registry.set_kv("cash_flow_seen", json.dumps(sorted(seen)[-500:]))
         self.registry.set_kv("cash_flow_checked", str(now))
 
@@ -1205,6 +1259,13 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             self.arms.update_settings(effective.tiers, effective.research)
         if self.team is not None:
             self.team.update_config(effective)
+        if self.arms is not None and self.cfg.universe.default_arms:
+            created = self.arms.ensure_default_arms(self.universe, self.timeframes(), self.cfg.strategy_names(),
+                                                    self.cfg.universe.max_arms, self.cfg.learning.stop_variants)
+            if created:
+                log.warning("Flow Doctor: %d new arms in shadow", created)
+                if self.scheduler is not None:
+                    self.scheduler.request("*", "new arms from the Flow Doctor", mode="sprint")
 
     def trading_window(self) -> tuple[int, int]:
         return tuple(self.cfg.trading_hours_server)  # type: ignore[return-value]
@@ -1235,7 +1296,9 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             drawdown_frac=self.guard.drawdown_pct(acc.equity) / lim.drawdown_breaker_pct
             if lim.drawdown_breaker_pct else 0.0,
             tier_counts=self.arms.counts(), min_agreement_cfg=self.base_cfg.team.min_agreement,
-            can_add_symbol=self._can_add_symbol(),
+            can_add_symbol=self._can_add_symbol(), slo_missed=self.slo.missed,
+            min_viable_active=self.cfg.sizing.min_viable_enabled, stop_variants_active=self.cfg.learning.stop_variants,
+            can_add_timeframe=any(tf not in self.cfg.universe.timeframes for tf in flow.TIMEFRAME_ORDER),
             relaxations_last_week=int(self.registry.conn.execute(
                 "SELECT COUNT(*) AS n FROM flow_adjustments WHERE direction = 'relax' AND ts >= ?",
                 (now - 7 * 86400,)).fetchone()["n"]))
@@ -1267,6 +1330,12 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         top = funnel_mod.dominant_blocker(status_rep)
         trading = status_rep.get("orders", 0) > 0 or bool(positions)
         self.flow_state.status_text = flow.status_text(self.arms.counts(), top, 6, trading, self._entry_block_reason())
+        if self.slo.missed:
+            done = "; ".join(f"{a.knob} {a.old:g} para {a.new:g}" for a in adjustments if a.direction == "relax")
+            why = funnel_mod.describe(str(top.get("reason"))) if top else "sem sinais a passar"
+            self.flow_state.status_text += (f" Primeiro trade fora do objectivo: bloqueio {why}. "
+                                            + (f"Doutor de Fluxo alterou {done}." if done else
+                                               "Nenhuma alteração passou a validação contrafactual."))
         self.registry.set_kv("flow_state", self.flow_state.to_json())
         if self.team is not None:
             doctor = self.team.agents.get("flow_doctor")
@@ -1283,7 +1352,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                                                 self.cfg.universe.max_arms)
         self.registry.set_kv("universe", json.dumps({"symbols": self.universe, "timeframes": list(self.timeframes())}))
         if self.scheduler is not None:
-            self.scheduler.request(",".join(added), "universe expanded by the Flow Doctor")
+            self.scheduler.request(",".join(added), "universe expanded", mode="sprint")
         log.warning("Universe expanded with %s (%d new arms in shadow)", ", ".join(added), created)
 
     # ------------------------------------------------------- opportunity engine
@@ -1291,10 +1360,10 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
     def _scan_opportunities(self, acc: Any) -> None:
         from .team.agents.market import session_view
 
-        lim = self.risk.limits
         equity = float(acc.equity)
-        tier_risk = {"T1": lim.t1_risk_pct, "T2": lim.t2_risk_pct, "T3": lim.t3_risk_pct}
-        caps = {"T1": lim.explore_trade_pct, "T2": lim.affordability_cap_pct, "T3": lim.affordability_cap_pct}
+        report = self._scan_feasibility(acc)
+        feasible_symbols = {r["symbol"] for r in report["rows"] if r["feasible"]}
+        self._promote_universe(acc, feasible_symbols)
         try:
             open_symbols = {p.symbol for p in self._bot_positions()}
         except RuntimeError:
@@ -1304,29 +1373,40 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             if arm.posterior is not None:
                 best_p[arm.symbol] = max(best_p.get(arm.symbol, 0.0), arm.posterior.p_positive)
         session_open = bool(session_view(self._utc_now())["sessions"])
-        scores, rows = [], []
+        scores = []
         for symbol in self.universe:
             spec = self.specs.get(symbol)
-            if spec is None:
-                continue
-            for tf in self.timeframes():
-                bars = self.market.rates(symbol, tf, 1, 300)
-                atr, spread, vol_ratio = atr_and_spread(bars)
-                rows.extend(affordability_rows(symbol, tf, atr, spec.value_per_price, spec.volume_min,
-                                               self.commission.get(symbol, 0.0), equity, tier_risk, caps))
-                if tf != self.cfg.timeframe:
-                    continue
-                if bars is not None and len(bars) > 20:
-                    self._spread_hourly[symbol] = _hourly_spread(bars)
-                feasible = any(r["feasible"] for r in rows if r["symbol"] == symbol and r["tier"] == "T1")
-                corr = self._max_correlation(symbol, open_symbols - {symbol}) if open_symbols else 0.0
-                scores.append(score_symbol(symbol, spread, atr, spec.point, vol_ratio, session_open, feasible, corr,
-                                           best_p.get(symbol)))
+            if spec is None or symbol not in feasible_symbols:
+                continue    # the scanner ranks only what the balance can trade
+            bars = self.market.rates(symbol, self.cfg.timeframe, 1, 300)
+            atr, spread, vol_ratio = atr_and_spread(bars)
+            if bars is not None and len(bars) > 20:
+                self._spread_hourly[symbol] = _hourly_spread(bars)
+            corr = self._max_correlation(symbol, open_symbols - {symbol}) if open_symbols else 0.0
+            scores.append(score_symbol(symbol, spread, atr, spec.point, vol_ratio, session_open, True, corr,
+                                       best_p.get(symbol)))
         self.opportunity = [s.to_dict() for s in rank(scores)]
-        self.affordability = rows
+        self.affordability = report["rows"]
         self.registry.set_kv("opportunity", json.dumps({"ts": self._utc_now(), "scores": self.opportunity}))
-        self.registry.set_kv("affordability", json.dumps({"ts": self._utc_now(), "equity": equity, "rows": rows},
-                                                         default=str))
+        self.registry.set_kv("affordability", json.dumps({"ts": self._utc_now(), "equity": equity,
+                                                          "rows": report["rows"]}, default=str))
+        self.registry.set_kv("feasibility", json.dumps({k: v for k, v in report.items() if k != "rows"}, default=str))
+
+    def _any_stop_feasible(self, symbol: str, atr: Optional[float], acc: Any) -> bool:
+        if not atr or atr <= 0:
+            return True     # no data yet is not evidence against the symbol
+        rules = self._feasibility_rules(acc)
+        for mult in fz.STOP_ATR_MULTS:
+            cand = self._candidate(symbol, self.cfg.timeframe, f"atr_{mult:g}", atr * mult, "BUY", acc)
+            if cand is None or fz.evaluate(cand, float(acc.equity), rules).feasible:
+                return True
+        return False
+
+    def _promote_universe(self, acc: Any, feasible_symbols: set[str]) -> None:
+        """A symbol that just became feasible (a deposit, a price move) joins without a restart."""
+        waiting = (self._universe_skipped & feasible_symbols) - set(self.universe)
+        if waiting:
+            self._expand_universe(acc)
 
     def _max_correlation(self, symbol: str, others: set[str]) -> float:
         mine = self._closes.get(symbol)
@@ -1384,6 +1464,13 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             "exploration": self._exploration_room(acc, server_now).to_dict(),
             "tiers": self.arms.counts() if self.arms else {},
             "status_line": self.status_line(),
+            "banner": self.banner_info,
+            "shared_assets": self.shared.summary() if self.shared is not None else {},
+            "slo": self.slo.snapshot(self.cfg.slo.first_trade_hours),
+            "risk_view": self.risk_view,
+            "account_mode": self.cfg.account_mode,
+            "started_utc": self._started_utc,
+            "feasibility": {k: v for k, v in self.feasibility.items() if k != "rows"},
             "mode": self._mode_chip(),
             "flow": {"knobs": self.flow_state.knobs, "active": [flow.adjustment_row(a) for a in self.flow_active]},
             "quarantined": {sym: round((until - self._monotonic()) / 60.0, 1)
@@ -1622,6 +1709,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             self._team_observe(symbol, acc, closed)
         self._manage_positions(symbol, tf, acc, closed)
         self._exits(symbol, tf, closed)
+        signals = self._feasible_signals(symbol, tf, signals, acc, bar_time)
         for sig in signals:
             post = sig.arm.posterior
             self._record("signal", "info", "SIGNAL", symbol, tf, arm_id=sig.arm.id, bar_time=bar_time,
@@ -1643,7 +1731,25 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         sig = intent.signal
         log.info("%s %s: %s signal from %s [%s%s] on bar %s (ATR %.6f)", symbol, tf, sig.side, intent.description,
                  intent.tier, " exploration" if intent.exploration else "", fmt_server_time(bar_time), sig.atr)
-        self._enter(symbol, intent, acc, closed)
+        self._pending_entries.append((symbol, intent, closed, intent.ev_r))
+
+    def _feasible_signals(self, symbol: str, tf: str, signals: list[ArmSignal], acc: Any,
+                          bar_time: int) -> list[ArmSignal]:
+        """Signals the minimum lot can carry. The rest leave here, with a reason, as scan information:
+        their shadow books already took them, so the learning continues."""
+        out = []
+        for sig in signals:
+            try:
+                why = self._signal_skip(symbol, tf, sig, acc)
+            except Exception:  # noqa: BLE001 - a filter only: sizing and the risk layer still judge the entry
+                log.exception("%s: feasibility check failed; the signal continues to the risk layer", symbol)
+                why = None
+            if why is None:
+                out.append(sig)
+            else:
+                self._record("scan", "info", "INFEASIBLE_SKIP", symbol, tf, arm_id=sig.arm.id, bar_time=bar_time,
+                             values={"reason": why, "strategy": sig.arm.strategy, "tier": sig.arm.tier})
+        return out
 
     def _exits(self, symbol: str, tf: str, closed: np.ndarray) -> None:
         if not self.cfg.close_on_opposite:
@@ -1687,11 +1793,14 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             if spec is None:
                 return None
             tier = "T1" if sig.arm.tier == "T0" else sig.arm.tier
-            cap = lim.explore_trade_pct if tier == "T1" else lim.affordability_cap_pct
             stop = sig.signal.atr * (sig.signal.sl_mult or 2.0)
             a = affordability(symbol, tf, stop, spec.value_per_price, spec.volume_min,
-                              self.commission.get(symbol, 0.0), equity, lim.tier_risk_pct(tier), cap)
+                              self.commission.get(symbol, 0.0), equity, lim.tier_risk_pct(tier),
+                              lim.min_viable_cap_pct)
             return None if a.feasible else a.reason
+
+        def expected(sig: ArmSignal, view: Any) -> Optional[EvEstimate]:
+            return self._expected_value(symbol, tf, sig, view, spec, closed)
 
         regime = self._regime(symbol)
 
@@ -1712,7 +1821,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         inp = AllocationInputs(symbol, tf, signals, busy, exploring, t.exploration_slots, t.exploration_enabled,
                                t.exploration_threshold, affordable, ineligible, bar_regime,
                                lambda sig: self.arms.regime_view(sig.arm, bar_regime or ""),
-                               self.cfg.team.regime_min_trades)
+                               self.cfg.team.regime_min_trades, expected)
 
         def record(stage: str, outcome: str, reason: str, **kwargs: Any) -> None:
             self._record(stage, outcome, reason, symbol, tf, **kwargs)
@@ -1721,6 +1830,28 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         if intent is not None and not self.cfg.management.policies_enabled and intent.policy != "fixed":
             intent = replace(intent, policy="fixed")
         return intent
+
+    def _expected_value(self, symbol: str, tf: str, sig: ArmSignal, view: Any, spec: Optional[SymbolSpec],
+                        closed: Optional[np.ndarray] = None) -> Optional[EvEstimate]:
+        """EV of this signal now: the arm's evidence, this regime and today's spread above the usual."""
+        post = sig.arm.posterior
+        if post is None or spec is None:
+            return None
+        sl, tp = sig.signal.sl_mult or 2.0, sig.signal.tp_mult or 3.0
+        mean = view.mean if view is not None else post.mean
+        extra = 0.0
+        tick = self.market.tick(symbol)
+        typical = (self._spread_hourly.get(symbol) or {}).get(int((self.clock.now() % 86400) // 3600))
+        if tick is not None and typical and spec.point > 0:
+            stop_points = sig.signal.atr * sl / spec.point
+            spread = (float(tick.ask) - float(tick.bid)) / spec.point
+            extra = max(spread - typical, 0.0) / stop_points if stop_points > 0 else 0.0
+        ev = ev_estimate(mean, tp / sl, self.arms.outcomes(sig.arm), post.shrinkage, extra)
+        if closed is None or not self.arms.feature_table:
+            return ev
+        side = 1 if sig.signal.side == "BUY" else -1
+        tagged = feature_lib.signal_features(closed, len(closed) - 1, side, sig.signal.atr, sl, spec.point)
+        return replace(ev, ev_r=ev.ev_r + feature_lib.adjustment(tagged, self.arms.feature_table))
 
     def _team_observe(self, symbol: str, acc: Any, closed: np.ndarray) -> None:
         """New bar: let the team scan the market and manage open positions. Never raises."""
@@ -1775,7 +1906,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         rows = self.registry.trades(mode="live", tier="T1", closed_since=week_start_utc)
         day_eq, week_eq = self._budget_refs(acc, server_now)
         lim = self.risk.limits
-        return exploration_room(rows, server_now, offset, day_eq, week_eq, lim.explore_day_pct, lim.explore_week_pct)
+        # One exploration trade costs the larger of the typical minimum lot and the T1 risk.
+        trade_risk = max(self._typical_risk or 0.0, max(float(acc.equity), 0.0) * lim.t1_risk_pct / 100.0)
+        return exploration_room(rows, server_now, offset, day_eq, week_eq, lim.explore_day_pct, lim.explore_week_pct,
+                                lim.explore_trades_day, lim.explore_trades_week, trade_risk, lim.daily_loss_pct,
+                                lim.weekly_loss_pct)
 
     def size(self, symbol: str, intent: EntryIntent, acc: Any) -> SizingDecision:
         """The sizer's verdict for one proposal (the minimum of every constraint)."""
@@ -1799,11 +1934,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         return size_risk(inp, self.risk.limits, self.capital)
 
     def _exception_cap(self, intent: EntryIntent, sizing: Mapping[str, Any]) -> float:
-        """Largest minimum-lot risk accepted as a conscious exception for this tier."""
+        """Largest minimum-lot risk accepted for this entry: the profile's minimum-viable cap, shrunk
+        by the drawdown ladder (after losses it can only fall) and bounded by every room that is left."""
         lim = self.risk.limits
-        room = [float(v) for k, v in sizing.items() if k in ("floor_room", "portfolio_heat", "exploration_budget",
-                                                             "anti_martingale")]
-        base = lim.explore_trade_pct if intent.tier == "T1" else lim.affordability_cap_pct
+        room = [float(v) for k, v in sizing.items() if k in ("floor_room", "portfolio_heat", "exploration_budget")]
+        base = lim.min_viable_cap_pct * min(self.ladder.multiplier, 1.0) * min(self._stress_factor, 1.0)
         return min([base, limits.MAX_RISK_PER_TRADE_PCT] + room)
 
     def _enter(self, symbol: str, intent: EntryIntent, acc: Any, closed: np.ndarray) -> None:
@@ -2011,12 +2146,13 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             risk_pct, sizing = decision.risk_pct, dict(decision.constraints, binding=decision.binding)
         exception_cap = self._exception_cap(intent, sizing)
         gap_points = self._gap_points(symbol, tf, price, spec)
+        capacity = self._capacity(symbol, spec, sig.side, price, acc)
+        volume_cap = self._volume_cap(symbol, spec, sig.side, price, acc, capacity)
 
         def plan_for(r: float) -> Any:
             return plan_trade(sig.side, sig.atr, sig.sl_mult or 2.0, sig.tp_mult or 3.0, price, spread_points, spec,
                               equity, r, self.commission.get(symbol, 0.0), self.cfg.deviation_points + gap_points,
-                              self._loss_per_lot_fn(symbol), min_lot_cap_pct=exception_cap,
-                              max_volume=spec.volume_max * limits.MAX_SPLIT_ORDERS)
+                              self._loss_per_lot_fn(symbol), min_lot_cap_pct=exception_cap, max_volume=volume_cap)
 
         base = plan_for(risk_pct)
         result = base if multiplier >= 1.0 else plan_for(risk_pct * multiplier)
@@ -2030,15 +2166,31 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             return note(f"no trade: {reason}", allowed=False, base_volume=base_volume, code=code)
         plan = result.plan
         refused = self._cost_gate(symbol, intent, plan, spread_points, spec, info)
+        if refused is not None and intent.tier in ("T2", "T3") and not plan.exception:
+            # Size grows only through the scaling gates; an arm that fails them keeps its entry size.
+            lower = plan_for(min(risk_pct * multiplier, self.risk.limits.t1_risk_pct))
+            if lower.plan is not None and self._cost_gate(symbol, intent, lower.plan, spread_points, spec, info,
+                                                          entry=True) is None:
+                plan, refused = lower.plan, None
+                if not preview:
+                    self._record("risk", "info", "SCALING_GATE_FALLBACK", symbol, tf, arm_id=intent.arm_id,
+                                 bar_time=intent.bar_time, values={"volume": plan.volume, "tier": intent.tier})
         if refused is not None:
             return note(refused, allowed=False, base_volume=base_volume, code="COST_TO_EDGE")
+        if plan.exception:
+            held_to = None if intent.arm_id is None else anti_martingale_money(
+                self.registry.trades(mode="live", arm_id=intent.arm_id, limit=20))
+            if held_to is not None and plan.planned_risk > held_to * (1 + 1e-9):
+                return note(f"no trade: {plan.planned_risk:.2f} at the minimum lot exceeds the {held_to:.2f} this arm "
+                            "lost last (size increases after a loss are forbidden)", allowed=False,
+                            base_volume=base_volume, code="ANTI_MARTINGALE")
         if plan.exception and not preview:
-            self._record("affordability", "info", "MIN_LOT_EXCEPTION", symbol, tf, arm_id=intent.arm_id,
+            self._record("affordability", "info", "MIN_VIABLE_SIZE", symbol, tf, arm_id=intent.arm_id,
                          bar_time=intent.bar_time, values={"min_lot_risk_pct": round(plan.risk_pct, 4),
                                                            "tier_risk_pct": round(risk_pct * multiplier, 4),
                                                            "cap_pct": round(exception_cap, 4)})
-            log.info("%s: minimum lot accepted as a conscious exception: it risks %.3f%% (tier %.3f%%, cap %.3f%%)",
-                     symbol, plan.risk_pct, risk_pct * multiplier, exception_cap)
+            log.info("%s: MIN_VIABLE_SIZE: the minimum lot risks %.3f%% (tier %.3f%%, cap %.3f%%)", symbol,
+                     plan.risk_pct, risk_pct * multiplier, exception_cap)
         positions = self._bot_positions()
         news = None
         if self.cfg.news_filter_enabled:
@@ -2053,7 +2205,7 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
             halted_reason=self._entry_block_reason(), news_blocked=news,
             slippage_paused=self._slippage_pause.get(symbol, 0) > self._monotonic(),
             allowed_risk_pct=risk_pct * multiplier, spread_limit_points=spread_cap, spread_limit_reason=spread_why,
-            exception_cap_pct=exception_cap,
+            exception_cap_pct=exception_cap, min_lot=plan.volume <= spec.volume_min + 1e-12,
         )
         if ctx.notional_money is None:
             return note("cannot compute exposure (order_calc_margin unavailable); skipping (fail closed)",
@@ -2071,18 +2223,29 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         if preview:
             return EntryOutcome(True, "ok", volume=plan.volume, base_volume=base_volume, risk_pct=plan.risk_pct)
         filling = select_filling(info.filling_mode)
-        parts = split_volume(plan.volume, spec.volume_max, spec.volume_step, spec.volume_min) \
-            if plan.volume > spec.volume_max else [plan.volume]
+        parts = [plan.volume]
+        if plan.volume > capacity.child_lots:
+            parts, _left = fz.plan_slices(plan.volume, capacity.lots, spec.volume_min, capacity.child_lots,
+                                          spec.volume_step, self.cfg.capacity.max_child_orders)
         if not parts:
             return note("no trade: the planned volume cannot be split into valid orders", allowed=False,
                         code="SIZE_ZERO")
         group = None
         if len(parts) > 1:
             group = oc.client_id("group", symbol, tf, intent.bar_time, intent.arm_id, sig.side)
+            self._record("execution", "info", "CAPACITY_SLICED", symbol, tf, arm_id=intent.arm_id,
+                         bar_time=intent.bar_time, values={"parts": len(parts), "volume": plan.volume,
+                                                           "binding": capacity.binding})
+        interval = self.cfg.capacity.child_interval_seconds
         opened: list[EntryOutcome] = []
         for index, part in enumerate(parts):
-            outcome = self._send_entry(symbol, intent, replace(plan, volume=part), info, tick, filling, multiplier,
-                                       dossier_id, base_volume, group, index, len(parts))
+            child = replace(plan, volume=part)
+            if index > 0 and interval > 0 and not self.cfg.dry_run:
+                self._children.append(ChildOrder(symbol, intent, child, multiplier, dossier_id, base_volume, group,
+                                                 index, len(parts), self._monotonic() + interval * index))
+                continue
+            outcome = self._send_entry(symbol, intent, child, info, tick, filling, multiplier, dossier_id, base_volume,
+                                       group, index, len(parts))
             self._note_execution(symbol, outcome)
             if not outcome.ok:
                 if not opened:
@@ -2117,6 +2280,11 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
                     log.warning("%s %s: no history returned (%s). Raise Tools > Options > Charts > Max bars in chart.",
                                 symbol, tf, self._last_error())
                     continue
+                if self.shared is not None:
+                    self.shared.store_bars(symbol, tf, rates)
+                    older = self.shared.load_bars(symbol, tf)
+                    if older is not None and older.dtype == rates.dtype and len(older) > len(rates):
+                        rates = older   # another account already downloaded further back
                 self.registry.store_bars(symbol, tf, rates)
                 ok_any = True
                 if len(rates) < count * 0.5:
@@ -2131,6 +2299,10 @@ class Bot(OversightMixin, GatesMixin, OrdersMixin):
         if acc is not None:
             self.registry.set_kv("equity", str(float(acc.equity)))
         return ok_any
+
+
+def _valid_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _hourly_spread(bars: np.ndarray) -> dict[int, float]:

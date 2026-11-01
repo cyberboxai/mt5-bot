@@ -160,7 +160,8 @@ class BotGateway:
                 tick_utc = float(self.bot._utc_now())
                 sessions = session_view(tick_utc)["sessions"]
                 payload = OrderExecuted(self.intent.signal.side, out.volume, out.price, out.sl, out.tp,
-                                        out.slippage_points, out.dry_run, sessions[0] if sessions else "off")
+                                        out.slippage_points, out.dry_run, sessions[0] if sessions else "off",
+                                        self.bot.first_trade_today())
                 team.bus.publish(payload, agent="execution_trader", symbol=self.symbol, correlation_id=dossier_id,
                                  severity="notice")
             else:

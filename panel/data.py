@@ -202,6 +202,10 @@ class PanelData:
             "limits": health.get("limits") or {}, "universe": health.get("universe") or [],
             "timeframes": health.get("timeframes") or [], "daily_loss_pct": health.get("daily_loss_pct"),
             "pnl_today": self._pnl_today(health),
+            "account_mode": health.get("account_mode"), "banner": health.get("banner") or {},
+            "started_utc": health.get("started_utc"), "slo": health.get("slo") or {},
+            "feasibility": health.get("feasibility") or {}, "risk_view": health.get("risk_view") or {},
+            "shared_assets": health.get("shared_assets") or {}, "research": health.get("research") or {},
             "team": {k: team.get(k) for k in ("configured_mode", "effective_mode", "mode_reason", "guardian_freeze",
                                                "benched_performance", "benched_errors")},
             "advisor": {"state": advisor.get("state", "DISABLED"), "reason": advisor.get("reason", ""),
@@ -611,6 +615,45 @@ class PanelData:
             out["hypotheses"] = office.hypotheses(limit=30) if office is not None else []
         return out
 
+    def learning(self) -> dict[str, Any]:
+        """Learning dashboard: evidence growth, posterior intervals over time, drift, model versions."""
+        from mt5bot.learning import evidence_summary, list_models
+
+        health, _ = self.health()
+        now = self.now(health)
+        out: dict[str, Any] = {"week": [], "history": {}, "drift": [], "models": [], "movers": [],
+                               "half_life_days": self.cfg.learning.half_life_days}
+        with self.registry() as reg:
+            if reg is None:
+                return out
+            try:
+                out["week"] = evidence_summary(reg, now - 7 * DAY)[:60]
+                names = {int(r["id"]): (r["symbol"], r["timeframe"], r["strategy"]) for r in reg.execute(
+                    "SELECT id, symbol, timeframe, strategy FROM arms")}
+                for item in out["week"]:
+                    item["arm"] = " ".join(names.get(item["arm_id"], ("?",)))
+                rows = reg.execute("SELECT ts, arm_id, mean, lo, hi, p, n_obs, live_n, tier FROM learning_points WHERE "
+                                   "ts >= ? ORDER BY ts", (now - 30 * DAY,)).fetchall()
+                first: dict[int, Any] = {}
+                last: dict[int, Any] = {}
+                for r in rows:
+                    first.setdefault(int(r["arm_id"]), r)
+                    last[int(r["arm_id"])] = r
+                    out["history"].setdefault(str(r["arm_id"]), []).append(
+                        {"ts": r["ts"], "mean": _f(r["mean"], 4), "lo": _f(r["lo"], 4), "hi": _f(r["hi"], 4)})
+                out["history"] = dict(list(out["history"].items())[:8])
+                movers = [{"arm": " ".join(names.get(k, ("?",))), "from": first[k]["tier"], "to": last[k]["tier"],
+                           "mean_from": _f(first[k]["mean"], 3), "mean_to": _f(last[k]["mean"], 3)}
+                          for k in last if first[k]["tier"] != last[k]["tier"]]
+                out["movers"] = movers[:20]
+                out["drift"] = [dict(r) for r in reg.execute("SELECT ts, arm_id, scope, detail FROM drift_events ORDER BY"
+                                                             " id DESC LIMIT 20")]
+                out["models"] = [{"id": m.id, "ts": m.ts, "kind": m.kind, "data": m.data_ref, "code": m.code_ref[:12],
+                                  "arms": m.arms} for m in list_models(reg, 15)]
+            except sqlite3.OperationalError:
+                pass
+        return out
+
     def funnel(self, hours: float = 24.0) -> dict[str, Any]:
         """"Porque nao estou a negociar?": the decision funnel, top blockers and what each filter is worth."""
         health, _ = self.health()
@@ -619,7 +662,9 @@ class PanelData:
                                "mode": health.get("mode"), "tiers": health.get("tiers") or {},
                                "exploration": health.get("exploration") or {}, "capital": health.get("capital") or {},
                                "entry_block": health.get("entry_block"),
-                               "trading_hours_server": health.get("trading_hours_server")}
+                               "trading_hours_server": health.get("trading_hours_server"),
+                               "feasibility": health.get("feasibility") or {}, "slo": health.get("slo") or {},
+                               "currency": health.get("currency") or ""}
         with self.registry() as reg:
             if reg is None:
                 out["report"] = {"available": False}
@@ -642,6 +687,9 @@ class PanelData:
             out["flow"] = self._flow(reg)
             raw = self._kv(reg, "affordability")
             out["affordability"] = json.loads(raw) if raw else {"rows": []}
+            blockers = out["report"].get("top_blockers") or []
+            relaxed = [a for a in out["flow"].get("adjustments") or [] if a.get("direction") == "relax"]
+            out["why"] = {"top": blockers[0] if blockers else None, "action": relaxed[0] if relaxed else None}
         rep = out["report"]
         stages = []
         if rep.get("available"):
@@ -677,7 +725,8 @@ class PanelData:
         health, _ = self.health()
         equity = float(health.get("equity") or 0.0)
         out: dict[str, Any] = {"equity": health.get("equity"), "drawdown_pct": health.get("drawdown_pct"),
-                               "halted": health.get("halted"), "entry_block": health.get("entry_block")}
+                               "halted": health.get("halted"), "entry_block": health.get("entry_block"),
+                               "risk_view": health.get("risk_view") or {}}
         with self.registry() as reg:
             open_rows = [dict(r) for r in reg.execute("SELECT symbol, side, volume, entry, sl, tp, risk_money FROM trades "
                                                       "WHERE mode = 'live' AND status = 'open'")] if reg else []

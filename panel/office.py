@@ -56,7 +56,14 @@ def event_effects(event: Mapping[str, Any], advisor_state: str = "DISABLED") -> 
     elif topic == "order.executed":
         out.append({"agent": "execution_trader", "visual": "ticket",
                     "bubble": f"{payload.get('side', '')} {payload.get('volume', '')} lotes com SL/TP"})
-        out.append({"agent": "cio", "visual": "ticket"})
+        out.append({"agent": "cio", "visual": "celebrating" if payload.get("first_today") else "ticket",
+                    **({"bubble": "Primeiro trade do dia!"} if payload.get("first_today") else {})})
+        if payload.get("first_today"):
+            out.append({"agent": "execution_trader", "visual": "celebrating"})
+    elif topic == "arm.tier":
+        rising = str(payload.get("new", "T0")) > str(payload.get("old", "T0"))
+        out.append({"agent": "quant_researcher", "visual": "celebrating" if rising else "reading",
+                    "bubble": f"Braço {payload.get('old', '')} para {payload.get('new', '')}"})
     elif topic == "trade.closed" and payload.get("mode") == "live":
         win = bool(payload.get("win"))
         text = f"{'Ganho' if win else 'Perda'} {float(payload.get('r') or 0):+.2f}R"

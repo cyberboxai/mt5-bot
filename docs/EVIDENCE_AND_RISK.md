@@ -15,7 +15,7 @@ Um **braço** é uma combinação concreta: estratégia + parâmetros + símbolo
 livro em sombra (trades em papel, nunca enviados), a sua evidência e o seu nível.
 
 * No arranque o bot cria um braço com os parâmetros por omissão para cada estratégia, em cada
-  símbolo e período do universo (até `universe.max_arms`, 400).
+  símbolo e período do universo (até `universe.max_arms`, 1400).
 * A investigação walk-forward (`--research-once`, ou sozinha em segundo plano) acrescenta
   braços com os melhores parâmetros fora da amostra e dá-lhes uma expectativa inicial.
 * Uma posição aberta fica sempre com o braço que a abriu: as regras de saída e a política de
@@ -170,7 +170,7 @@ risco permitido:
 * **não cabe, mas o risco do lote mínimo fica abaixo do tecto de excepção** (o orçamento de
   exploração em T1; `capital.affordability_cap_pct`, igual ao risco T3 do perfil, em T2/T3):
   aceita o lote mínimo como **excepção consciente**, registada no funil
-  (`MIN_LOT_EXCEPTION`) e no trade;
+  (`MIN_VIABLE_SIZE`) e no trade;
 * **não cabe:** não negoceia esse símbolo nesse período (`MIN_LOT_EXCEEDS_RISK`) e o mapa de
   viabilidade do painel diz o capital mínimo necessário.
 

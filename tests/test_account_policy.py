@@ -1,4 +1,4 @@
-"""Account policy: any / demo_only / real_only, the one-time real-money confirmation,
+"""Account policy: real / demo / auto, the one-time real-money confirmation,
 real-account risk defaults and per-account state separation."""
 
 from __future__ import annotations
@@ -22,14 +22,14 @@ def make_real(fake: FakeMT5) -> None:
 
 
 @pytest.mark.parametrize("mode,is_real,confirmed,allowed", [
-    ("any", False, False, True),
-    ("any", True, False, False),
-    ("any", True, True, True),
-    ("demo_only", False, False, True),
-    ("demo_only", True, True, False),
-    ("real_only", True, True, True),
-    ("real_only", True, False, False),
-    ("real_only", False, True, False),
+    ("auto", False, False, True),
+    ("auto", True, False, False),
+    ("auto", True, True, True),
+    ("demo", False, False, True),
+    ("demo", True, True, False),
+    ("real", True, True, True),
+    ("real", True, False, False),
+    ("real", False, True, False),
 ])
 def test_policy_matrix(mode: str, is_real: bool, confirmed: bool, allowed: bool) -> None:
     assert (account_policy_problem(mode, is_real, confirmed) is None) is allowed
@@ -62,7 +62,7 @@ def test_real_with_config_confirmation_runs(make_bot, fake_mt5: FakeMT5) -> None
     assert bot.is_real
 
 
-@pytest.mark.parametrize("mode,real", [("demo_only", True), ("real_only", False)])
+@pytest.mark.parametrize("mode,real", [("demo", True), ("real", False)])
 def test_wrong_account_type_is_refused(make_bot, fake_mt5: FakeMT5, mode: str, real: bool) -> None:
     if real:
         make_real(fake_mt5)
@@ -88,7 +88,7 @@ def test_main_exits_3_for_unconfirmed_real_account(tmp_path: Path, monkeypatch: 
         assert cli.main(["--config", str(cfg_path)]) == botmod.EXIT_SAFETY_STOP
     finally:
         _close_logs()
-    assert "REAL MONEY" in (tmp_path / "bot.log").read_text(encoding="utf-8")
+    assert "conta REAL" in (tmp_path / "bot.log").read_text(encoding="utf-8")
 
 
 def test_main_with_confirmation_runs_until_kill_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

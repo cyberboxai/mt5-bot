@@ -20,10 +20,15 @@ The exploration budget is the visible price of information: the net realised los
 trades in the current server day and week, plus the risk still open on T1 trades, plus the
 new trade's risk, must fit inside the daily and the weekly budgets. When it is spent T1
 pauses until the next window.
+
+A percent budget alone cannot pay for one trade on a small account, because lots are
+discrete. So the budget is ``max(pct x equity, n_trades x one trade's risk)``, bounded by the
+daily loss limit and the weekly soft limit, and it is also reported in trades left.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Sequence
@@ -51,10 +56,16 @@ class TierSettings:
     t3_min_trades: int = 100
     t3_max_dd_r: float = 12.0
     promote_cooldown_hours: float = 4.0
+    t1_min_mean: float = 0.0
 
     @classmethod
-    def from_config(cls, tiers: Any, t1_enter_override: Optional[float] = None) -> "TierSettings":
+    def from_config(cls, tiers: Any, t1_enter_override: Optional[float] = None,
+                    entry_gates: Any = None) -> "TierSettings":
         values = {f: getattr(tiers, f) for f in cls.__dataclass_fields__ if hasattr(tiers, f)}
+        if entry_gates is not None:
+            # T1 is where the entry gates live: what they say is what admits an arm to it.
+            values.update(t1_min_evidence=entry_gates.min_oos_trades, t1_min_mean=entry_gates.min_mean_r)
+            t1_enter_override = entry_gates.min_p if t1_enter_override is None else t1_enter_override
         if t1_enter_override is not None:
             values["t1_enter_p"] = t1_enter_override
             values["t1_exit_p"] = max(0.50, min(values.get("t1_exit_p", cls.t1_exit_p), t1_enter_override - 0.02))
@@ -100,7 +111,8 @@ def decide_tier(current: str, post: Posterior, settings: TierSettings, now: floa
     if last_change is not None and now - last_change < settings.promote_cooldown_hours * 3600:
         return TierDecision(current, current, "promotion cooldown")
     evidence = post.n_obs + post.n_prior
-    if current == "T0" and p >= settings.t1_enter_p and evidence >= settings.t1_min_evidence:
+    if current == "T0" and p >= settings.t1_enter_p and evidence >= settings.t1_min_evidence \
+            and post.mean > settings.t1_min_mean:
         source = f"{post.n_prior} walk-forward + {post.n_obs} observed trades"
         return TierDecision("T1", current, f"promote: P(E>0) {p:.2f} >= {settings.t1_enter_p:.2f} from {source}; "
                                            f"{detail}")
@@ -120,10 +132,12 @@ def decide_tier(current: str, post: Posterior, settings: TierSettings, now: floa
 
 def thompson_select(post: Posterior, rng: np.random.Generator, threshold: float = 0.0) -> tuple[bool, float]:
     """Exploration choice for one signal: draw the arm's expectancy from its posterior and
-    explore when the draw clears ``threshold``. Uncertain arms with plausible upside win more
-    often; arms the evidence has turned against are drawn below zero almost always."""
+    explore when the draw is positive. ``threshold`` bounds the arm's posterior MEAN after costs:
+    an arm the evidence has already turned against never explores, however uncertain it is."""
+    if post.mean < threshold:
+        return False, post.mean
     draw = post.thompson(rng)
-    return draw > threshold, draw
+    return draw > 0.0, draw
 
 
 def server_day_start(server_ts: float) -> float:
@@ -143,10 +157,24 @@ class BudgetRoom:
     day_used: float
     week_used: float
     open_risk: float
+    trade_risk: float = 0.0     # the money one exploration trade typically risks
 
     @property
     def room(self) -> float:
         return max(0.0, min(self.day_budget - self.day_used, self.week_budget - self.week_used) - self.open_risk)
+
+    def _trades(self, left: float) -> Optional[int]:
+        if self.trade_risk <= 0:
+            return None
+        return int(math.floor(max(left, 0.0) / self.trade_risk + 1e-9))
+
+    @property
+    def trades_left_day(self) -> Optional[int]:
+        return self._trades(self.day_budget - self.day_used - self.open_risk)
+
+    @property
+    def trades_left_week(self) -> Optional[int]:
+        return self._trades(self.week_budget - self.week_used - self.open_risk)
 
     @property
     def day_fraction(self) -> float:
@@ -163,15 +191,20 @@ class BudgetRoom:
         return {"day_budget": round(self.day_budget, 2), "week_budget": round(self.week_budget, 2),
                 "day_used": round(self.day_used, 2), "week_used": round(self.week_used, 2),
                 "open_risk": round(self.open_risk, 2), "room": round(self.room, 2),
+                "trade_risk": round(self.trade_risk, 4), "trades_left_day": self.trades_left_day,
+                "trades_left_week": self.trades_left_week,
                 "day_fraction": round(self.day_fraction, 4), "week_fraction": round(self.week_fraction, 4)}
 
 
 def exploration_room(t1_trades: Iterable[Any], server_now: float, server_offset: float, day_equity: float,
-                     week_equity: float, day_pct: float, week_pct: float) -> BudgetRoom:
+                     week_equity: float, day_pct: float, week_pct: float, trades_day: int = 0, trades_week: int = 0,
+                     trade_risk: float = 0.0, day_limit_pct: Optional[float] = None,
+                     week_limit_pct: Optional[float] = None) -> BudgetRoom:
     """Budget left for T1 risk. ``t1_trades`` are live journal rows (TradeRow-like) with tier T1.
 
     Net realised P&L counts (a winning T1 trade gives room back, never more than the budget);
-    open T1 trades count with the full money at stake to their stop."""
+    open T1 trades count with the full money at stake to their stop. The trade-count part never
+    takes a budget past ``day_limit_pct`` or ``week_limit_pct`` of the reference equity."""
     day_start = server_day_start(server_now) - server_offset
     week_start = server_week_start(server_now) - server_offset
     day_net = week_net = open_risk = 0.0
@@ -185,9 +218,15 @@ def exploration_room(t1_trades: Iterable[Any], server_now: float, server_offset:
             week_net += pnl
             if closed >= day_start:
                 day_net += pnl
-    day_budget = max(day_equity, 0.0) * day_pct / 100.0
-    week_budget = max(week_equity, 0.0) * week_pct / 100.0
-    return BudgetRoom(day_budget, week_budget, max(0.0, -day_net), max(0.0, -week_net), open_risk)
+    day_ref, week_ref = max(day_equity, 0.0), max(week_equity, 0.0)
+    trade_risk = max(float(trade_risk), 0.0)
+    day_budget = max(day_ref * day_pct / 100.0, trades_day * trade_risk)
+    week_budget = max(week_ref * week_pct / 100.0, trades_week * trade_risk)
+    if day_limit_pct is not None:
+        day_budget = min(day_budget, day_ref * day_limit_pct / 100.0)
+    if week_limit_pct is not None:
+        week_budget = min(week_budget, week_ref * week_limit_pct / 100.0)
+    return BudgetRoom(day_budget, week_budget, max(0.0, -day_net), max(0.0, -week_net), open_risk, trade_risk)
 
 
 def tier_counts(tiers: Sequence[str]) -> dict[str, int]:

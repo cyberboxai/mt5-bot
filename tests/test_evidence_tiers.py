@@ -158,8 +158,8 @@ class TestExplorationBudget:
         rng = np.random.default_rng(3)
         hopeful = Posterior(-0.02, 0.10, 0.42, -0.2, 0.15, 1.0, -0.03, 0.08, 0, 0, 0.0, 0.0, 1.1)
         refuted = Posterior(-0.30, 0.03, 0.0, -0.35, -0.25, 0.2, -0.03, 0.08, 300, 0, 300.0, -0.3, 1.1)
-        picks_h = sum(thompson_select(hopeful, rng)[0] for _ in range(2000))
-        picks_r = sum(thompson_select(refuted, rng)[0] for _ in range(2000))
+        picks_h = sum(thompson_select(hopeful, rng, -0.02)[0] for _ in range(2000))
+        picks_r = sum(thompson_select(refuted, rng, -0.02)[0] for _ in range(2000))
         assert 500 < picks_h < 1100 and picks_r == 0
 
 

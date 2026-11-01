@@ -207,7 +207,7 @@ class TestHotReload:
         path = tmp_path / "config.json"
         base = {"state_root": str(tmp_path / "state"), "health_file": str(tmp_path / "health.json"),
                 "kill_switch_file": str(tmp_path / "KILL"), "log_file": str(tmp_path / "bot.log"),
-                "reports_dir": str(tmp_path / "reports"), "trading_hours_server": [0, 24]}
+                "reports_dir": str(tmp_path / "reports"), "trading_hours_server": [0, 24], "account_mode": "auto"}
         base.update(cfg)
         path.write_text(json.dumps(base))
         bot = make_bot(cfg=Config.load(path))
@@ -399,7 +399,7 @@ class TestScheduler:
         assert sched.maybe_launch(weekend=False) == "cold start: no research results yet"
         args, kw = launched[0]
         assert "--research-once" in args and "--offline" in args and "--state-dir" in args
-        assert args[args.index("--research-mode") + 1] == "startup"
+        assert args[args.index("--research-mode") + 1] == "sprint"
         reg.close()
 
     def test_failed_research_is_retried_within_the_hour(self, tmp_path: Path) -> None:
@@ -411,7 +411,7 @@ class TestScheduler:
         assert sched.due(weekend=False) is None
         now[0] += Config().research.retry_minutes * 60 + 1
         reason, mode = sched.due(weekend=False)
-        assert reason.startswith("retry") and mode == "startup"
+        assert reason.startswith("retry") and mode == "sprint"
         reg.close()
 
     def test_weekly_cycle_waits_for_the_weekend(self, tmp_path: Path) -> None:

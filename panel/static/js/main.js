@@ -10,14 +10,15 @@ import { openPalette, registerCommands, wirePalette } from "./palette.js";
 import { apply as applySettings, onSettings, setSetting, settings } from "./settings.js";
 import { maybeStartTour, startTour } from "./tour.js";
 import { ago, clear, el, num, setLocale, signed, storeGet, storeSet } from "./util.js";
-import { mountAdvisor, mountDecisions, mountHealth, mountMarkets, mountOverview, mountPerformance, mountRisk,
+import { mountAdvisor, mountDecisions, mountHealth, mountLearning, mountMarkets, mountOverview, mountPerformance, mountRisk,
   mountStrategies, mountTeam, mountTrades } from "./views/dashboards.js";
 import { mountFunnel } from "./views/funnel.js";
 import { describe, mountOffice } from "./views/office.js";
 import { mountTimeMachine, mountTruth } from "./views/truth.js";
 
 const VIEWS = [
-  ["office", mountOffice], ["why", mountFunnel], ["truth", mountTruth], ["timemachine", mountTimeMachine],
+  ["office", mountOffice], ["why", mountFunnel], ["learning", mountLearning], ["truth", mountTruth],
+  ["timemachine", mountTimeMachine],
   ["overview", mountOverview], ["performance", mountPerformance],
   ["trades", mountTrades], ["team", mountTeam], ["strategies", mountStrategies], ["risk", mountRisk],
   ["markets", mountMarkets], ["advisor", mountAdvisor], ["health", mountHealth], ["decisions", mountDecisions],
@@ -88,6 +89,29 @@ function kpi(id, label, value, note, cls = "") {
   if (note) node.append(el("span", { class: "kpi-note", text: note }));
 }
 
+function renderOps(s, kind) {
+  const tag = kind === "real" ? "[REAL] " : kind === "demo" ? "[DEMO] " : kind === "sim" ? "[SIM] " : "";
+  const base = currentId === "office" || !currentId ? t("app.title") : `${t(`tab.${currentId}`)} · ${t("app.title")}`;
+  document.title = `${tag}${base}`;
+  const fz = s.feasibility || {};
+  const mode = $("ops-mode");
+  mode.textContent = fz.mode ? t("ops.mode", { mode: t(`ops.mode.${fz.mode}`) }) : t("ops.mode.none");
+  mode.title = fz.message || fz.undeployed_text || "";
+  mode.className = `ops-chip${fz.below_floor ? " crit" : fz.mode === "capacity" ? " warn" : ""}`;
+  const ex = s.exploration || {};
+  $("ops-budget").textContent = ex.trades_left_day === undefined || ex.trades_left_day === null ? t("ops.budget.none")
+    : t("ops.budget", { day: ex.trades_left_day, week: ex.trades_left_week });
+  const slo = s.slo || {};
+  const sloNode = $("ops-slo");
+  sloNode.textContent = slo.met ? t("ops.slo.met") : slo.missed ? t("ops.slo.missed")
+    : slo.target_hours ? t("ops.slo.left", { h: num(slo.remaining_hours, 1) }) : t("ops.slo.none");
+  sloNode.className = `ops-chip${slo.missed ? " warn" : ""}`;
+  const hours = s.started_utc ? Math.max(0, (s.now_utc - s.started_utc) / 3600) : null;
+  const research = (s.research || {}).running ? t("ops.learning.research") : t("ops.learning.shadow");
+  const asked = s.account_mode ? t("ops.account_mode", { mode: s.account_mode }) : "";
+  $("ops-uptime").textContent = [asked, hours === null ? "" : t("ops.uptime", { h: num(hours, 1) }), research].filter(Boolean).join(" · ");
+}
+
 function renderTopbar(s) {
   const kind = s.simulation ? "sim" : s.account_type === "REAL" ? "real" : s.account_type === "DEMO" ? "demo" : "";
   const acc = $("account-badge");
@@ -98,6 +122,7 @@ function renderTopbar(s) {
   banner.className = `banner ${kind}`;
   banner.textContent = kind === "real" ? t("banner.real") : kind === "sim" ? t("banner.sim") : "";
   banner.hidden = !(kind === "real" || kind === "sim");
+  renderOps(s, kind);
   const cur = s.currency ? ` (${s.currency})` : "";
   kpi("kpi-equity", `${t("kpi.equity")}${cur}`, s.equity === null || s.equity === undefined ? "n/d" : num(s.equity, 2),
     s.drawdown_pct === null || s.drawdown_pct === undefined ? "" : t("kpi.drawdown", { v: num(s.drawdown_pct, 2) }));

@@ -4,7 +4,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install_autostart.ps1 [-DelayMinutes 2] [-BotArgs "--dry-run"]
 param(
     [string]$TaskName = "MT5 Bot Supervisor",
-    [string]$BotArgs = "",
+    [string]$BotArgs = "--account real",
     [int]$DelayMinutes = 1,
     [switch]$NoPanel
 )

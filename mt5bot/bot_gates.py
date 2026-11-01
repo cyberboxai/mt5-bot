@@ -95,9 +95,12 @@ class GatesMixin:
                                    spec.swap_cost_per_lot_night(side), nights)  # type: ignore[arg-type]
 
     def _cost_gate(self, symbol: str, intent: EntryIntent, plan: TradePlan, spread_points: float, spec: SymbolSpec,
-                   info: Any) -> Optional[str]:
+                   info: Any, entry: Optional[bool] = None) -> Optional[str]:
         """Why this arm may not trade at this cost, or None. An external test source has no evidence
-        to gate; demo exploration is exempt because it is how own fills get measured."""
+        to gate; exploration is exempt because the prior threshold and the trade budget bound it.
+
+        Entry gate (T1 and minimum-viable trades, or ``entry=True``): the cost-to-edge condition on
+        the posterior mean. Scaling gate (size above that): on the lower quantile, with its higher k."""
         c = self.cfg.costs
         post = intent.posterior
         if not c.gate_enabled or post is None:
@@ -105,9 +108,14 @@ class GatesMixin:
         if intent.exploration and (c.exploration_exempt_real if self.is_real else c.exploration_exempt_demo):
             return None
         cost = self.expected_cost_per_lot(symbol, intent.timeframe, intent.signal.side, spread_points, spec)
-        lower = post.mean - c.edge_z * post.sd
-        ratio = cost_to_edge_ratio(lower, plan.loss_per_lot, cost)
-        if ratio >= c.k:
+        if entry is None:
+            entry = intent.tier == "T1" or plan.exception
+        if entry:
+            edge, k, name = post.mean, self.cfg.entry_gates.min_cost_to_edge, "mean"
+        else:
+            edge, k, name = post.mean - c.edge_z * post.sd, max(c.k, self.cfg.scaling_gates.min_cost_to_edge), "lower"
+        ratio = cost_to_edge_ratio(edge, plan.loss_per_lot, cost)
+        if ratio >= k:
             return None
-        return (f"cost-to-edge {ratio:.2f} < {c.k:.2f}: lower edge {lower:+.3f}R x {plan.loss_per_lot:.2f} per lot "
+        return (f"cost-to-edge {ratio:.2f} < {k:.2f}: {name} edge {edge:+.3f}R x {plan.loss_per_lot:.2f} per lot "
                 f"vs all-in cost {cost:.2f} per lot")

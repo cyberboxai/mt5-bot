@@ -154,6 +154,7 @@ class OrdersMixin:
             "tp": plan.tp, "loss_per_lot": plan.loss_per_lot, "strategy": intent.strategy,
             "exploration": intent.exploration, "policy": intent.policy, "regime": intent.regime,
             "min_lot_exception": plan.exception, "sizing_binding": (intent.sizing or {}).get("binding"),
+            "size_tag": "MIN_VIABLE_SIZE" if plan.exception else None, "ev_r": intent.ev_r,
             "planned_risk_pct": plan.risk_pct, "multiplier": multiplier, "volume": plan.volume,
             "decision_price": float(tick.ask if intent.signal.side == "BUY" else tick.bid),
             "spread_decision": (float(tick.ask) - float(tick.bid)) / float(info.point), "point": float(info.point)}
@@ -208,7 +209,7 @@ class OrdersMixin:
                                  "risk_pct": round(risk_pct, 6), "policy": meta["policy"], "regime": meta["regime"],
                                  "min_lot_exception": meta["min_lot_exception"],
                                  "sizing_binding": meta["sizing_binding"]}
-        for key in ("group", "part", "parts", "p_positive", "posterior_mean"):
+        for key in ("group", "part", "parts", "p_positive", "posterior_mean", "size_tag", "ev_r"):
             if meta.get(key) is not None:
                 extra[key] = meta[key]
         if meta.get("dossier_id"):

@@ -56,8 +56,12 @@ body[data-view="office"] .view { overflow: hidden; padding: 10px 12px 8px; displ
   border-radius: var(--radius-sm); border: 1.5px solid currentColor; flex-shrink: 0; text-transform: uppercase;
 }
 .env-real { color: #fff; background: var(--real); border-color: var(--real); animation: env-pulse 2.4s ease-in-out infinite; }
-.env-demo { color: var(--accent-2); }
-:root[data-theme="dark"] .env-demo { color: #6fb3f5; }
+.env-demo { color: #fff; background: var(--accent-2); border-color: var(--accent-2); }
+.ops-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px var(--space-4); background: var(--page-deep); border-bottom: 1px solid var(--border); }
+.ops-chip { font-size: 0.75rem; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; white-space: nowrap; color: var(--text-muted); }
+.ops-chip.warn { color: var(--warning); border-color: var(--warning); }
+.ops-chip.crit { color: var(--critical); border-color: var(--critical); }
+.ops-chip:empty { display: none; }
 .env-sim { color: var(--sim); background: color-mix(in srgb, var(--sim) 12%, transparent); }
 .env-unknown { color: var(--text-muted); }
 @keyframes env-pulse { 50% { box-shadow: 0 0 0 4px rgba(230, 48, 48, 0.25); } }

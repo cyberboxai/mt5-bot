@@ -99,12 +99,10 @@ class OversightMixin:
                                f"risco novo reduzido", key="stress")
 
     def _weekend_flatten(self, acc: Any, server_now: float) -> None:
-        """Small accounts are flat at the weekend unless the arm has proven a multi-day edge (T3)."""
+        """Flat at the weekend unless the arm has proven a multi-day edge (T3), at any balance."""
         rules = self.schedule
         market_time = self.clock.latest_tick_time or server_now   # the broker's clock, not the PC's
         if not rules.flat_before_weekend or not pre_weekend(market_time, rules) or self.cfg.dry_run:
-            return
-        if float(acc.equity) >= self.cfg.tail.small_account_equity:
             return
         try:
             positions = self._bot_positions()
@@ -171,8 +169,11 @@ class OversightMixin:
         try:
             conn = self.registry.conn
             fill_rate, slip_gap = realitygap.fill_and_slippage(conn, self.cfg.backtest_slippage_points)
-            report = realitygap.evaluate_gap(realitygap.twin_pairs(conn), slip_gap, fill_rate, realitygap.GapSettings())
+            pairs = realitygap.twin_pairs(conn)
+            settings = realitygap.GapSettings(max_gap_r=self.cfg.scaling_gates.max_reality_gap_r)
+            report = realitygap.evaluate_gap(pairs, slip_gap, fill_rate, settings)
             realitygap.record_gap(conn, float(self._utc_now()), report)
+            self._watch_gap_drift(pairs)
         except Exception:  # noqa: BLE001 - the monitor must never stop trading
             log.exception("Reality gap check failed")
             return

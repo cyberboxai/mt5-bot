@@ -45,7 +45,7 @@ def simulation_config(cfg: Config, state_root: Path, team_mode: Optional[str]) -
         "symbols": ("EURUSD",), "timeframe": "M15", "bars": 600, "trading_hours_server": (0, 24),
         "state_root": str(state_root), "health_file": str(state_root / "health.json"),
         "reports_dir": str(state_root / "reports"), "kill_switch_file": str(state_root / "KILL"),
-        "log_file": str(state_root / "simulation.log"), "dry_run": False, "account_mode": "demo_only",
+        "log_file": str(state_root / "simulation.log"), "dry_run": False, "account_mode": "demo",
         "real_money_confirmed": False, "news_filter_enabled": False, "commission_per_lot": 7.0,
         "terminal_restart_enabled": False, "telegram_enabled": False, "risk_profile": "balanced",
         "team.team_mode": team_mode or "full", "universe.candidates": names, "universe.max_symbols": len(names),

@@ -143,6 +143,7 @@ class OrderExecuted(Message):
     slippage_points: float
     dry_run: bool = False
     session: str = ""
+    first_today: bool = False
 
 
 @dataclass(frozen=True)

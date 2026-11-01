@@ -450,7 +450,7 @@ class TiersConfig:
 
     t1_enter_p: float = 0.55
     t1_exit_p: float = 0.50
-    t1_min_evidence: int = 20
+    t1_min_evidence: int = 30
     t2_enter_p: float = 0.80
     t2_exit_p: float = 0.70
     t2_min_trades: int = 50
@@ -462,7 +462,7 @@ class TiersConfig:
     promote_cooldown_hours: float = 4.0
     exploration_enabled: bool = True
     exploration_slots: int = 2
-    exploration_threshold: float = 0.0
+    exploration_threshold: float = -0.02   # an arm whose posterior mean is below this never explores
     exploration_day_pct: Optional[float] = None
     exploration_week_pct: Optional[float] = None
     t1_risk_pct: Optional[float] = None
@@ -531,7 +531,8 @@ class CapitalConfig:
         _bool("capital.floor_soft_stop", self.floor_soft_stop)
 
 
-DEFAULT_CANDIDATES = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "XAUUSD")
+DEFAULT_CANDIDATES = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "BTCUSD",
+                      "XAUUSD")
 UNIVERSE_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 
 
@@ -540,20 +541,23 @@ class UniverseConfig:
     """Opportunity engine: which symbols and timeframes the arms may use."""
 
     candidates: tuple[str, ...] = DEFAULT_CANDIDATES
-    timeframes: tuple[str, ...] = ("M15", "H1", "H4", "D1")
+    timeframes: tuple[str, ...] = ("M5", "M15", "H1", "H4")
+    always_include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
     max_symbols: int = 6
-    max_arms: int = 400
+    max_arms: int = 1400
     default_arms: bool = True
     max_spread_points_by_symbol: tuple[tuple[str, float], ...] = ()
     spread_spike_mult: float = 2.5
     max_spread_to_stop: float = 0.25
+    max_cost_r: float = 0.5                  # all-in cost in R a stop may carry before any edge is measured
     scan_every_minutes: float = 15.0
 
     @classmethod
     def from_dict(cls, data: Any) -> "UniverseConfig":
         if isinstance(data, Mapping):
             data = dict(data)
-            for key in ("candidates", "timeframes"):
+            for key in ("candidates", "timeframes", "always_include", "exclude"):
                 if isinstance(data.get(key), list):
                     data[key] = tuple(data[key])
             spread = data.get("max_spread_points_by_symbol")
@@ -572,6 +576,12 @@ class UniverseConfig:
     def validate(self) -> None:
         if not isinstance(self.candidates, tuple) or not all(isinstance(s, str) and s.strip() for s in self.candidates):
             raise ValueError("universe.candidates must be a list of symbol names")
+        for name in ("always_include", "exclude"):
+            value = getattr(self, name)
+            if not isinstance(value, tuple) or not all(isinstance(v, str) and v.strip() for v in value):
+                raise ValueError(f"universe.{name} must be a list of symbol names")
+        if set(self.always_include) & set(self.exclude):
+            raise ValueError("universe.always_include and universe.exclude must not share a symbol")
         if not isinstance(self.timeframes, tuple) or not self.timeframes:
             raise ValueError("universe.timeframes must be a non-empty list such as [\"M5\", \"M15\", \"H1\"]")
         for tf in self.timeframes:
@@ -587,6 +597,7 @@ class UniverseConfig:
             _num(f"universe.max_spread_points_by_symbol.{name}", value, 0.1, 1e6)
         _num("universe.spread_spike_mult", self.spread_spike_mult, 1.2, 10.0)
         _num("universe.max_spread_to_stop", self.max_spread_to_stop, 0.02, 1.0)
+        _num("universe.max_cost_r", self.max_cost_r, 0.02, 2.0)
         _num("universe.scan_every_minutes", self.scan_every_minutes, 1.0, 1440.0)
 
 
@@ -765,7 +776,7 @@ class CostsConfig:
     edge_z: float = 1.645                    # which posterior lower quantile counts as proven edge: 1.645 is 5%
     gate_enabled: bool = True
     exploration_exempt_demo: bool = True     # demo micro-trades are how own fills get measured
-    exploration_exempt_real: bool = False
+    exploration_exempt_real: bool = True     # v4.2: bounded by the prior threshold and the trade budget instead
     expected_hold_bars: int = 20
     calibrate_every_hours: float = 24.0
     rollover_start: str = "23:50"            # server time; learned windows can only widen this
@@ -844,7 +855,6 @@ class TailConfig:
     margin_call_multiple: float = 1.5
     gap_quantile: float = 0.99
     overnight_hours: float = 6.0
-    small_account_equity: float = 25_000.0
     ladder_recovery_days: float = 3.0
     stress_reduction: float = 0.5
 
@@ -859,7 +869,6 @@ class TailConfig:
         _num("tail.margin_call_multiple", self.margin_call_multiple, 1.0, 10.0)
         _num("tail.gap_quantile", self.gap_quantile, 0.5, 1.0)
         _num("tail.overnight_hours", self.overnight_hours, 0.0, 48.0)
-        _num("tail.small_account_equity", self.small_account_equity, 0.0, 1e9)
         _num("tail.ladder_recovery_days", self.ladder_recovery_days, 0.0, 60.0)
         _num("tail.stress_reduction", self.stress_reduction, 0.05, 1.0)
 
@@ -867,8 +876,7 @@ class TailConfig:
         from .core.tail import TailRules
 
         return TailRules(self.margin_stop_out_multiple, self.margin_call_multiple, self.gap_quantile,
-                         self.overnight_hours, self.small_account_equity,
-                         ladder_recovery_days=self.ladder_recovery_days)
+                         self.overnight_hours, ladder_recovery_days=self.ladder_recovery_days)
 
 
 @dataclass(frozen=True)
@@ -932,6 +940,184 @@ class OpsConfig:
         _num("ops.symbol_info_ttl_seconds", self.symbol_info_ttl_seconds, 0.0, 3600.0)
 
 
+@dataclass(frozen=True)
+class SizingConfig:
+    """Broker-granularity sizing (see ``mt5bot.feasibility``). Null values use the profile."""
+
+    min_viable_enabled: bool = True
+    min_viable_risk_cap_pct: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "SizingConfig":
+        cfg = _build(cls, "sizing", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _bool("sizing.min_viable_enabled", self.min_viable_enabled)
+        _opt_num("sizing.min_viable_risk_cap_pct", self.min_viable_risk_cap_pct, 0.01, limits.MAX_RISK_PER_TRADE_PCT)
+
+
+@dataclass(frozen=True)
+class BudgetConfig:
+    """Exploration budget measured in trades as well as money. Null values use the profile."""
+
+    min_trades_per_day: Optional[int] = None
+    min_trades_per_week: Optional[int] = None
+    weekly_soft_limit_pct: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "BudgetConfig":
+        cfg = _build(cls, "budget", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        if self.min_trades_per_day is not None:
+            _int("budget.min_trades_per_day", self.min_trades_per_day, 0, limits.MAX_EXPLORATION_TRADES_PER_DAY)
+        if self.min_trades_per_week is not None:
+            _int("budget.min_trades_per_week", self.min_trades_per_week, 0, limits.MAX_EXPLORATION_TRADES_PER_WEEK)
+        _opt_num("budget.weekly_soft_limit_pct", self.weekly_soft_limit_pct, 0.1, limits.MAX_WEEKLY_SOFT_LOSS_PCT)
+
+
+@dataclass(frozen=True)
+class StartupConfig:
+    """Warm start: the research sprint and the real-account acknowledgment."""
+
+    research_sprint_minutes: float = 20.0
+    sprint_trials: int = 6
+    ack_max_age_days: float = 30.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "StartupConfig":
+        cfg = _build(cls, "startup", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("startup.research_sprint_minutes", self.research_sprint_minutes, 1.0, 240.0)
+        _int("startup.sprint_trials", self.sprint_trials, 1, 100)
+        _num("startup.ack_max_age_days", self.ack_max_age_days, 0.0, 3650.0)
+
+
+@dataclass(frozen=True)
+class EntryGatesConfig:
+    """What an arm needs for its first, minimum-viable trades (see ``mt5bot.gates``)."""
+
+    min_mean_r: float = 0.0
+    min_p: float = 0.55
+    min_cost_to_edge: float = 1.2
+    min_oos_trades: int = 30
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "EntryGatesConfig":
+        cfg = _build(cls, "entry_gates", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("entry_gates.min_mean_r", self.min_mean_r, 0.0, 1.0)
+        _num("entry_gates.min_p", self.min_p, limits.ENTRY_MIN_P_FLOOR, 0.99)
+        _num("entry_gates.min_cost_to_edge", self.min_cost_to_edge, limits.ENTRY_MIN_COST_TO_EDGE_FLOOR, 20.0)
+        _int("entry_gates.min_oos_trades", self.min_oos_trades, limits.ENTRY_MIN_OOS_TRADES_FLOOR, 100000)
+
+
+@dataclass(frozen=True)
+class ScalingGatesConfig:
+    """What an arm needs to size above the minimum (see ``mt5bot.gates``)."""
+
+    min_cost_to_edge: float = 2.0
+    require_verdict: bool = True
+    max_reality_gap_r: float = 0.15
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ScalingGatesConfig":
+        cfg = _build(cls, "scaling_gates", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("scaling_gates.min_cost_to_edge", self.min_cost_to_edge, 1.0, 20.0)
+        _bool("scaling_gates.require_verdict", self.require_verdict)
+        _num("scaling_gates.max_reality_gap_r", self.max_reality_gap_r, 0.01, 5.0)
+
+
+DRIFT_DETECTORS = ("page_hinkley", "cusum", "off")
+
+
+@dataclass(frozen=True)
+class LearningConfig:
+    """Continuous learning (see ``mt5bot.learning``)."""
+
+    half_life_days: float = 60.0
+    drift_detector: str = "page_hinkley"
+    drift_delta_r: float = 0.15
+    drift_threshold_r: float = 15.0
+    drift_min_trades: int = 30
+    nightly_research: bool = True
+    nightly_hour_server: int = 23
+    weekend_deep_research: bool = True
+    stop_variants: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "LearningConfig":
+        cfg = _build(cls, "learning", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("learning.half_life_days", self.half_life_days, 1.0, 3650.0)
+        _choice("learning.drift_detector", self.drift_detector, DRIFT_DETECTORS)
+        _num("learning.drift_delta_r", self.drift_delta_r, 0.0, 2.0)
+        _num("learning.drift_threshold_r", self.drift_threshold_r, 0.5, 200.0)
+        _int("learning.drift_min_trades", self.drift_min_trades, 5, 100000)
+        _bool("learning.nightly_research", self.nightly_research)
+        _int("learning.nightly_hour_server", self.nightly_hour_server, 0, 23)
+        _bool("learning.weekend_deep_research", self.weekend_deep_research)
+        _bool("learning.stop_variants", self.stop_variants)
+
+
+@dataclass(frozen=True)
+class SloConfig:
+    """Time-to-first-trade objective, in hours of market activity."""
+
+    first_trade_hours: float = 2.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "SloConfig":
+        cfg = _build(cls, "slo", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _num("slo.first_trade_hours", self.first_trade_hours, 0.25, 168.0)
+
+
+@dataclass(frozen=True)
+class CapacityConfig:
+    """How much size the system tries to put through (see ``mt5bot.feasibility``).
+
+    ``lots_per_tick`` is a heuristic: MT5 reports tick counts, not traded volume, so the
+    liquidity cap is an estimate until real slippage has been measured."""
+
+    max_child_orders: int = limits.MAX_SPLIT_ORDERS
+    child_interval_seconds: float = 30.0
+    lots_per_tick: float = 0.25
+    hysteresis: float = 0.1
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "CapacityConfig":
+        cfg = _build(cls, "capacity", data)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        _int("capacity.max_child_orders", self.max_child_orders, 1, limits.MAX_SPLIT_ORDERS)
+        _num("capacity.child_interval_seconds", self.child_interval_seconds, 0.0, 3600.0)
+        _num("capacity.lots_per_tick", self.lots_per_tick, 0.001, 100.0)
+        _num("capacity.hysteresis", self.hysteresis, 0.0, 0.5)
+
+
 BLOCKS: dict[str, type] = {
     "claude": ClaudeConfig,
     "team": TeamConfig,
@@ -949,6 +1135,14 @@ BLOCKS: dict[str, type] = {
     "portfolio": PortfolioConfig,
     "tail": TailConfig,
     "governance": GovernanceConfig,
+    "sizing": SizingConfig,
+    "budget": BudgetConfig,
+    "startup": StartupConfig,
+    "entry_gates": EntryGatesConfig,
+    "scaling_gates": ScalingGatesConfig,
+    "learning": LearningConfig,
+    "slo": SloConfig,
+    "capacity": CapacityConfig,
     "ops": OpsConfig,
 }
 

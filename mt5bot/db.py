@@ -223,6 +223,18 @@ CREATE TRIGGER IF NOT EXISTS trials_no_delete BEFORE DELETE ON trial_ledger
     BEGIN SELECT RAISE(ABORT, 'the trial ledger is never deleted'); END
 """
 
+SCHEMA_4 = """
+CREATE TABLE IF NOT EXISTS model_versions (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, kind TEXT NOT NULL, data_ref TEXT, code_ref TEXT, note TEXT,
+    payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS learning_points (
+    ts REAL NOT NULL, arm_id INTEGER NOT NULL, mean REAL, lo REAL, hi REAL, p REAL, n_obs INTEGER, live_n INTEGER,
+    tier TEXT);
+CREATE INDEX IF NOT EXISTS ix_learning_arm ON learning_points (arm_id, ts);
+CREATE TABLE IF NOT EXISTS drift_events (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, arm_id INTEGER, scope TEXT NOT NULL, detail TEXT NOT NULL)
+"""
+
 TRADE_COLUMNS_2 = (("arm_id", "INTEGER"), ("timeframe", "TEXT"), ("tier", "TEXT"), ("risk_pct", "REAL"))
 
 
@@ -259,11 +271,17 @@ def _migration_3(conn: Conn) -> None:
         conn.execute("CREATE TRIGGER " + text.strip())
 
 
+def _migration_4(conn: Conn) -> None:
+    for statement in _statements(SCHEMA_4):
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[Conn], None]], ...] = (
     (1, "v3.0 journal, registry and team office tables", _migration_1),
     (2, "v3.1 arms, tiers, research priors, funnel, flow doctor, cash flows, policies", _migration_2),
     (3, "v4 ledger, orders, TCA, cost models, trial ledger, snapshots, verdicts, stress, reality gap, governance",
      _migration_3),
+    (4, "v4.2 model registry, learning history and drift events", _migration_4),
 )
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

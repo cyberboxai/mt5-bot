@@ -22,10 +22,13 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 
+from . import features as feature_lib
 from . import indicators, management, regime
 from . import strategies as strategy_lib
 from .backtest import CostModel, VirtualPosition, close_position, exit_for_bar, market_exit_price, open_position
-from .evidence import ArmSample, EvidenceSettings, Posterior, build_sample, family_of, fit
+from .evidence import ArmSample, EvidenceSettings, Posterior, build_sample, family_of
+from .feasibility import STOP_ATR_MULTS
+from .learning import Detector, fit_hierarchical, make_detector, symbol_cluster, timeframe_group
 from .registry import Registry, TradeRow, _json
 from .risk import SymbolSpec
 from .strategies.base import Signal, SignalArrays
@@ -63,6 +66,8 @@ class EntryIntent:
     min_lot_exception: bool = False
     policy: str = "fixed"
     regime: Optional[str] = None
+    ev_r: Optional[float] = None
+    ev: Optional[Mapping[str, float]] = None
 
 
 @dataclass
@@ -221,6 +226,16 @@ def _regime_at(closed: np.ndarray, index: int) -> str:
         return ""
 
 
+def _features_at(closed: np.ndarray, index: int, side: int, atr: float, sl_mult: float,
+                 point: float) -> Optional[dict]:
+    """Confirmation features of a signal: optional evidence, never a reason to lose the trade."""
+    try:
+        return feature_lib.signal_features(closed, index, side, atr, sl_mult, point)
+    except Exception:  # noqa: BLE001
+        log.debug("feature tag failed", exc_info=True)
+        return None
+
+
 class ShadowBook:
     """Paper-trades one arm. Never sends orders.
 
@@ -245,6 +260,7 @@ class ShadowBook:
         self.pending_bar = 0
         self.pending_exit = False
         self.pending_regime = ""
+        self.pending_features: Optional[dict] = None
         self.last_bar_time: Optional[int] = None
         self.track_policies = True  # replay each closed trade under every management policy
         self._saved: Optional[tuple] = None
@@ -348,7 +364,7 @@ class ShadowBook:
                             self.pos.entry_price, self.pos.sl, self.pos.tp, self.pos.volume, self.pos.risk_money,
                             open_bar_time=t, arm_id=self.arm.id, timeframe=self.arm.timeframe, tier="T0",
                             extra={"entry_index": i, "strategy": self.arm.strategy, "signal_bar": self.pending_bar,
-                                   "regime": self.pending_regime or None})
+                                   "regime": self.pending_regime or None, "features": self.pending_features})
                 if self.pos is not None:
                     hit = exit_for_bar(self.pos, o, h, lo, spr, spec.point, costs.slippage_points,
                                        self.pos.entry_time == t)
@@ -359,10 +375,12 @@ class ShadowBook:
                 if self.pos is None:
                     self.pending, self.pending_atr, self.pending_bar = s, float(sig.atr[i]), t
                     self.pending_regime = _regime_at(closed, i)
+                    self.pending_features = _features_at(closed, i, s, float(sig.atr[i]), sig.sl_mult, spec.point)
                 elif costs.close_on_opposite and s == -self.pos.side:
                     self.pending_exit = True
                     self.pending, self.pending_atr, self.pending_bar = s, float(sig.atr[i]), t
                     self.pending_regime = _regime_at(closed, i)
+                    self.pending_features = _features_at(closed, i, s, float(sig.atr[i]), sig.sl_mult, spec.point)
             elif self.pos is None:
                 self.pending = 0
             self.last_bar_time = t
@@ -394,7 +412,9 @@ class ArmEngine:
     def __init__(self, registry: Registry, tiers_cfg: Any, research_cfg: Any, clock: Callable[[], float] = time.time,
                  notify: Callable[[str], None] = lambda text: None,
                  on_tier_change: Optional[Callable[[Arm, TierDecision, int], None]] = None,
-                 half_life_days: float = 120.0, management_cfg: Any = None) -> None:
+                 half_life_days: float = 60.0, management_cfg: Any = None, entry_gates: Any = None,
+                 scaling_gates: Any = None, learning_cfg: Any = None,
+                 on_drift: Optional[Callable[["Arm", str], None]] = None) -> None:
         self.registry = registry
         self.store = ArmStore(registry, clock)
         self.clock = clock
@@ -403,6 +423,15 @@ class ArmEngine:
         self.half_life_days = half_life_days
         self.management_cfg = management_cfg
         self.promotions_frozen: Optional[str] = None   # the reality gap monitor froze promotions
+        self.entry_gates = entry_gates
+        self.scaling_gates = scaling_gates
+        self.learning_cfg = learning_cfg
+        self.on_drift = on_drift
+        self._detectors: dict[int, Detector] = {}
+        self._drift_alarms: set[int] = set()
+        self._drift_replay = True     # the history rebuilds the detectors; it must not fire old alarms
+        self.feature_table: list[feature_lib.Uplift] = []
+        self._dirty = False
         self.update_settings(tiers_cfg, research_cfg)
         self.arms: dict[int, Arm] = {a.id: a for a in self.store.load()}
         self.books: dict[int, ShadowBook] = {}
@@ -416,17 +445,21 @@ class ArmEngine:
         self._policy_rows: dict[int, dict[int, dict[str, float]]] = defaultdict(dict)
         self._policy_after = 0
         self._last_policy_refresh = -math.inf
+        self._last_feature_refresh = -math.inf
         self.rng = np.random.default_rng(int(getattr(tiers_cfg, "seed", 20261026)))
         self._load_evidence()
+        self._drift_replay = False
 
     def update_settings(self, tiers_cfg: Any, research_cfg: Any, t1_enter_override: Optional[float] = None) -> None:
         self.tiers_cfg = tiers_cfg
-        self.tier_settings = TierSettings.from_config(tiers_cfg, t1_enter_override)
+        self.tier_settings = TierSettings.from_config(tiers_cfg, t1_enter_override, self.entry_gates)
         self.evidence_settings = EvidenceSettings(prior_discount=tiers_cfg.prior_discount, tau_min=tiers_cfg.tau_min,
                                                   global_mean=tiers_cfg.global_mean)
         self.ref_equity = float(research_cfg.reference_equity)
         self.ref_risk = float(research_cfg.reference_risk_pct)
         self.require_verdict = bool(getattr(research_cfg, "require_verdict", False))
+        if self.scaling_gates is not None:
+            self.require_verdict = self.require_verdict and bool(self.scaling_gates.require_verdict)
         for book in getattr(self, "books", {}).values():
             book.equity, book.risk_pct = self.ref_equity, self.ref_risk
 
@@ -449,17 +482,29 @@ class ArmEngine:
         return self.arms[arm.id]
 
     def ensure_default_arms(self, symbols: Sequence[str], timeframes: Sequence[str], strategies: Sequence[str],
-                            max_arms: int) -> int:
-        """One default-parameter arm per symbol x timeframe x strategy (bounded by ``max_arms``)."""
+                            max_arms: int, stop_variants: bool = False) -> int:
+        """One default arm per symbol x timeframe x strategy, plus, with ``stop_variants``, one per
+        ATR stop policy the strategy's own grid allows (bounded by ``max_arms``).
+
+        The stop is part of the arm: it decides feasibility and cost in R. Base arms come first,
+        one pass over every symbol, so a small ``max_arms`` never starves a whole symbol."""
         created = 0
+        passes: list[tuple[str, str, str, dict]] = []
+        variants: list[tuple[str, str, str, dict]] = []
         for symbol in symbols:
             for tf in timeframes:
                 for name in strategies:
-                    if len(self.arms) >= max_arms:
-                        return created
-                    before = len(self.arms)
-                    self.ensure_arm(symbol, tf, name, strategy_lib.get(name).default_params(), "default")
-                    created += len(self.arms) - before
+                    strat = strategy_lib.get(name)
+                    base = strat.default_params()
+                    passes.append((symbol, tf, name, base))
+                    if stop_variants:
+                        variants.extend((symbol, tf, name, p) for p in stop_variant_params(strat, base))
+        for symbol, tf, name, params in passes + variants:
+            if len(self.arms) >= max_arms:
+                return created
+            before = len(self.arms)
+            self.ensure_arm(symbol, tf, name, params, "default")
+            created += len(self.arms) - before
         return created
 
     def flush(self) -> None:
@@ -488,11 +533,13 @@ class ArmEngine:
             return out
         bar_time = int(closed[-1]["time"])
         # One transaction for every shadow book of this bar: one commit instead of one per arm.
+        memo: dict[tuple, SignalArrays] = {}
         with self.registry.tx():
             for arm in self.arms_for(symbol, timeframe):
                 try:
-                    sig = arm_signals(arm, closed)
-                    self._book(arm).on_bars(closed, sig, spec, costs)
+                    sig = shared_signals(arm, closed, memo)
+                    if self._book(arm).on_bars(closed, sig, spec, costs):
+                        self._dirty = True
                 except Exception:  # noqa: BLE001 - one arm must never stop the others
                     log.exception("%s: arm %s failed on this bar", symbol, arm.short())
                     continue
@@ -539,6 +586,7 @@ class ArmEngine:
             close_ts = float(row["close_ts"] or 0.0)
             ev = self._evidence[int(row["arm_id"])]
             ev.observations.append((close_ts, signal_bar, float(row["r"]), row["mode"] == "live"))
+            self._watch_drift(int(row["arm_id"]), float(row["r"]))
             if extra.get("regime"):
                 ev.regimes[signal_bar or int(close_ts)] = str(extra["regime"])
             if close_ts > self._evidence_until:
@@ -548,6 +596,49 @@ class ArmEngine:
             count += 1
         return count
 
+    def _watch_drift(self, arm_id: int, r: float) -> None:
+        """One observation into the arm's detector. An alarm is acted on in ``refresh``."""
+        cfg = self.learning_cfg
+        if cfg is None:
+            return
+        detector = self._detectors.get(arm_id)
+        if detector is None:
+            detector = make_detector(cfg.drift_detector, cfg.drift_delta_r, cfg.drift_threshold_r, cfg.drift_min_trades)
+            if detector is None:
+                return
+            self._detectors[arm_id] = detector
+        if detector.update(r) and not self._drift_replay:
+            self._drift_alarms.add(arm_id)
+
+    def _handle_drift(self, now: float) -> list[tuple[Arm, TierDecision]]:
+        """Demote one tier at once and ask for targeted research. Never promotes anything."""
+        changes: list[tuple[Arm, TierDecision]] = []
+        alarms, self._drift_alarms = self._drift_alarms, set()
+        for arm_id in sorted(alarms):
+            arm = self.arms.get(arm_id)
+            if arm is None or not arm.active:
+                continue
+            index = TIER_INDEX.get(arm.tier, 0)
+            detail = f"queda da expectativa detectada em {arm.short()}"
+            self.registry.conn.execute("INSERT INTO drift_events (ts, arm_id, scope, detail) VALUES (?, ?, 'arm', ?)",
+                                       (now, arm.id, detail))
+            if index > 0:
+                decision = TierDecision(list(TIER_INDEX)[index - 1], arm.tier, f"demote: drift detected; {detail}")
+                self.store.change_tier(arm, decision, now)
+                changes.append((arm, decision))
+                log.warning("%s: %s %s -> %s: drift detected", arm.symbol, arm.short(), decision.previous, decision.tier)
+                if self.on_tier_change is not None:
+                    try:
+                        self.on_tier_change(arm, decision, 0)
+                    except Exception:  # noqa: BLE001 - observers must never break the engine
+                        log.debug("tier observer failed", exc_info=True)
+            if self.on_drift is not None:
+                try:
+                    self.on_drift(arm, detail)
+                except Exception:  # noqa: BLE001
+                    log.debug("drift observer failed", exc_info=True)
+        return changes
+
     def _ingest_new(self) -> int:
         # ">=" plus the ids seen at the high-water mark: trades closed at the same clock value as the
         # last read (a virtual clock in simulation, coarse clocks) are neither lost nor read twice.
@@ -555,6 +646,16 @@ class ArmEngine:
             "SELECT id, arm_id, mode, close_ts, open_bar_time, r, extra_json FROM trades WHERE arm_id IS NOT NULL AND"
             " status = 'closed' AND r IS NOT NULL AND close_ts >= ? ORDER BY close_ts", (self._evidence_until,))
         return self._ingest(rows)
+
+    def outcomes(self, arm: Arm, limit: int = 500) -> list[float]:
+        """The arm's most recent observed R values, one per signal (live replaces its shadow twin)."""
+        by_signal: dict[int, tuple[float, float, bool]] = {}
+        for close_ts, signal_bar, r, live in self._evidence.get(arm.id, _Evidence()).observations:
+            key = signal_bar or int(close_ts)
+            if key in by_signal and by_signal[key][2] and not live:
+                continue
+            by_signal[key] = (close_ts, r, live)
+        return [r for _ts, r, _live in sorted(by_signal.values())][-limit:]
 
     def regime_view(self, arm: Arm, label: str) -> Optional[RegimeView]:
         """The arm's evidence in one regime, shrunk toward its overall posterior mean."""
@@ -598,19 +699,23 @@ class ArmEngine:
         self._ingest_new()
         samples: dict[int, ArmSample] = {}
         families: dict[int, str] = {}
+        groups: dict[int, str] = {}
         for arm in self.arms.values():
             samples[arm.id], _seq = self.sample(arm, now)
             families[arm.id] = arm.family
-        return fit(samples, families, self.evidence_settings)
+            groups[arm.id] = f"{symbol_cluster(arm.symbol)}|{timeframe_group(arm.timeframe)}"
+        return fit_hierarchical(samples, families, groups, self.evidence_settings)
 
     def refresh(self, force: bool = False) -> list[tuple[Arm, TierDecision]]:
         """Recompute posteriors and apply tier changes (audited). Returns the changes."""
         now = self.clock()
-        if not force and now - self._last_refresh < self.tiers_cfg.evidence_refresh_seconds:
+        # A closed trade, live or shadow, updates the posteriors at the next housekeeping pass.
+        if not force and not self._dirty and now - self._last_refresh < self.tiers_cfg.evidence_refresh_seconds:
             return []
         self._last_refresh = now
+        self._dirty = False
         posts = self.posteriors(now)
-        changes: list[tuple[Arm, TierDecision]] = []
+        changes: list[tuple[Arm, TierDecision]] = self._handle_drift(now)
         verdicts = self.latest_verdicts() if self.require_verdict else {}
         for arm in self.arms.values():
             arm.posterior = posts.get(arm.id)
@@ -633,7 +738,20 @@ class ArmEngine:
                         log.debug("tier observer failed", exc_info=True)
         self._save_posteriors(now, force=bool(changes))
         self.refresh_policies(now)
+        if now - self._last_feature_refresh >= POLICY_REFRESH_SECONDS:
+            self._last_feature_refresh = now
+            self.refresh_features()
         return changes
+
+    def record_learning_points(self, now: float, limit: int = 60) -> int:
+        """Posterior of the best arms over time, for the learning dashboard."""
+        rows = [(now, a.id, a.posterior.mean, a.posterior.lo, a.posterior.hi, a.posterior.p_positive,
+                 a.posterior.n_obs, a.posterior.live_n, a.tier) for a in self.ranked(limit) if a.posterior is not None]
+        if rows:
+            with self.registry.tx():
+                self.registry.conn.executemany("INSERT INTO learning_points (ts, arm_id, mean, lo, hi, p, n_obs, live_n,"
+                                               " tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        return len(rows)
 
     def latest_verdicts(self) -> dict[tuple[str, str, str], str]:
         """Latest research verdict per symbol, timeframe and strategy family."""
@@ -696,6 +814,22 @@ class ArmEngine:
             changed.append((arm, choice))
         return changed
 
+    def refresh_features(self, limit: int = 5000) -> list[feature_lib.Uplift]:
+        """What each confirmation feature was worth on the most recent shadow trades."""
+        rows = self.registry.conn.execute(
+            "SELECT r, extra_json FROM trades WHERE mode = 'shadow' AND status = 'closed' AND r IS NOT NULL"
+            " ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        pairs = []
+        for row in rows:
+            try:
+                found = json.loads(row["extra_json"] or "{}").get("features")
+            except ValueError:
+                continue
+            if found:
+                pairs.append((found, float(row["r"])))
+        self.feature_table = feature_lib.uplift(pairs)
+        return self.feature_table
+
     def _save_posteriors(self, now: float, force: bool = False, every: float = 600.0) -> None:
         """Persist posteriors that moved (for the panel and --arms) at most every ``every`` seconds."""
         if not force and now - self._last_save_ts < every:
@@ -745,3 +879,36 @@ class ArmEngine:
 
 def arm_signals(arm: Arm, closed: np.ndarray) -> SignalArrays:
     return strategy_lib.get(arm.strategy).signals(closed, arm.params)
+
+
+def shared_signals(arm: Arm, closed: np.ndarray, memo: dict[tuple, SignalArrays]) -> SignalArrays:
+    """``arm_signals``, computed once per bar for arms that differ only in their stop and target.
+
+    Those parameters never change when a strategy trades, so stop variants share the entries. A
+    structure stop is excluded: its volatility figure depends on the stop multiple."""
+    if arm.strategy.startswith("structstop_"):
+        return arm_signals(arm, closed)
+    key = (arm.strategy, tuple(sorted((k, v) for k, v in arm.params.items() if k not in ("sl_mult", "tp_mult"))))
+    base = memo.get(key)
+    if base is None:
+        base = memo[key] = arm_signals(arm, closed)
+    sl, tp = strategy_lib.get(arm.strategy).sl_tp_mults(arm.params)
+    return SignalArrays(base.side, base.atr, sl, tp)
+
+
+def stop_variant_params(strategy: Any, params: Mapping[str, Any]) -> list[dict]:
+    """The strategy's default parameters at each ATR stop policy its grid allows, keeping the
+    reward-to-risk of the defaults (rounded to the nearest legal TP)."""
+    space = {p.name: p for p in strategy.param_space}
+    sl_param, tp_param = space.get("sl_mult"), space.get("tp_mult")
+    if sl_param is None or tp_param is None:
+        return []
+    base_sl = float(params["sl_mult"])
+    reward = float(params["tp_mult"]) / base_sl
+    out = []
+    for mult in STOP_ATR_MULTS:
+        if math.isclose(mult, base_sl) or not sl_param.contains(mult):
+            continue
+        tp = min(tp_param.values, key=lambda v: (abs(float(v) - mult * reward), float(v)))
+        out.append(dict(params, sl_mult=mult, tp_mult=tp))
+    return out

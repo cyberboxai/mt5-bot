@@ -80,7 +80,7 @@ def test_thompson_rejects_arms_the_evidence_turned_against() -> None:
     sig = signal(1, "T0", 0.01)
     sig.arm.posterior = post(0.01, mean=-0.5, sd=0.05)
     intent, rec = run([sig])
-    assert intent is None and rec.codes() == {1: "THOMPSON_REJECT"}
+    assert intent is None and rec.codes() == {1: "EXPLORATION_PRIOR_LOW"}
 
 
 def test_strategy_level_regime_veto_applies_to_tiered_arms() -> None:

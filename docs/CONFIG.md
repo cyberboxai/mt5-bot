@@ -19,7 +19,7 @@ perfil mais agressivo ou mudar as chaves marcadas com "reinício" exige reinicia
 | `bars` | `1000` | Velas fechadas lidas por período em cada ciclo. |
 | `history_months` | `12` | Histórico pedido para a investigação semanal. |
 | `magic` | `510001` | Identificador das ordens do bot (reinício). Uma instância por `magic`. |
-| `account_mode` | `"any"` | `any`, `demo_only` ou `real_only` (reinício). |
+| `account_mode` | `"real"` | `real`, `demo` ou `auto` (reinício). Ver `docs/CONFIG_v4_2.md`. |
 | `real_money_confirmed` | `false` | Confirmação permanente para contas reais (reinício). |
 | `mt5_path` | `null` | Caminho do `terminal64.exe` se não estiver em Program Files (reinício). |
 
@@ -58,7 +58,7 @@ chave e o tecto rígido do código.
 | `candidates` | EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, NZDUSD, EURJPY, XAUUSD | Símbolos que o explorador de oportunidades pode juntar aos de `symbols`. |
 | `timeframes` | `["M5", "M15", "H1"]` | Períodos dos braços. |
 | `max_symbols` | `6` | Universo máximo (sem contar os extra do Doutor de Fluxo). |
-| `max_arms` | `400` | Braços activos no máximo. |
+| `max_arms` | `1400` | Braços activos no máximo. |
 | `default_arms` | `true` | Cria um braço com parâmetros por omissão por estratégia, símbolo e período. |
 | `max_spread_to_stop` | `0.25` | Spread máximo como fracção da distância ao SL (válido em qualquer mercado). |
 | `spread_spike_mult` | `2.5` | Spread máximo face ao típico daquela hora. |
@@ -216,7 +216,6 @@ Tudo aqui só reduz posições.
 | `margin_call_multiple` | `1.5` | Abaixo disto em relação à chamada, novas entradas param. |
 | `gap_quantile` | `0.99` | Quantil dos gaps históricos usado no tamanho. |
 | `overnight_hours` | `6` | Permanência a partir da qual se conta com gaps. |
-| `small_account_equity` | `25000` | Abaixo disto, sem posições ao fim de semana. |
 | `ladder_recovery_days` | `3` | Dias entre subidas na escada de risco. |
 | `stress_reduction` | `0.5` | Multiplicador de risco novo depois de um cenário violar limites. |
 

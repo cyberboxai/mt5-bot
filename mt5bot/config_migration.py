@@ -1,21 +1,30 @@
-"""Migration of older config.json files to the v3.1 schema.
+"""Migration of older config.json files to the current schema.
 
 Rules: map every deprecated key to its new home when one exists; when the mechanism it
 controlled no longer exists (the champion/challenger promotion gates of v3.0), keep the
 user's value under ``_legacy_v30`` so nothing is silently discarded; emit one notice per
-key. ``Config`` ignores keys that start with "_". The original file is never modified:
-``write_migrated`` writes ``config.migrated.json`` next to it.
+key. ``Config`` ignores keys that start with "_". Loading never touches the file:
+``write_migrated`` writes ``config.migrated.json`` next to it, and ``apply_migrated`` (used
+when the bot starts) replaces config.json only after saving a dated backup of it.
+
+v4.2 maps ``account_mode``. The old default ``any`` with ``real_money_confirmed: true`` becomes
+``real``. With confirmation false it becomes ``auto`` and stays unconfirmed: a migration never
+turns on real money that the owner did not already confirm.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from .persistence import atomic_write_text
 
+CURRENT_VERSION = "4.2"
 MIGRATED_NAME = "config.migrated.json"
+ACCOUNT_MODE_MAP = {"demo_only": "demo", "real_only": "real"}
 
 # v3.0 champion/challenger and optimiser acceptance gates. v3.1 replaces binary promotion
 # with evidence tiers: the walk-forward still computes these statistics (shown as quality
@@ -56,13 +65,55 @@ def migrate_config_dict(data: Mapping[str, Any]) -> tuple[dict[str, Any], list[s
     if isinstance(team, Mapping) and team.get("team_mode") == "baseline":
         notices.append("team.team_mode 'baseline' now means 'simple rules: the team records opinions but does not "
                        "resize'; it is no longer a separate engine")
+    _migrate_account_mode(out, notices)
+    _migrate_universe(out, notices)
+    tail = out.get("tail")
+    if isinstance(tail, dict) and "small_account_equity" in tail:
+        legacy["small_account_equity"] = tail.pop("small_account_equity")
+        notices.append("'tail.small_account_equity' was a fixed money band and no longer exists: the weekend rule now "
+                       "applies at every balance")
     if legacy:
         out["_legacy_v30"] = legacy
-    if out.get("config_version") != "3.1":
+    if out.get("config_version") != CURRENT_VERSION:
         if "config_version" in out or notices:
-            notices.append(f"config_version {out.get('config_version', '3.0')!r} -> '3.1'")
-        out["config_version"] = "3.1"
+            notices.append(f"config_version {out.get('config_version', '3.0')!r} -> {CURRENT_VERSION!r}")
+        out["config_version"] = CURRENT_VERSION
     return out, notices
+
+
+def _migrate_account_mode(out: dict[str, Any], notices: list[str]) -> None:
+    mode = out.get("account_mode")
+    if mode in ACCOUNT_MODE_MAP:
+        out["account_mode"] = ACCOUNT_MODE_MAP[mode]
+        notices.append(f"account_mode {mode!r} -> {out['account_mode']!r}")
+    elif mode == "any":
+        confirmed = out.get("real_money_confirmed") is True
+        out["account_mode"] = "real" if confirmed else "auto"
+        notices.append(f"account_mode 'any' -> {out['account_mode']!r}"
+                       + ("" if confirmed else ": real money stays unconfirmed, as it was"))
+
+
+def _migrate_universe(out: dict[str, Any], notices: list[str]) -> None:
+    """``symbols`` and ``timeframe`` are deprecated: their content moves into ``universe``."""
+    symbols = out.get("symbols")
+    timeframe = out.get("timeframe")
+    if symbols is None and timeframe is None:
+        return
+    universe = dict(out.get("universe") or {})
+    if isinstance(symbols, list):
+        known = list(universe.get("candidates") or [])
+        universe["candidates"] = [str(s) for s in symbols if s not in known] + known
+        out.pop("symbols")
+        notices.append(f"'symbols' is deprecated: {', '.join(map(str, symbols))} moved into 'universe.candidates'; "
+                       "the balance now decides which of them are traded")
+    if isinstance(timeframe, str):
+        frames = list(universe.get("timeframes") or [])
+        if frames and timeframe not in frames:
+            universe["timeframes"] = [timeframe] + frames
+        out.pop("timeframe")
+        notices.append(f"'timeframe' is deprecated: {timeframe} is now one of 'universe.timeframes'")
+    if universe:
+        out["universe"] = universe
 
 
 def write_migrated(config_path: Path, migrated: Mapping[str, Any]) -> Path:
@@ -73,3 +124,13 @@ def write_migrated(config_path: Path, migrated: Mapping[str, Any]) -> Path:
         return target
     atomic_write_text(target, text)
     return target
+
+
+def apply_migrated(config_path: Path, migrated: Mapping[str, Any], stamp: Optional[str] = None) -> Path:
+    """Replace config.json with its migrated form after a dated backup. Returns the backup path."""
+    path = Path(config_path)
+    label = stamp or time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-{label}")
+    shutil.copy2(path, backup)
+    atomic_write_text(path, json.dumps(migrated, indent=2, ensure_ascii=False) + "\n")
+    return backup

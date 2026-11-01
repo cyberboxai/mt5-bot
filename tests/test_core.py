@@ -137,8 +137,8 @@ class TestConfig:
     def test_shipped_config_is_valid_and_safe(self) -> None:
         cfg = Config.load(PROJECT_DIR / "config.json")
         assert cfg.symbols == ("EURUSD",)
-        assert cfg.account_mode == "any"
-        assert cfg.real_money_confirmed is False
+        assert cfg.account_mode == "real"
+        assert cfg.real_money_confirmed is True     # the owner's decision; see ADR-021
         assert cfg.risk_profile == "balanced"
         from mt5bot.profiles import effective_limits
 
@@ -147,19 +147,19 @@ class TestConfig:
             assert lim.t3_risk_pct <= limits.MAX_RISK_PER_TRADE_PCT and lim.t1_risk_pct <= lim.t2_risk_pct
             assert lim.daily_loss_pct <= limits.MAX_DAILY_LOSS_PCT
             assert lim.explore_day_pct <= limits.MAX_EXPLORATION_DAY_PCT
-        assert effective_limits(cfg, True).t1_risk_pct < effective_limits(cfg, False).t1_risk_pct
+        assert effective_limits(cfg, True).explore_day_pct < effective_limits(cfg, False).explore_day_pct
 
     def test_valid_file_loads(self, tmp_path: Path) -> None:
         path = tmp_path / "c.json"
         path.write_text(json.dumps({"symbols": ["XAUUSD", "EURUSD.m"], "trading_hours_server": [22, 6]}))
         cfg = Config.load(path)
-        assert cfg.symbols == ("XAUUSD", "EURUSD.m")
+        assert cfg.universe.candidates[:2] == ("XAUUSD", "EURUSD.m")  # the deprecated key moved into the universe
         assert cfg.trading_hours_server == (22, 6)
 
     def test_bom_is_accepted(self, tmp_path: Path) -> None:
         path = tmp_path / "c.json"
-        path.write_text(json.dumps({"timeframe": "H1"}), encoding="utf-8-sig")
-        assert Config.load(path).timeframe == "H1"
+        path.write_text(json.dumps({"risk_profile": "aggressive"}), encoding="utf-8-sig")
+        assert Config.load(path).risk_profile == "aggressive"
 
     def test_unknown_key_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / "c.json"

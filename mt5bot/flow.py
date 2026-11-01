@@ -1,8 +1,9 @@
 """Flow Doctor: the adaptive activity governor.
 
 If markets are open, signals are being generated and no trade has happened for
-``max_idle_hours`` (6 h on demo, 12 h on real by default), it finds the dominant blocker in
-the funnel and relaxes THAT filter by one bounded step. Every adjustment is logged with its
+``max_idle_hours`` (6 h on demo, 12 h on real by default), or the time-to-first-trade objective
+was just missed, it finds the dominant blocker in the funnel and relaxes THAT filter by one
+bounded step. Every adjustment is logged with its
 evidence and gets an automatic review: if the trades made under the relaxed setting perform
 poorly it is reverted. When the daily loss or the drawdown degrades, it tightens by reverting
 the most recent relaxation.
@@ -13,8 +14,12 @@ books, so what relaxing it would have done on recent data is known. Without enou
 they would have lost money, the filter stays as it is. Reverting and tightening are never limited.
 
 Hard limits (code): every knob has a floor and a ceiling below. The Flow Doctor can never
-touch the hard ceilings, SL/TP rules, the drawdown breaker, the daily loss limit, the
-exploration budget or any Risk Manager / Guardian veto: none of them is a knob.
+touch the hard ceilings, SL/TP rules, the drawdown breaker, the daily loss limit, the margin
+guard, the account mode or any Risk Manager / Guardian veto: none of them is a knob.
+
+v2 knobs: switch minimum-viable sizing on within the profile's cap, switch stop variants on,
+add a timeframe, add symbols, widen hours within the liquid sessions, and lower the entry gates
+down to their fixed floors in ``limits``.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
+from . import limits
 from .funnel import describe
 from .tiers import TIER_PT
 
@@ -36,7 +42,14 @@ KNOBS: dict[str, tuple[float, float, float, float, str]] = {
     "min_agreement": (0.0, -1.0, -20.0, 0.0, "redução da concordância mínima da equipa (mínimo 1)"),
     "min_aggregate_confidence": (0.0, -0.01, -0.02, 0.0, "redução da confiança agregada mínima (mínimo 0,50)"),
     "universe_extra": (0.0, 1.0, 0.0, 6.0, "símbolos extra no universo (os mais viáveis primeiro)"),
+    "entry_cost": (0.0, -0.05, -0.20, 0.0, "redução do custo sobre vantagem exigido na entrada (mínimo 1,0)"),
+    "entry_oos": (0.0, -2.0, -10.0, 0.0, "redução dos trades fora da amostra exigidos na entrada (mínimo 20)"),
+    "min_viable_on": (0.0, 1.0, 0.0, 1.0, "dimensionamento mínimo viável ligado, dentro do limite do perfil"),
+    "stop_variants_on": (0.0, 1.0, 0.0, 1.0, "variantes de stop ligadas, dentro do conjunto limitado"),
+    "timeframe_extra": (0.0, 1.0, 0.0, 2.0, "períodos gráficos extra (M5, M15, H1, H4)"),
 }
+
+TIMEFRAME_ORDER = ("M15", "H1", "M5", "H4")
 
 
 T1_ENTER_FLOOR = 0.52
@@ -101,6 +114,10 @@ class FlowInputs:
     min_agreement_cfg: int
     can_add_symbol: bool = True
     relaxations_last_week: int = 0
+    slo_missed: bool = False
+    min_viable_active: bool = True
+    stop_variants_active: bool = True
+    can_add_timeframe: bool = True
 
 
 # A relaxation needs a material blocker: seen at least this often and this share of all blocks.
@@ -151,9 +168,11 @@ def evaluate(inp: FlowInputs, state: FlowState, active: Sequence[Adjustment], cf
     idle_hours = cfg.max_idle_hours_real if inp.is_real else cfg.max_idle_hours_demo
     since = inp.last_order_ts if inp.last_order_ts is not None else inp.started_ts
     idle = (inp.now - since) / 3600.0
-    if not inp.markets_open or idle < idle_hours or inp.signals_in_window <= 0:
+    if not inp.markets_open or inp.signals_in_window <= 0 or (idle < idle_hours and not inp.slo_missed):
         return out
-    if inp.now - state.last_adjustment_ts < cfg.min_hours_between_adjustments * 3600:
+    # A missed objective must get a reaction within the hour, whatever the normal spacing is.
+    spacing = min(cfg.min_hours_between_adjustments, 1.0) if inp.slo_missed else cfg.min_hours_between_adjustments
+    if inp.now - state.last_adjustment_ts < spacing * 3600:
         return out
     if inp.relaxations_last_week >= cfg.max_relaxations_per_week:
         return out
@@ -168,6 +187,12 @@ def evaluate(inp: FlowInputs, state: FlowState, active: Sequence[Adjustment], cf
         if cf.get("n", 0) < cfg.min_counterfactual_signals or cf.get("virtual_mean_r", -1.0) < cfg.min_counterfactual_r:
             continue  # shadowed on recent data: unproven, or this filter protects value. It stays.
         if knob == "universe_extra" and not inp.can_add_symbol:
+            continue
+        if knob == "min_viable_on" and inp.min_viable_active:
+            continue
+        if knob == "stop_variants_on" and inp.stop_variants_active:
+            continue
+        if knob == "timeframe_extra" and not inp.can_add_timeframe:
             continue
         current = state.knobs.get(knob, KNOBS[knob][0])
         if knob == "min_agreement" and inp.min_agreement_cfg + current <= 1:
@@ -206,6 +231,25 @@ def overrides(cfg: Any, state: FlowState) -> dict[str, Any]:
         enter = max(T1_ENTER_FLOOR, cfg.tiers.t1_enter_p + k["t1_entry_p"])
         out["tiers.t1_enter_p"] = round(enter, 4)
         out["tiers.t1_exit_p"] = round(max(0.50, min(cfg.tiers.t1_exit_p, enter - 0.02)), 4)
+        out["entry_gates.min_p"] = round(max(limits.ENTRY_MIN_P_FLOOR, cfg.entry_gates.min_p + k["t1_entry_p"]), 4)
+    if k.get("entry_cost"):
+        out["entry_gates.min_cost_to_edge"] = round(max(limits.ENTRY_MIN_COST_TO_EDGE_FLOOR,
+                                                        cfg.entry_gates.min_cost_to_edge + k["entry_cost"]), 4)
+    if k.get("entry_oos"):
+        out["entry_gates.min_oos_trades"] = max(limits.ENTRY_MIN_OOS_TRADES_FLOOR,
+                                                int(cfg.entry_gates.min_oos_trades + k["entry_oos"]))
+    if k.get("min_viable_on"):
+        out["sizing.min_viable_enabled"] = True
+    if k.get("stop_variants_on"):
+        out["learning.stop_variants"] = True
+    if k.get("timeframe_extra"):
+        frames = list(cfg.universe.timeframes)
+        for tf in TIMEFRAME_ORDER:
+            if int(k["timeframe_extra"]) <= len(frames) - len(cfg.universe.timeframes):
+                break
+            if tf not in frames:
+                frames.append(tf)
+        out["universe.timeframes"] = tuple(frames)
     if k.get("min_agreement"):
         out["team.min_agreement"] = max(1, int(cfg.team.min_agreement + k["min_agreement"]))
     if k.get("min_aggregate_confidence"):
@@ -226,7 +270,7 @@ def status_text(tier_counts: Mapping[str, int], top: Optional[Mapping[str, Any]]
         best = max(active, key=lambda t: int(t[1]))
         head = f"{mode} ({TIER_PT.get(best, best).lower()}): {parts}."
     else:
-        head = "Em exploração: nenhum braço com evidência suficiente; só trades de exploração com micro-risco."
+        head = "Em exploração: nenhum braço passou as portas de entrada; só exploração dentro do orçamento."
     if top:
         symbol = (top.get("example") or {}).get("symbol")
         where = f" em {symbol}" if symbol else ""

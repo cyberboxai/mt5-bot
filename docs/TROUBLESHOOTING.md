@@ -39,7 +39,12 @@ linha no separador **Porque não estou a negociar?** (tabela de bloqueios, gráf
 | Sintoma / mensagem | Causa provável | Solução |
 |---|---|---|
 | `REAL MONEY account ... one deliberate confirmation` (código 3) | Conta real sem confirmação. | README, secção 8.2. |
-| `account_mode is "demo_only" but ...` (código 3) | A conta não corresponde ao `account_mode`. | Mude de conta no terminal ou ajuste `account_mode`. |
+| `O modo pedido é REAL, mas o terminal tem uma conta DEMO` (código 3) | A conta não corresponde ao modo. | Entre na conta real no MT5, ou use `start_bot_demo.bat`. |
+| `O modo pedido é DEMO, mas o terminal tem uma conta REAL` (código 3) | Protecção contra usar dinheiro real ao testar. | Entre numa conta demo, ou use `start_bot.bat`. |
+| `o lote mínimo arrisca mais do que o limite do perfil` | O saldo está abaixo do piso nesse símbolo. | Veja a tabela em "Porque não estou a negociar?". A aprendizagem continua. Confirme com a corretora se existem contas micro ou cent. |
+| `exposição do lote mínimo acima do limite` | O nocional do lote mínimo passa 30x o capital. | Sobe com o capital; use símbolos com menor nocional. |
+| Nenhum trade com o mercado aberto | Nenhum braço passou as portas de entrada. | É a decisão certa sem vantagem. Veja o bloqueio principal no painel; o Doutor de Fluxo age se o objectivo falhar e a validação o permitir. |
+| `commission_per_lot in the config is ...` | A configuração difere do histórico. | O bot usa o histórico. Corrija a configuração. |
 | `mt5.initialize() failed: (-10003, 'IPC initialize failed ...')` | MT5 fechado ou a arrancar; Python de 32 bits; vários terminais; permissões diferentes. | Abra o MT5 e espere que ligue. Confirme 64 bits. Defina `mt5_path`. Corra os dois com o mesmo nível de permissões. |
 | O terminal não abre sozinho | `terminal64.exe` fora de Program Files ou várias instalações. | `"mt5_path": "C:\\Program Files\\NOME DA PASTA\\terminal64.exe"`. |
 | `Symbol 'EURUSD' not found (also tried broker suffixes)` | O símbolo tem outro nome ou não existe nessa conta. | Market Watch > Show All; copie o nome exacto para `symbols`. |
