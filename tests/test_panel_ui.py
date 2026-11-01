@@ -110,8 +110,8 @@ def test_node_roster_fixture_matches_the_real_roster() -> None:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed")
 def test_office_engine_unit_tests_pass_under_node() -> None:
-    out = subprocess.run(["node", "--test", str(PROJECT / "tests" / "js" / "office.test.mjs")], capture_output=True,
-                         text=True, timeout=120, cwd=PROJECT)
+    out = subprocess.run(["node", "--test", "--test-reporter=tap", str(PROJECT / "tests" / "js" / "office.test.mjs")],
+                         capture_output=True, text=True, timeout=120, cwd=PROJECT)
     assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
     assert "# fail 0" in out.stdout
 
