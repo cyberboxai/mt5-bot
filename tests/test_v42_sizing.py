@@ -532,7 +532,7 @@ def test_a_deposit_is_not_a_weekly_result_and_rescans_at_once(make_bot, fake_mt5
     bot.run_once()
     bot._next_scan = 1e18
     bot.registry.set_kv("week_ref", '{"week": "1", "equity": 100.0}')
-    bot.registry.set_kv("cash_flow_checked", "0")
+    bot.registry.set_kv("cash_flow_checked", str(bot._utc_now() - 3600))  # a real time: Windows has no negative ones
     fake_mt5.deals.append(SimpleNamespace(symbol="", volume=0.0, entry=0, commission=0.0, type=fake_mt5.DEAL_TYPE_BALANCE,
                                           ticket=9, time=1, position_id=0, profit=500.0, comment="deposit"))
     bot._check_cash_flow()
