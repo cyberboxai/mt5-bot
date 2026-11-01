@@ -33,7 +33,8 @@ from .budget import CallBudget, estimate_cost
 from .cache import TTLCache, cache_key
 from .classify import classify, describe, retry_after_seconds
 from .health import OFFLINE_STATES, AdvisorHealth, HealthSettings
-from .prompts import (BRIEFING_SYSTEM, EXPLAIN_SYSTEM, MANAGEMENT_SYSTEM, PROBE_SYSTEM, RESEARCH_SYSTEM,
+from .prompts import (BRIEFING_SYSTEM, EXPLAIN_SYSTEM, MANAGEMENT_SYSTEM, PROBE_SYSTEM, REPORT_SYSTEM, RESEARCH_SYSTEM,
+                      report_user,
                       TRADE_REVIEW_SYSTEM, clean_untrusted, sanitize_features, untrusted_block,
                       user_message)
 from .redact import REDACTOR, Redactor
@@ -52,6 +53,13 @@ PROBE_MAX_TOKENS = 64
 TILT_HOURS = 24.0
 
 ClientFactory = Callable[[str, float], Any]
+
+
+BATCH_DISCOUNT = 0.5    # Message Batches bill half the standard token prices
+REPORT_SCHEMA: dict = {"type": "object", "additionalProperties": False, "required": ["summary", "highlights"],
+                       "properties": {"summary": {"type": "string", "maxLength": 1500},
+                                      "highlights": {"type": "array", "maxItems": 5,
+                                                     "items": {"type": "string", "maxLength": 300}}}}
 
 
 def _default_client_factory(api_key: str, timeout: float) -> Any:
@@ -95,6 +103,8 @@ class ClaudeAdvisor(Advisor):
         self._strategy_menu = strategy_menu or (lambda: {})
         self._menu_lookup = menu_lookup
         self.health = AdvisorHealth(HealthSettings.from_config(cfg), clock, rng, self._on_transition)
+        self._reports: dict[str, dict[str, Any]] = {}
+        self._report_outbox: list[tuple[str, str]] = []
         self.budget = CallBudget(cfg.max_calls_per_hour, cfg.max_daily_cost_usd, clock,
                                  restore=store.advisor_usage_since if store is not None else None)
         self.cache = TTLCache(cfg.cache_ttl_seconds, clock=clock)
@@ -133,7 +143,7 @@ class ClaudeAdvisor(Advisor):
     def update_config(self, cfg: Any) -> None:
         self.cfg = cfg
         self.health.settings = HealthSettings.from_config(cfg)
-        self.budget.update_limits(cfg.max_calls_per_hour, cfg.max_daily_cost_usd)
+        self.budget.update_limits(cfg.max_calls_per_hour, cfg.max_daily_cost_usd, cfg.max_monthly_cost_usd)
         self.cache.ttl = float(cfg.cache_ttl_seconds)
         self.refresh_key()
 
@@ -484,6 +494,83 @@ class ClaudeAdvisor(Advisor):
         return self._background("explain", self.cfg.model_fast, EXPLAIN_SYSTEM, EXPLAIN_SCHEMA, user,
                                 self.cfg.max_tokens_fast, self.cfg.effort_fast, False, deliver)
 
+    # ---- non-urgent reports: Message Batches at half price, on the small model
+
+    def submit_report(self, kind: str, facts: Mapping[str, Any]) -> bool:
+        """Queue one report. Hours of delay are fine for a report, and a batch costs 50 percent less."""
+        if self._closed or not self.cfg.enabled or not self.health.can_call():
+            return False
+        system, user = REPORT_SYSTEM, report_user(kind, facts)
+        model, max_tokens = self.cfg.model_fast, self.cfg.max_tokens_deep
+        worst = self._worst_case(model, system, user, max_tokens) * (BATCH_DISCOUNT if self.cfg.batch_reports else 1.0)
+        ok, why, resume = self.budget.reserve(worst)
+        if not ok:
+            self.health.budget_capped(resume, why)
+            return False
+        params = {"model": model, "max_tokens": int(max_tokens),
+                  "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                  "messages": [{"role": "user", "content": user}],
+                  "output_config": {"format": {"type": "json_schema", "schema": api_schema(REPORT_SCHEMA)},
+                                    "effort": self.cfg.effort_fast}}
+        custom_id = f"{kind}-{int(self._clock())}"
+        try:
+            batch = self._get_client().messages.batches.create(requests=[{"custom_id": custom_id, "params": params}])
+        except Exception as exc:  # noqa: BLE001 - a report is optional
+            kind_of = classify(exc)
+            self.health.record_failure(kind_of, "", retry_after_seconds(exc))
+            self.budget.settle(worst, None)
+            log.debug("report batch not submitted: %s", kind_of)
+            return False
+        self._reports[str(batch.id)] = {"kind": kind, "custom_id": custom_id, "worst": worst, "model": model,
+                                        "user": user, "hash": hashlib.sha256(user.encode("utf-8")).hexdigest()[:24]}
+        return True
+
+    def poll_reports(self) -> None:
+        """Collect finished batches. Results arrive in any order, so they are keyed by custom id."""
+        if not self._reports or self._closed:
+            return
+        client = self._get_client()
+        for batch_id, job in list(self._reports.items()):
+            try:
+                if client.messages.batches.retrieve(batch_id).processing_status != "ended":
+                    continue
+                entries = {e.custom_id: e for e in client.messages.batches.results(batch_id)}
+            except Exception:  # noqa: BLE001 - polled again later; the reservation stays until it settles
+                log.debug("report batch %s not ready", batch_id, exc_info=True)
+                continue
+            del self._reports[batch_id]
+            self._settle_report(job, entries.get(job["custom_id"]))
+
+    def _settle_report(self, job: Mapping[str, Any], entry: Any) -> None:
+        result = CallResult(False)
+        text = ""
+        if entry is not None and entry.result.type == "succeeded":
+            message = entry.result.message
+            usage = getattr(message, "usage", None)
+            price, _known = self.cfg.price(job["model"])
+            result = CallResult(False, input_tokens=_int_attr(usage, "input_tokens"),
+                                output_tokens=_int_attr(usage, "output_tokens"),
+                                cache_read_tokens=_int_attr(usage, "cache_read_input_tokens"),
+                                cache_write_tokens=_int_attr(usage, "cache_creation_input_tokens"))
+            result.cost_usd = BATCH_DISCOUNT * estimate_cost(price, result.input_tokens, result.output_tokens,
+                                                             result.cache_read_tokens, result.cache_write_tokens)
+            text = _first_text(message) or ""
+            try:
+                data = json.loads(text)
+                validate(REPORT_SCHEMA, data)
+                result.ok, result.data = True, data
+                lines = [str(data["summary"]), ""] + [f"- {h}" for h in data.get("highlights", [])]
+                self._report_outbox.append((str(job["kind"]), self._redactor.redact("\n".join(lines))))
+            except (ValueError, SchemaError, KeyError) as exc:
+                result.detail = f"invalid report: {type(exc).__name__}"
+        self.budget.settle(float(job["worst"]), result)
+        self._audit(f"report:{job['kind']}", str(job["model"]), str(job["hash"]), str(job["user"]),
+                    "ok" if result.ok else "error", result, text)
+
+    def take_reports(self) -> list[tuple[str, str]]:
+        out, self._report_outbox = self._report_outbox, []
+        return out
+
     def take_briefing(self) -> Optional[Briefing]:
         with self._lock:
             out, self._briefing = self._briefing, None
@@ -533,8 +620,3 @@ class ClaudeAdvisor(Advisor):
                     pass
         self._fast.submit(lambda: None).result(timeout=max(0.0, deadline - time.monotonic()))
         self._bg.submit(lambda: None).result(timeout=max(0.0, deadline - time.monotonic()))
-
-
-def clean_headlines(items: Sequence[Any]) -> list[str]:
-    """Public helper for the News Sentinel (same cleaning as the prompt wrapper)."""
-    return clean_untrusted(items)

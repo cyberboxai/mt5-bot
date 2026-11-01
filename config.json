@@ -23,10 +23,14 @@
 
   "universe": {
     "candidates": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "XAUUSD"],
-    "timeframes": ["M5", "M15", "H1"],
+    "timeframes": ["M15", "H1", "H4", "D1"],
     "max_symbols": 6
   },
   "tiers": {"exploration_enabled": true, "exploration_slots": 2},
+  "costs": {"k": 2.0, "gate_enabled": true, "rollover_start": "23:50", "rollover_end": "00:20", "friday_cutoff_hour": 21.0},
+  "portfolio": {"max_concurrent_arms": 4},
+  "tail": {"margin_stop_out_multiple": 3.0},
+  "governance": {"enabled": true, "horizon_trades": 200, "horizon_days": 91},
   "flow_doctor": {"enabled": true},
 
   "trials_per_strategy": 30,
@@ -45,6 +49,6 @@
   "mt5_path": null,
 
   "team": {"team_mode": "auto"},
-  "claude": {"enabled": false, "max_calls_per_hour": 20, "max_daily_cost_usd": 0.5, "latency_budget_ms": 1500},
+  "claude": {"enabled": false, "review_trades": false, "max_calls_per_hour": 20, "max_daily_cost_usd": 0.5, "max_monthly_cost_usd": 5.0, "latency_budget_ms": 1500},
   "panel": {"enabled": true, "host": "127.0.0.1", "port": 8765, "control_actions_enabled": false}
 }

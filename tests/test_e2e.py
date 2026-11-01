@@ -129,8 +129,9 @@ def test_lifecycle_exploration_research_promotion_and_demotion(tmp_path: Path) -
     bot.run_once()
     assert any(a.prior_n > 0 for a in bot.arms.arms.values()), "research must give the arms a prior"
 
-    # Phase 2: the edge persists live; the bot trades from the first hours (exploration or
-    # prior-qualified T1) and evidence lifts at least one arm to T2.
+    # Phase 2: the edge persists live. On demo the bot trades within days through exploration (a
+    # prior-qualified T1 arm must first clear the cost gate), and evidence lifts one arm to T2 once
+    # research agrees it has an edge. A verdict is what opens T2.
     live = synthetic_bars(24 * 150, seed=202, trend=0.15)
     close, scale = _scaled(live, float(history["close"][-1]))
     first_trade_hour = promoted_hour = None
@@ -144,7 +145,7 @@ def test_lifecycle_exploration_research_promotion_and_demotion(tmp_path: Path) -
         if any(a.tier in ("T2", "T3") for a in bot.arms.arms.values()):
             promoted_hour = i
             break
-    assert first_trade_hour is not None and first_trade_hour < 48, "trading must start within the first two days"
+    assert first_trade_hour is not None and first_trade_hour < 120, "exploration must start within the first week"
     assert promoted_hour is not None, "a genuine edge must be promoted to T2 by evidence"
     promoted = next(a for a in bot.arms.arms.values() if a.tier in ("T2", "T3"))
     t1_risk = [t.risk_pct for t in reg.trades(mode="live") if t.tier == "T1" and t.risk_pct]
@@ -184,5 +185,7 @@ def test_lifecycle_exploration_research_promotion_and_demotion(tmp_path: Path) -
     assert all(t.r is not None for t in live_rows if t.status == "closed")
     bot.funnel.flush()
     reasons = {r["reason"] for r in reg.conn.execute("SELECT DISTINCT reason FROM funnel_events")}
-    assert {"BAR_EVALUATED", "SIGNAL", "ORDER_OK"} <= reasons
+    assert {"BAR_EVALUATED", "SIGNAL"} <= reasons
+    # The funnel keeps 30 days and this run spans 150. Orders are in the ledger, which keeps everything.
+    assert reg.conn.execute("SELECT COUNT(*) AS n FROM ledger WHERE kind = 'order.filled'").fetchone()["n"] > 0
     bot.close()

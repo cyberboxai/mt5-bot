@@ -6,11 +6,14 @@ which is faster than indexing numpy scalars and still linear in the input size.
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
+
+from .core import incremental as inc
 
 _CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 _CACHE_SIZE = 64
@@ -41,8 +44,138 @@ def cached(bars: np.ndarray, name: str, compute: Callable[[], np.ndarray]) -> np
     return value
 
 
+# ---------------------------------------------------------------- append-only series
+#
+# The live loop keeps each symbol and timeframe in a ``SeriesBuffer``: rows are only ever appended,
+# so the indicators of a view of the buffer can extend their last result by one value, in O(1),
+# instead of recomputing hundreds of bars. Any other input takes the batch path below, and research
+# always does. tests/test_incremental.py proves both paths give the same numbers.
+
+
+class _Extension:
+    __slots__ = ("n", "out", "step")
+
+    def __init__(self, capacity: int, step: Any) -> None:
+        self.n = 0
+        self.out = np.full(capacity, np.nan)
+        self.step = step
+
+
+class _Root:
+    __slots__ = ("array", "extensions", "children")
+
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+        self.extensions: dict[tuple[int, str], _Extension] = {}
+        self.children: list[int] = []
+
+
+_ROOTS: dict[int, _Root] = {}
+_LOCK = threading.RLock()   # the team's agents read the same series from other threads
+
+
+class SeriesBuffer:
+    """Append-only bars with a stable memory location. ``view()`` is what strategies receive."""
+
+    def __init__(self, rows: np.ndarray, capacity: int) -> None:
+        self.array = np.zeros(max(capacity, len(rows) + 1), dtype=rows.dtype)
+        self.array[:len(rows)] = rows
+        self.n = len(rows)
+        with _LOCK:
+            _ROOTS[id(self.array)] = _Root(self.array)
+
+    def __len__(self) -> int:
+        return self.n
+
+    @property
+    def free(self) -> int:
+        return len(self.array) - self.n
+
+    def append(self, rows: np.ndarray) -> None:
+        end = self.n + len(rows)
+        self.array[self.n:end] = rows
+        self.n = end
+
+    def view(self) -> np.ndarray:
+        return self.array[:self.n]
+
+    def release(self) -> None:
+        with _LOCK:
+            _forget(id(self.array))
+
+
+def _forget(root_id: int) -> None:
+    root = _ROOTS.pop(root_id, None)
+    if root is not None:
+        for child in root.children:
+            _forget(child)
+
+
+def _root_of(x: np.ndarray) -> Optional[tuple[_Root, int]]:
+    """The registered root of ``x`` and its field offset, only if ``x`` starts at row 0."""
+    base = x.base
+    if not isinstance(base, np.ndarray):
+        return None
+    root = _ROOTS.get(id(base))
+    if root is None or x.ndim != 1 or x.strides[0] != base.strides[0]:
+        return None
+    offset = x.__array_interface__["data"][0] - base.__array_interface__["data"][0]
+    return (root, offset) if 0 <= offset < base.strides[0] else None
+
+
+def _extend(found: tuple[_Root, int], name: str, n: int, make: Callable[[], Any], feed: Callable[[Any, int], float]) -> np.ndarray:
+    root, offset = found
+    with _LOCK:
+        key = (offset, name)
+        ext = root.extensions.get(key)
+        if ext is None or n < ext.n:
+            ext = root.extensions[key] = _Extension(len(root.array), make())
+            registered = _Root(ext.out)
+            _ROOTS[id(ext.out)] = registered
+            root.children.append(id(ext.out))
+        out, step = ext.out, ext.step
+        for i in range(ext.n, n):
+            out[i] = feed(step, i)
+        ext.n = max(ext.n, n)
+        view = out[:n]
+        view.flags.writeable = False
+        return view
+
+
+def _one_input(x: np.ndarray, name: str, make: Callable[[], Any]) -> Optional[np.ndarray]:
+    found = _root_of(x)
+    if found is None:
+        return None
+    return _extend(found, name, x.size, make, lambda step, i: step.update(float(x[i])))
+
+
+def _bars_input(bars: np.ndarray, name: str, make: Callable[[], Any], fields: tuple[str, ...]) -> Optional[np.ndarray]:
+    found = _root_of(bars)
+    if found is None:
+        return None
+    columns = [bars[f] for f in fields]
+    return _extend(found, name, len(bars), make, lambda step, i: step.update(*(float(c[i]) for c in columns)))
+
+
 def bars_atr(bars: np.ndarray, period: int) -> np.ndarray:
+    fast = _bars_input(bars, f"atr{period}", lambda: inc.WilderAtr(period), ("high", "low", "close"))
+    if fast is not None:
+        return fast
     return cached(bars, f"atr{period}", lambda: atr(bars["high"], bars["low"], bars["close"], period))
+
+
+def bars_adx(bars: np.ndarray, period: int = 14) -> np.ndarray:
+    fast = _bars_input(bars, f"adx{period}", lambda: inc.WilderAdx(period), ("high", "low", "close"))
+    if fast is not None:
+        return fast
+    return cached(bars, f"adx{period}", lambda: adx(np.asarray(bars["high"], dtype=float),
+                                                    np.asarray(bars["low"], dtype=float),
+                                                    np.asarray(bars["close"], dtype=float), period))
+
+
+def bars_rolling_median(bars: np.ndarray, field: str, window: int, batch: Callable[[], np.ndarray]) -> np.ndarray:
+    fast = _bars_input(bars, f"median_{field}_{window}", lambda: inc.RollingMedian(window), (field,))
+    return fast if fast is not None else batch()
 
 
 def ema(values: Any, period: int) -> np.ndarray:
@@ -53,6 +186,9 @@ def ema(values: Any, period: int) -> np.ndarray:
     if period < 1:
         raise ValueError("period must be >= 1")
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"ema{period}", lambda: inc.Ema(period))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if x.size < period:
         return out
@@ -72,6 +208,9 @@ def sma(values: Any, period: int) -> np.ndarray:
     if period < 1:
         raise ValueError("period must be >= 1")
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"sma{period}", lambda: inc.Sma(period))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if x.size < period:
         return out
@@ -83,6 +222,9 @@ def sma(values: Any, period: int) -> np.ndarray:
 def rolling_std(values: Any, period: int) -> np.ndarray:
     """Population standard deviation over the last ``period`` values (inclusive)."""
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"std{period}", lambda: inc.RollingStd(period))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if period < 2 or x.size < period:
         return out
@@ -132,6 +274,9 @@ def rsi(close: Any, period: int) -> np.ndarray:
     if period < 1:
         raise ValueError("period must be >= 1")
     c = np.asarray(close, dtype=float)
+    fast = _one_input(c, f"rsi{period}", lambda: inc.WilderRsi(period))
+    if fast is not None:
+        return fast
     out = np.full(c.shape, np.nan)
     if c.size < period + 1:
         return out
@@ -159,6 +304,9 @@ def rsi(close: Any, period: int) -> np.ndarray:
 def rolling_max_prev(values: Any, period: int) -> np.ndarray:
     """Max of the ``period`` values BEFORE index i (excludes i). NaN until defined."""
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"maxprev{period}", lambda: inc.RollingMaxPrev(period))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if x.size <= period:
         return out
@@ -169,6 +317,9 @@ def rolling_max_prev(values: Any, period: int) -> np.ndarray:
 def rolling_min_prev(values: Any, period: int) -> np.ndarray:
     """Min of the ``period`` values BEFORE index i (excludes i). NaN until defined."""
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"minprev{period}", lambda: inc.RollingMinPrev(period))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if x.size <= period:
         return out
@@ -182,6 +333,9 @@ def rolling_percentile_rank(values: Any, lookback: int, chunk: int = 4096) -> np
     NaN inputs propagate as NaN. Processed in chunks to bound memory.
     """
     x = np.asarray(values, dtype=float)
+    fast = _one_input(x, f"pctrank{lookback}", lambda: inc.PercentileRank(lookback))
+    if fast is not None:
+        return fast
     out = np.full(x.shape, np.nan)
     if lookback < 2 or x.size < lookback:
         return out
@@ -202,6 +356,9 @@ def efficiency_ratio(close: Any, period: int) -> np.ndarray:
     if period < 1:
         raise ValueError("period must be >= 1")
     c = np.asarray(close, dtype=float)
+    fast = _one_input(c, f"er{period}", lambda: inc.EfficiencyRatio(period))
+    if fast is not None:
+        return fast
     out = np.full(c.shape, np.nan)
     if c.size <= period:
         return out
@@ -215,7 +372,7 @@ def efficiency_ratio(close: Any, period: int) -> np.ndarray:
 
 
 def adx(high: Any, low: Any, close: Any, period: int = 14) -> np.ndarray:
-    """Wilder's Average Directional Index (0..100). First defined value at index 2 * period."""
+    """Wilder's Average Directional Index (0..100). First defined value at index 2 * period - 1."""
     if period < 1:
         raise ValueError("period must be >= 1")
     h = np.asarray(high, dtype=float)
@@ -223,7 +380,7 @@ def adx(high: Any, low: Any, close: Any, period: int = 14) -> np.ndarray:
     c = np.asarray(close, dtype=float)
     n = h.size
     out = np.full(n, np.nan)
-    if n < 2 * period + 1:
+    if n < 2 * period:      # an index's value must not depend on how many bars come after it
         return out
     up = h[1:] - h[:-1]
     down = lo[:-1] - lo[1:]

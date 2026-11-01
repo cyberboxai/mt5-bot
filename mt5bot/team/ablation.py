@@ -106,7 +106,8 @@ def ablation_report(dossiers: Sequence[Mapping[str, Any]], settings: EnsembleSet
     advisor_used = sum(1 for d in rows if d.get("advisor_multiplier") is not None
                        and (d.get("advisor") or {}).get("status") == "ok")
     out["advisor"] = {"reviews": advisor_used,
-                      "value_added_sharpe": round(sharpe(team_r) - sharpe(no_adv_r), 5)}
+                      "value_added_sharpe": round(sharpe(team_r) - sharpe(no_adv_r), 5),
+                      "value_added_r": round(float((team_r - no_adv_r).sum()), 5)}
     per_agent: dict[str, Any] = {}
     for agent in agents:
         involved = [i for i, d in enumerate(rows) if any(op.get("agent") == agent for op in d.get("opinions", []))]
@@ -130,6 +131,15 @@ def ablation_report(dossiers: Sequence[Mapping[str, Any]], settings: EnsembleSet
         out["team_beats_baseline"] = False
         out["verdict"] = f"insufficient data ({len(rows)}/{min_samples} resolved decisions)"
     return out
+
+
+def advisor_gating_earned(report: Optional[Mapping[str, Any]], spend_usd: float, mean_risk_money: float,
+                         min_samples: int) -> bool:
+    """Per-trade gating is earned only by enough reviews whose value exceeds what they cost."""
+    advisor = (report or {}).get("advisor") or {}
+    if int(advisor.get("reviews") or 0) < min_samples or float(advisor.get("value_added_sharpe") or 0.0) <= 0:
+        return False
+    return float(advisor.get("value_added_r") or 0.0) * max(mean_risk_money, 0.0) > max(spend_usd, 0.0)
 
 
 def select_mode(configured: str, report: Optional[Mapping[str, Any]], min_samples: int) -> tuple[str, str]:

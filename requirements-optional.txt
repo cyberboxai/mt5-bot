@@ -1,0 +1,5 @@
+# Optional extras, each for one feature. The bot runs fully without them.
+anthropic          # Claude advisor (reports, explanations). Never needed for trading.
+keyring            # Windows Credential Manager for the Claude API key.
+pyarrow            # Parquet export of research data.
+numba              # Faster research loops. numpy fallbacks stay the default.

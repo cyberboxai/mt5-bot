@@ -9,7 +9,7 @@ advisor booth when the advisor is not ONLINE).
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from mt5bot.team.roster import BY_ID, DEPARTMENTS, ROOMS, ROSTER
 
@@ -144,7 +144,3 @@ def annotate(event: Mapping[str, Any], advisor_state: str) -> dict[str, Any]:
     out = dict(event)
     out["effects"] = event_effects(event, advisor_state)
     return out
-
-
-def agents_in(events: Iterable[Mapping[str, Any]]) -> set[str]:
-    return {str(e.get("agent")) for e in events if e.get("agent")}

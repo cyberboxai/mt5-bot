@@ -8,6 +8,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -20,9 +21,9 @@ from typing import Any, Optional
 
 import pytest
 
+from mt5bot.adapters.sim_broker import SIM_LOGIN
 from mt5bot.config import Config
 from mt5bot.officedb import OfficeStore
-from mt5bot.sim.terminal import SIM_LOGIN
 from panel import office as office_mod
 from panel.app import main as panel_main
 from panel.app import run_in_thread, stop_server
@@ -30,10 +31,11 @@ from panel.app import run_in_thread, stop_server
 PROJECT = Path(__file__).resolve().parent.parent
 TOKEN = "panel-test-token-0123456789"
 API_KEY = "sk-ant-api03-PANEL-LEAK-CHECK-000000"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENDPOINTS = ("/api/status", "/api/office/state", "/api/equity", "/api/performance", "/api/trades", "/api/agents",
              "/api/agents/risk_manager", "/api/decisions", "/api/strategies", "/api/risk", "/api/markets",
              "/api/advisor", "/api/health", "/api/team", "/api/events", "/api/replay", "/api/arms", "/api/funnel",
-             "/api/flow")
+             "/api/flow", "/api/truth", "/api/timemachine", "/api/project")
 
 
 @pytest.fixture(scope="module")
@@ -545,3 +547,63 @@ def test_panel_code_has_no_runtime_code_generation() -> None:
         assert "http://" not in text.replace("http://www.w3.org", "") and "https://" not in text, f"{path}: no CDN"
         if path.suffix == ".html":
             assert "<script>" not in text and " style=" not in text and "onclick" not in text.lower(), path
+
+
+def test_truth_views_show_intervals_and_replay_any_decision(panel) -> None:
+    _ctx, port = panel()
+    truth = json.loads(request(port, "/api/truth")[2])
+    assert set(truth) >= {"reality_gap", "arms", "execution", "tail", "trials"}
+    for arm in truth["arms"]:
+        assert "lo_r" in arm and "hi_r" in arm and "verdict" in arm       # never a bare point estimate
+    log = json.loads(request(port, "/api/timemachine")[2])["decisions"]
+    assert log, "the demo produced no decisions"
+    decision = json.loads(request(port, f"/api/timemachine/{log[0]['id']}")[2])
+    assert decision["steps"] and decision["stamp"]["code"]
+    encoded = log[0]["id"].replace(":", "%3A")          # what the browser really sends
+    assert request(port, f"/api/timemachine/{encoded}")[0] == 200
+    assert any(s["kind"].startswith("decision.") or s["kind"].startswith("order.") for s in decision["steps"])
+    assert request(port, "/api/timemachine/no-such-decision")[0] == 404
+
+
+def test_project_card_states_the_verdict_and_never_a_promise(panel) -> None:
+    _ctx, port = panel()
+    project = json.loads(request(port, "/api/project")[2])
+    assert project["verdict"] in ("evidence_insufficient", "edge_plausible", "no_edge")
+    assert set(project["services"]) == {"data", "signals", "allocation", "risk", "execution", "research", "ops"}
+    assert project["components"]
+
+
+def test_metrics_endpoint_is_off_by_default(panel) -> None:
+    _ctx, port = panel()
+    assert request(port, "/metrics")[0] == 404
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_stopping_the_demo_panel_stops_its_simulator(tmp_path: Path) -> None:
+    """Regression: a SIGTERM left the simulator running for ever, eating a CPU core."""
+    log = tmp_path / "panel.out"
+    with open(log, "w", encoding="utf-8") as out:
+        proc = subprocess.Popen([sys.executable, "-m", "panel", "--demo", "--port", "0", "--demo-dir", str(tmp_path / "d"),
+                                 "--demo-speed", "1"], cwd=PROJECT_ROOT, stdout=out, stderr=subprocess.STDOUT)
+    try:
+        child = None
+        for _ in range(100):
+            time.sleep(0.2)
+            found = re.search(r"simulation started \(pid (\d+)\)", (tmp_path / "d" / "panel.log").read_text(encoding="utf-8")
+                              if (tmp_path / "d" / "panel.log").exists() else "")
+            if found:
+                child = int(found.group(1))
+                break
+        assert child, log.read_text(encoding="utf-8")[-800:]
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(20)
+        for _ in range(100):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.2)
+        pytest.fail("the simulator survived its panel")
+    finally:
+        if proc.poll() is None:
+            proc.kill()

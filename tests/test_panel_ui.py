@@ -48,11 +48,11 @@ def test_app_css_uses_tokens_not_raw_brand_hex() -> None:
 def test_fonts_are_vendored_with_their_licences() -> None:
     fonts_css = (STATIC / "css" / "fonts.css").read_text(encoding="utf-8")
     files = re.findall(r'url\("\.\./fonts/([^"]+)"\)', fonts_css)
-    assert len(files) == 6
+    assert len(files) == 8
     for name in files:
         data = (STATIC / "fonts" / name).read_bytes()
         assert data[:4] == b"wOF2", name
-    for licence in ("OFL-Syne.txt", "OFL-SpaceMono.txt"):
+    for licence in ("OFL-Syne.txt", "OFL-SpaceGrotesk.txt", "OFL-SpaceMono.txt"):
         assert "SIL OPEN FONT LICENSE" in (STATIC / "fonts" / licence).read_text(encoding="utf-8").upper()
 
 
@@ -110,8 +110,8 @@ def test_node_roster_fixture_matches_the_real_roster() -> None:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed")
 def test_office_engine_unit_tests_pass_under_node() -> None:
-    out = subprocess.run(["node", "--test", str(PROJECT / "tests" / "js" / "office.test.mjs")], capture_output=True,
-                         text=True, timeout=120, cwd=PROJECT)
+    out = subprocess.run(["node", "--test", "--test-reporter=tap", str(PROJECT / "tests" / "js" / "office.test.mjs")],
+                         capture_output=True, text=True, timeout=120, cwd=PROJECT)
     assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
     assert "# fail 0" in out.stdout
 

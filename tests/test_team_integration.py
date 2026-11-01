@@ -14,6 +14,7 @@ import pytest
 import fake_anthropic as fa
 from conftest import FakeMT5, FixedSource
 from team_helpers import fixed
+from mt5bot.adapters.mt5 import Mt5Adapter
 from mt5bot.advisor import NullAdvisor
 from mt5bot.advisor.claude import ClaudeAdvisor
 from mt5bot.config import Config
@@ -62,7 +63,7 @@ def test_team_disagreement_shrinks_the_real_order(make_bot, fake_mt5: FakeMT5, t
     for mode in ("baseline", "full"):
         fake = FakeMT5()
         bot = make_bot(team_mode=mode, state_root=str(tmp_path / mode))
-        bot.mt5 = fake
+        bot.broker = bot.market = Mt5Adapter(fake)
         bot.startup()
         bot.run_once()
         pin(bot, trend_analyst=("long", 0.7), mean_reversion_analyst=("short", 0.4), breakout_analyst=("flat", 0.5),
@@ -86,8 +87,9 @@ def claude(behaviour: Any) -> ClaudeAdvisor:
 def test_orders_identical_to_null_advisor_in_failure_modes(make_bot, tmp_path: Path, failure: str, mode: str) -> None:
     def run(advisor: Any, name: str) -> list:
         fake = FakeMT5()
-        bot = make_bot(team_mode=mode, state_root=str(tmp_path / name), advisor=advisor)
-        bot.mt5 = fake
+        bot = make_bot(team_mode=mode, state_root=str(tmp_path / name), advisor=advisor,
+                       claude={"review_trades": True, "review_requires_ablation": False})
+        bot.broker = bot.market = Mt5Adapter(fake)
         bot.startup()
         bot.run_once()
         pin(bot, trend_analyst=("long", 0.7), mean_reversion_analyst=("short", 0.3), breakout_analyst=("long", 0.6),
@@ -160,14 +162,15 @@ def test_panel_pause_blocks_new_entries_without_closing_positions(make_bot, fake
     assert len(fake_mt5.positions) == pos_count  # pausing never closes anything
 
 
-def test_guardian_freezes_on_an_unjournaled_position(make_bot, fake_mt5: FakeMT5) -> None:
+def test_unjournaled_position_is_adopted_logged_and_blocks_entries(make_bot, fake_mt5: FakeMT5) -> None:
     bot = start(make_bot)
-    fake_mt5.add_position("EURUSD", "BUY", bot.cfg.magic, sl=1.0, tp=2.0)  # appeared behind the bot's back
+    pos = fake_mt5.add_position("EURUSD", "BUY", bot.cfg.magic, sl=1.0, tp=2.0)  # appeared behind the bot's back
     bot._next_housekeeping = 0
     next_bar(bot, fake_mt5)
-    assert bot._guardian_freeze and "journal" in bot._guardian_freeze
+    assert bot.registry.trade_by_ticket(pos.ticket) is not None   # periodic reconciliation, not only at start-up
+    assert [e.kind for e in bot.events.stream(str(pos.ticket))] == ["reconcile.adopted"]
     assert opening_sends(fake_mt5) == []
-    assert "Guardian freeze" in bot._entry_block_reason()
+    assert "Guardian freeze" in bot._entry_block_reason()   # counted in full: its wide stop exceeds the open-risk cap
 
 
 def test_guardian_kill_switch_on_ceiling_breach(make_bot, fake_mt5: FakeMT5) -> None:

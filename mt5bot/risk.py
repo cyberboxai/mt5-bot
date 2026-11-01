@@ -441,7 +441,8 @@ class EquityGuard:
     ``RESUME_REQUIRED.txt`` in the account state folder is deleted (``--resume`` does it).
     """
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(self, state_dir: Path, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
         self.dir = Path(state_dir)
         self.path = self.dir / "risk_state.json"
         self.marker = self.dir / RESUME_MARKER
@@ -517,7 +518,8 @@ class EquityGuard:
                 changed = True
             if self.drawdown_pct(equity) >= max_drawdown_pct:
                 s.dd_halted = True
-                s.dd_tripped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                s.dd_tripped_at = datetime.fromtimestamp(float(self._clock()), tz=timezone.utc).isoformat(
+                    timespec="seconds")
                 self._write_marker(equity, max_drawdown_pct)
                 events.append("drawdown_trip")
                 changed = True

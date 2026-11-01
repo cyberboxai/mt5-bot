@@ -181,6 +181,23 @@ class Registry:
     def close(self) -> None:
         self.conn.close()
 
+    @contextmanager
+    def durable_tx(self) -> Iterator[SerializedConnection]:
+        """A transaction that survives a power cut: fsync on this commit (write-ahead of orders).
+
+        The rest of the journal keeps WAL + NORMAL, which may lose the last commit but never
+        corrupts. An order that may have left the process must not be lost, so it pays the fsync."""
+        strict = self.durable and not self.fast_writes
+        with self._lock:
+            if strict:
+                self.conn.execute("PRAGMA synchronous=FULL")
+            try:
+                with self.tx() as conn:
+                    yield conn
+            finally:
+                if strict:
+                    self.conn.execute("PRAGMA synchronous=NORMAL")
+
     def now(self) -> float:
         return float(self._clock())
 
@@ -253,11 +270,6 @@ class Registry:
         self.conn.execute("UPDATE optimization_runs SET finished_at = ?, status = 'failed', notes = ? WHERE id = ?",
                           (self.now(), message[:2000], run_id))
 
-    def latest_run(self, symbol: str, status: str = "done") -> Optional[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM optimization_runs WHERE symbol = ? AND status = ? ORDER BY id DESC LIMIT 1",
-            (symbol, status)).fetchone()
-
     def runs(self, limit: int = 20) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM optimization_runs ORDER BY id DESC LIMIT ?", (limit,)))
 
@@ -272,16 +284,6 @@ class Registry:
             raise KeyError(f"candidate {candidate_id} not found")
         return self._candidate_from_row(row)
 
-    def run_candidates(self, run_id: int) -> list[Candidate]:
-        rows = self.conn.execute("SELECT * FROM candidate_metrics WHERE run_id = ? ORDER BY rank", (run_id,))
-        return [self._candidate_from_row(r) for r in rows]
-
-    def run_reasons(self, run_id: int) -> list[tuple[str, bool, float, list[str]]]:
-        rows = self.conn.execute(
-            "SELECT c.*, p.strategy FROM candidate_metrics c JOIN param_sets p ON p.id = c.param_set_id "
-            "WHERE run_id = ? ORDER BY rank", (run_id,))
-        return [(r["strategy"], bool(r["passed"]), float(r["score"]), json.loads(r["reasons_json"])) for r in rows]
-
     # ---- champions and challengers
 
     def champion(self, symbol: str) -> Candidate:
@@ -293,46 +295,10 @@ class Registry:
         strategy, params = self.param_set(int(row["param_set_id"]))
         return Candidate(None, int(row["param_set_id"]), strategy, params, {}, 0.0, False)
 
-    def champion_since(self, symbol: str) -> Optional[float]:
-        row = self.conn.execute("SELECT since FROM champions WHERE symbol = ?", (symbol,)).fetchone()
-        return float(row["since"]) if row else None
-
-    def set_challengers(self, symbol: str, candidates: Sequence[Candidate]) -> None:
-        with self.tx():
-            existing = {int(r["param_set_id"]): float(r["added"]) for r in self.conn.execute(
-                "SELECT param_set_id, added FROM challengers WHERE symbol = ?", (symbol,))}
-            self.conn.execute("DELETE FROM challengers WHERE symbol = ?", (symbol,))
-            for cand in candidates:
-                self.conn.execute(
-                    "INSERT INTO challengers (symbol, param_set_id, candidate_id, added) VALUES (?, ?, ?, ?)",
-                    (symbol, cand.param_set_id, cand.candidate_id, existing.get(cand.param_set_id, self.now())))
-
     def challengers(self, symbol: str) -> list[tuple[Candidate, float]]:
         rows = self.conn.execute(
             "SELECT candidate_id, added FROM challengers WHERE symbol = ? ORDER BY added, param_set_id", (symbol,))
         return [(self.candidate(int(r["candidate_id"])), float(r["added"])) for r in rows]
-
-    def record_switch(self, symbol: str, action: str, old: Candidate, new: Candidate, reason: str,
-                      metrics: dict) -> int:
-        """Change the champion and write the audit row in one transaction."""
-        now = self.now()
-        with self.tx():
-            cur = self.conn.execute(
-                "INSERT INTO promotions (ts, symbol, action, old_param_set_id, new_param_set_id, new_candidate_id,"
-                " old_desc, new_desc, reason, metrics_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, symbol, action, old.param_set_id, new.param_set_id, new.candidate_id, old.describe(),
-                 new.describe(), reason, _json(metrics)))
-            promo_id = int(cur.lastrowid)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO champions (symbol, param_set_id, candidate_id, since, promotion_id)"
-                " VALUES (?, ?, ?, ?, ?)", (symbol, new.param_set_id, new.candidate_id, now, promo_id))
-        return promo_id
-
-    def last_switch_ts(self, symbol: str) -> Optional[float]:
-        row = self.conn.execute(
-            "SELECT ts FROM promotions WHERE symbol = ? AND action IN ('promote', 'demote', 'rollback') "
-            "ORDER BY id DESC LIMIT 1", (symbol,)).fetchone()
-        return float(row["ts"]) if row else None
 
     def promotions(self, limit: int = 50) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM promotions ORDER BY id DESC LIMIT ?", (limit,)))

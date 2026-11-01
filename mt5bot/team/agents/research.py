@@ -151,26 +151,6 @@ def lookahead_audit(strategy: str, params: Mapping[str, Any], bars: np.ndarray, 
     return None
 
 
-def gate_audit(metrics: Mapping[str, Any], cfg: Any = None) -> dict[str, Any]:
-    """Research quality flags against the reference thresholds (information, not gates)."""
-    from ...optimizer import Gates
-
-    if not metrics:
-        return {"status": "no stored research metrics"}
-    g = Gates()
-    checks = {
-        "deflated_sharpe": (metrics.get("deflated_sharpe"), g.min_deflated_sharpe),
-        "neighbor_pass_ratio": (metrics.get("neighbor_pass_ratio"), g.min_neighbor_pass_ratio),
-        "trades": (metrics.get("trades"), g.min_oos_trades),
-        "profit_factor": (metrics.get("profit_factor"), g.min_profit_factor),
-    }
-    out: dict[str, Any] = {}
-    for name, (value, minimum) in checks.items():
-        out[name] = {"value": value, "minimum": minimum,
-                     "ok": value is not None and float(value) >= float(minimum)}
-    out["multiple_testing_trials"] = metrics.get("total_trials")
-    return out
-
 
 class PerformanceAnalyst(Agent):
     id = "performance_analyst"

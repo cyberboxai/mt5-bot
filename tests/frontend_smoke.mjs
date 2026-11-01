@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 const [url, outDir, chromeBin = "google-chrome"] = process.argv.slice(2);
 mkdirSync(outDir, { recursive: true });
-const TABS = ["office", "why", "overview", "performance", "trades", "team", "strategies", "risk", "markets", "advisor", "health",
+const TABS = ["office", "why", "truth", "timemachine", "overview", "performance", "trades", "team", "strategies", "risk", "markets", "advisor", "health",
   "decisions"];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const step = (text) => process.stderr.write(`[smoke] ${text}\n`);
@@ -102,6 +102,15 @@ for (const tab of TABS) {
   report.tabs[tab] = info;
   await shot(`tab_${tab}`, tab !== "office");
 }
+await evaluate(`window.location.hash = "#/timemachine"`);
+await sleep(2500);
+await evaluate(`document.querySelector(".vt-click")?.click()`);
+await sleep(1500);
+report.checks.timemachine_steps = await evaluate(`document.querySelectorAll(".tm-step").length`);
+await evaluate(`[...document.querySelectorAll(".tm-controls .btn")].pop()?.click()`);
+await sleep(300);
+report.checks.timemachine_position = await evaluate(`document.querySelector(".tm-pos")?.textContent || ""`);
+await shot("timemachine_decision", false);
 await evaluate(`window.location.hash = "#/office"`);
 await sleep(3000);
 for (let i = 0; i < 20 && !(await evaluate(`!!document.querySelector(".agent-btn")`)); i += 1) await sleep(500);

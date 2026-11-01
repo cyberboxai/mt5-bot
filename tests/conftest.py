@@ -23,6 +23,7 @@ MT5_CONSTANTS: dict[str, int] = {
     "TIMEFRAME_M30": 30,
     "TIMEFRAME_H1": 16385,
     "TIMEFRAME_H4": 16388,
+    "TIMEFRAME_D1": 16408,
     "ORDER_TYPE_BUY": 0,
     "ORDER_TYPE_SELL": 1,
     "POSITION_TYPE_BUY": 0,
@@ -248,7 +249,7 @@ class FakeMT5:
         tick.time = int(new["time"][0]) + 60
 
     def add_position(self, symbol: str, side: str, magic: int, volume: float = 0.1, price_open: float = 1.1,
-                     sl: float = 0.0, tp: float = 0.0) -> SimpleNamespace:
+                     sl: float = 0.0, tp: float = 0.0, comment: str = "") -> SimpleNamespace:
         self._next_ticket += 1
         pos = SimpleNamespace(
             ticket=self._next_ticket,
@@ -259,6 +260,7 @@ class FakeMT5:
             price_open=price_open,
             sl=sl,
             tp=tp,
+            comment=comment,
         )
         self.positions.append(pos)
         return pos
@@ -349,7 +351,8 @@ class FakeMT5:
                 else:
                     price = price + (self.fill_slippage if side == "BUY" else -self.fill_slippage)
                     pos = self.add_position(request["symbol"], side, request["magic"], request["volume"],
-                                            price_open=price, sl=request.get("sl", 0.0), tp=request.get("tp", 0.0))
+                                            price_open=price, sl=request.get("sl", 0.0), tp=request.get("tp", 0.0),
+                                            comment=request.get("comment", ""))
                     return SimpleNamespace(retcode=retcode, comment="done", volume=request["volume"], price=price,
                                            order=pos.ticket, deal=pos.ticket + 50_000)
         return SimpleNamespace(retcode=retcode, comment=f"retcode {retcode}", volume=request.get("volume", 0.0),

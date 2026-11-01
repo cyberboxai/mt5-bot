@@ -32,6 +32,9 @@ from mt5bot.team.agents.market import correlation_matrix, currency_exposure, ses
 from mt5bot.team.context import PositionView
 from mt5bot.team.roster import BY_ID, DEPARTMENTS, ROSTER, VOTERS
 
+from mt5bot.observability import collect, render_metrics
+
+from . import truth as truth_views
 from . import metrics
 from .office import annotate, derive
 
@@ -877,6 +880,44 @@ class PanelData:
         events = self.events(0, 20000, since_ts=start, until_ts=end)
         return {"from": start, "to": end, "events": events, "truncated": len(events) >= 20000}
 
+    # ------------------------------------------------------------- truth views
+
+    def truth(self) -> dict[str, Any]:
+        health, _age = self.health()
+        with self.registry() as reg:
+            if reg is None:
+                return {"reality_gap": {"status": "insufficient", "n": 0, "history": []}, "arms": [], "tail": {},
+                        "execution": {"sessions": [], "hours": [], "order_states": {}}, "trials": 0}
+            return truth_views.truth(reg, self.cfg, health, self.now(health))
+
+    def decision_log(self, limit: int = 200) -> dict[str, Any]:
+        with self.registry() as reg:
+            return {"decisions": truth_views.decisions(reg, limit) if reg is not None else []}
+
+    def decision_replay(self, decision_id: str) -> Optional[dict[str, Any]]:
+        with self.registry() as reg:
+            return truth_views.replay_decision(reg, decision_id) if reg is not None else None
+
+    def project(self) -> dict[str, Any]:
+        health, _age = self.health()
+        latest = None
+        with self.office() as office:
+            if office is not None:
+                found = office.latest_ablation()
+                latest = found["payload"] if found else None
+        with self.registry() as reg:
+            if reg is None:
+                return {"verdict": "evidence_insufficient", "verdict_pt": "evidência insuficiente", "progress": 0.0,
+                        "services": {}, "components": []}
+            return truth_views.project(reg, self.cfg, self.now(health), latest)
+
+    def metrics_text(self) -> str:
+        health, _age = self.health()
+        with self.registry() as reg:
+            if reg is None:
+                return ""
+            return render_metrics(collect(reg, health, self.now(health)))
+
     def team(self) -> dict[str, Any]:
         health, _ = self.health()
         agents = self.agents()
@@ -896,7 +937,3 @@ class PanelData:
 
 def _day_start(ts: float) -> float:
     return float(int(ts // DAY) * DAY)
-
-
-def utc_text(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

@@ -14,7 +14,8 @@ import pytest
 from mt5bot.config import Config
 from mt5bot.officedb import OfficeStore
 from mt5bot.sim.market import SyntheticMarket
-from mt5bot.sim.terminal import SimulatedTerminal
+from mt5bot.adapters.sim_broker import SimBroker
+from mt5bot.core.broker import DEAL_ENTRY_OUT, OrderRequest
 from mt5bot.team.agent import Agent, AgentState, Opinion, TeamServices
 from mt5bot.team.events import AgentSaid, Alert, Event, EventBus, GuardianAlert
 from mt5bot.team.scheduler import AgentSupervisor
@@ -159,7 +160,7 @@ def test_crashing_agent_is_isolated_benched_and_restarted() -> None:
     sup, services = supervisor(mono, bus)
     good = sup.register(GoodAgent(services))
     crash = sup.register(CrashAgent(services))
-    for i in range(3):
+    for _i in range(3):
         out = sup.call_many(["trend_analyst", "breakout_analyst"], "analyze", None)
         assert out["trend_analyst"].ok and out["trend_analyst"].value == "ok"
         assert not out["breakout_analyst"].ok and "boom" in out["breakout_analyst"].error
@@ -240,18 +241,16 @@ def test_synthetic_market_is_deterministic_and_skips_weekends() -> None:
     assert not np.array_equal(SyntheticMarket(12).history(50)["EURUSD"], ha["EURUSD"][:50])
 
 
-def test_simulated_terminal_fills_server_side_stops() -> None:
-    term = SimulatedTerminal(SyntheticMarket(5), warmup_bars=300)
-    tick = term.symbol_info_tick("EURUSD")
-    res = term.order_send({"action": term.TRADE_ACTION_DEAL, "symbol": "EURUSD", "volume": 0.1,
-                           "type": term.ORDER_TYPE_BUY, "price": tick.ask, "sl": tick.bid - 0.0003,
-                           "tp": tick.bid + 0.0003, "magic": 1})
-    assert res.retcode == term.TRADE_RETCODE_DONE and len(term.positions) == 1
+def test_sim_broker_fills_server_side_stops() -> None:
+    sim = SimBroker(SyntheticMarket(5), warmup_bars=300)
+    tick = sim.tick("EURUSD")
+    res = sim.send(OrderRequest("open", "EURUSD", "BUY", 0.1, tick.ask, tick.bid - 0.0003, tick.bid + 0.0003, magic=1))
+    assert res.retcode == 10009 and len(sim.positions()) == 1
     for _ in range(200):
-        term.advance_bar()
-        if not term.positions:
+        sim.advance_bar()
+        if not sim.positions():
             break
-    assert not term.positions
-    exits = [d for d in term.deals if d.entry == term.DEAL_ENTRY_OUT]
+    assert not sim.positions()
+    exits = [d for d in sim.deals_book if d.entry == DEAL_ENTRY_OUT]
     assert len(exits) == 1 and exits[0].position_id == res.order
-    assert term.account.equity == term.account.balance
+    assert sim.account().equity == sim.account().balance

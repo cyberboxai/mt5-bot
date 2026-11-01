@@ -78,11 +78,33 @@ linha no separador **Porque não estou a negociar?** (tabela de bloqueios, gráf
 | `BUDGET_CAPPED` | Atingiu `max_calls_per_hour` ou `max_daily_cost_usd`. | Pretendido; retoma na janela seguinte. |
 | `DISABLED` com `enabled: true` | Falta o pacote `anthropic`, ou `--no-claude`. | `pip install anthropic` no ambiente virtual. |
 
+## Novos bloqueios da versão 4.0
+
+| Código | O que significa | O que fazer |
+|---|---|---|
+| `COST_TO_EDGE` | A parte provada da vantagem não cobre `costs.k` vezes o custo total. | Normal no início. Veja o separador Verdade. Não baixe `k` para negociar mais. |
+| `ROLLOVER_GUARD` | Janela do rollover do servidor. | Nada. Passa sozinho. |
+| `PRE_WEEKEND` | Depois do corte de sexta-feira. | Nada. Volta na abertura. |
+| `ORDER_UNCERTAIN` | Uma ordem anterior neste símbolo tem resultado desconhecido. | Veja `order_uncertain` no [RUNBOOK](RUNBOOK.md). |
+| `DUPLICATE_BLOCKED` | A mesma decisão já tinha ordem. | Nada. É a protecção a funcionar. |
+| `BROKER_BREAKER_OPEN` | Falhas de infraestrutura seguidas. | Veja `broker_breaker_open` no [RUNBOOK](RUNBOOK.md). |
+| `MARGIN_GUARD` | A margem projectada ficaria abaixo de 3 vezes o stop-out. | Reduza posições ou risco. Não baixe o múltiplo. |
+| `MARGIN_PRESSURE` | O nível de margem aproxima-se da chamada. | Reduza exposição. |
+| `PORTFOLIO_MAX_ARMS` | Máximo de braços em simultâneo. | Nada. |
+| `CURRENCY_CAP` | Risco por moeda no limite. | Nada. |
+| `RESEARCH_ONLY` | A regra de paragem actuou nesta conta real. | Veja `research_only` no [RUNBOOK](RUNBOOK.md). |
+| `REGIME_MEAN_REVERSION` | Reversão à média fora de regime lateral. | Nada. |
+
 ## Códigos de retorno da corretora (retcode)
+
+Na 4.0, cada código tem uma classe (`mt5bot/core/orders.py`): sucesso, transitório (repete com recuo exponencial), permanente (nunca repete) ou incerto (reconcilia e não reenvia uma entrada). Códigos desconhecidos e ausência de resposta são tratados como incertos.
 
 | Código | Nome | O que fazer |
 |---|---|---|
-| 10004 | Requote | O bot repete até 3 vezes com preço novo. |
+| 10004 | Requote | O bot confirma que nada aconteceu e repete até 3 vezes com preço novo. |
+| 10008 | Order placed | Sucesso, mas o preenchimento ainda tem de ser confirmado no corretor. |
+| 10010 | Partial | Regista o volume real preenchido. |
+| 10011, 10012, 10028, 10031 | Erro, timeout, bloqueado, sem ligação | Resultado desconhecido: reconcilia e nunca reenvia. |
 | 10006 | Request rejected | A corretora recusou. Se persistir, o símbolo entra em quarentena; contacte o suporte. |
 | 10014 | Invalid volume | Volume fora do mínimo, máximo ou passo. Veja **Specification** no MT5. |
 | 10015 | Invalid price | Mercado muito rápido ou símbolo sem cotação. |

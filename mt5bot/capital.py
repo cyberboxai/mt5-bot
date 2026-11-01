@@ -140,6 +140,8 @@ class SizingInputs:
     last_loss_risk_pct: Optional[float] = None    # anti-martingale: risk of this arm's last losing trade
     correlation_factor: float = 1.0               # 0..1 from the Correlation and Exposure Analyst
     liquidity_factor: float = 1.0                 # 0..1 from realised slippage / liquidity
+    portfolio_factor: float = 1.0                 # 0..1 risk parity, cluster caps, correlated-risk target
+    derisk_factor: float = 1.0                    # 0..1 drawdown ladder times the stress reduction
 
 
 @dataclass(frozen=True)
@@ -195,6 +197,10 @@ def size_risk(inp: SizingInputs, lim: EffectiveLimits, capital: CapitalState) ->
         c["correlation"] = c["tier"] * max(inp.correlation_factor, 0.0)
     if inp.liquidity_factor < 1.0:
         c["liquidity"] = c["tier"] * max(inp.liquidity_factor, 0.0)
+    if inp.portfolio_factor < 1.0:
+        c["portfolio"] = c["tier"] * max(inp.portfolio_factor, 0.0)
+    if inp.derisk_factor < 1.0:
+        c["derisk"] = c["tier"] * max(inp.derisk_factor, 0.0)
     binding = min(c, key=lambda k: c[k])
     risk = min(c.values())
     blocked = None

@@ -160,6 +160,69 @@ CREATE TABLE IF NOT EXISTS policy_outcomes (
 CREATE INDEX IF NOT EXISTS ix_policy_arm ON policy_outcomes (arm_id, policy);
 """
 
+# --------------------------------------------------------------------- schema 3
+# v4: the append-only ledger, the order projection and the evidence tables. The triggers make
+# the ledger immutable at the database level. Rows of ``trial_ledger`` are never deleted either:
+# selection-bias correction needs the count of EVERY configuration ever evaluated.
+
+SCHEMA_3 = """
+CREATE TABLE IF NOT EXISTS ledger (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, kind TEXT NOT NULL, stream TEXT NOT NULL,
+    correlation_id TEXT, stamp_json TEXT NOT NULL DEFAULT '{}', payload_json TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ix_ledger_stream ON ledger (stream, seq);
+CREATE INDEX IF NOT EXISTS ix_ledger_kind ON ledger (kind, seq);
+CREATE INDEX IF NOT EXISTS ix_ledger_correlation ON ledger (correlation_id, seq);
+CREATE TABLE IF NOT EXISTS orders (
+    client_id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT,
+    volume REAL NOT NULL, filled_volume REAL NOT NULL DEFAULT 0, price REAL, fill_price REAL, ticket INTEGER,
+    position_ticket INTEGER, attempts INTEGER NOT NULL DEFAULT 0, retcode INTEGER, decision_id TEXT,
+    created_ts REAL NOT NULL, updated_ts REAL NOT NULL, submitted_ts REAL, resolved_ts REAL,
+    protected INTEGER NOT NULL DEFAULT 0, detail TEXT, meta_json TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ix_orders_state ON orders (state, symbol);
+CREATE INDEX IF NOT EXISTS ix_orders_decision ON orders (decision_id);
+CREATE TABLE IF NOT EXISTS tca (
+    id INTEGER PRIMARY KEY, client_id TEXT NOT NULL UNIQUE, ts REAL NOT NULL, status TEXT NOT NULL,
+    symbol TEXT NOT NULL, timeframe TEXT, side TEXT, session TEXT NOT NULL, hour INTEGER NOT NULL,
+    decision_price REAL, spread_decision REAL, spread_submit REAL, fill_price REAL, slippage_points REAL,
+    slippage_r REAL, latency_ms REAL, commission REAL, swap REAL, requotes INTEGER NOT NULL DEFAULT 0,
+    rejects INTEGER NOT NULL DEFAULT 0, volume REAL, risk_money REAL, arm_id INTEGER, tier TEXT);
+CREATE INDEX IF NOT EXISTS ix_tca_key ON tca (symbol, session, hour);
+CREATE INDEX IF NOT EXISTS ix_tca_ts ON tca (ts);
+CREATE TABLE IF NOT EXISTS cost_models (
+    symbol TEXT NOT NULL, session TEXT NOT NULL, hour INTEGER NOT NULL, n INTEGER NOT NULL, spread_points REAL NOT NULL,
+    spread_p90 REAL NOT NULL, slippage_points REAL NOT NULL, slippage_p90 REAL NOT NULL, latency_ms REAL NOT NULL,
+    reject_rate REAL NOT NULL, source TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY (symbol, session, hour));
+CREATE TABLE IF NOT EXISTS trial_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, run_id INTEGER, symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL, strategy TEXT NOT NULL, params_hash TEXT NOT NULL, snapshot_id TEXT,
+    sharpe REAL, n_obs INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_trials_key ON trial_ledger (symbol, timeframe, strategy);
+CREATE TABLE IF NOT EXISTS data_snapshots (
+    id TEXT PRIMARY KEY, ts REAL NOT NULL, symbol TEXT NOT NULL, timeframe TEXT NOT NULL, first_time INTEGER,
+    last_time INTEGER, rows INTEGER NOT NULL, content_hash TEXT NOT NULL, quality_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS candidate_verdicts (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, run_id INTEGER, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+    strategy TEXT NOT NULL, param_set_id INTEGER, n_trials INTEGER NOT NULL, sharpe REAL, dsr REAL, pbo REAL,
+    min_track_record REAL, track_record REAL, cpcv_n INTEGER NOT NULL DEFAULT 0, cpcv_mean_r REAL, cpcv_var_r REAL,
+    cost_to_edge REAL, verdict TEXT NOT NULL, snapshot_id TEXT, detail_json TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ix_verdicts_key ON candidate_verdicts (symbol, timeframe, strategy, ts);
+CREATE TABLE IF NOT EXISTS stress_reports (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, worst_scenario TEXT, worst_loss_pct REAL NOT NULL,
+    worst_margin_level REAL, breached INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS reality_gap (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, n INTEGER NOT NULL, live_mean_r REAL, sim_mean_r REAL, gap_r REAL,
+    slippage_gap_points REAL, fill_rate REAL, status TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS governance_reports (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, kind TEXT NOT NULL, verdict TEXT NOT NULL, n_trades INTEGER NOT NULL,
+    expectancy_money REAL, ci_low REAL, ci_high REAL, payload_json TEXT NOT NULL DEFAULT '{}');
+CREATE TRIGGER IF NOT EXISTS ledger_no_update BEFORE UPDATE ON ledger
+    BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END
+CREATE TRIGGER IF NOT EXISTS ledger_no_delete BEFORE DELETE ON ledger
+    BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END
+CREATE TRIGGER IF NOT EXISTS trials_no_delete BEFORE DELETE ON trial_ledger
+    BEGIN SELECT RAISE(ABORT, 'the trial ledger is never deleted'); END
+"""
+
 TRADE_COLUMNS_2 = (("arm_id", "INTEGER"), ("timeframe", "TEXT"), ("tier", "TEXT"), ("risk_pct", "REAL"))
 
 
@@ -187,9 +250,20 @@ def _migration_2(conn: Conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS ix_trades_mode_close ON trades (mode, status, close_ts)")
 
 
+def _migration_3(conn: Conn) -> None:
+    body, triggers = SCHEMA_3.split("CREATE TRIGGER", 1)
+    for statement in _statements(body):
+        conn.execute(statement)
+    # Trigger bodies contain ";", so they are executed whole rather than split on it.
+    for text in triggers.split("CREATE TRIGGER"):
+        conn.execute("CREATE TRIGGER " + text.strip())
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[Conn], None]], ...] = (
     (1, "v3.0 journal, registry and team office tables", _migration_1),
     (2, "v3.1 arms, tiers, research priors, funnel, flow doctor, cash flows, policies", _migration_2),
+    (3, "v4 ledger, orders, TCA, cost models, trial ledger, snapshots, verdicts, stress, reality gap, governance",
+     _migration_3),
 )
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

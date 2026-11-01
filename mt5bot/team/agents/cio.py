@@ -285,7 +285,9 @@ class ChiefInvestmentOfficer(Agent):
             headlines = news_view.get("headlines", []) if self.cfg.news.advisor_headlines else []
             advisor_op = strategist.review(features, headlines, sym, did)
         m_adv = advisor_op.effective_multiplier
-        final_m = conservative(m_mode, m_adv) if mode == "full" else m_mode
+        # Until ablation shows value after cost, a review is recorded (shadow) and changes nothing.
+        applied = m_adv if rt.advisor_gate_active() else 1.0
+        final_m = conservative(m_mode, applied) if mode == "full" else m_mode
         counterfactual_full = 0.0 if all_mode_block else conservative(full_team_m, m_adv)
 
         # 7. execution through the gateway (risk gate re-checked at send time)

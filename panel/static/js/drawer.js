@@ -4,7 +4,7 @@
 import { getJSON, postControl } from "./api.js";
 import { dataTable, lineChart } from "./charts.js";
 import { t } from "./i18n.js";
-import { clear, dateTime, el, num, signed } from "./util.js";
+import { axisTime, clear, dateTime, el, num, signed } from "./util.js";
 
 const $ = (id) => document.getElementById(id);
 let lastFocus = null;
@@ -43,7 +43,8 @@ export async function openAgent(id) {
   const weightNode = el("div");
   if (wh.length >= 2) {
     lineChart(weightNode, { series: [{ name: t("agent.weight"), color: "var(--series-1)",
-      points: wh.map((p) => ({ x: p.ts, y: p.weight })) }], height: 150, xFormat: (v) => dateTime(v).slice(0, 10) });
+      points: wh.map((p) => ({ x: p.ts, y: p.weight })) }], height: 150,
+      xFormat: (v) => axisTime(v, wh.length ? wh[wh.length - 1].ts - wh[0].ts : 0), xTip: (v) => dateTime(v) });
   } else weightNode.append(el("div", { class: "empty", text: t("common.insufficient", { n: wh.length, min: 2 }) }));
   const byRegime = Object.entries(a.accuracy_by_regime || {}).map(([regime, v]) => ({ regime, votes: v.n,
     accuracy: v.accuracy === null ? "n/d" : `${num(v.accuracy * 100, 1)}%` }));

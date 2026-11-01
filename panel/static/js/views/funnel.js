@@ -5,7 +5,7 @@
 import { getJSON } from "../api.js";
 import { chartCard, dataTable, lineChart, meter } from "../charts.js";
 import { reasonText, t } from "../i18n.js";
-import { card, clear, dateTime, el, empty, num, signed, timeOnly } from "../util.js";
+import { axisTime, card, clear, dateTime, el, empty, num, signed } from "../util.js";
 
 const HOURS = [6, 24, 72, 168];
 
@@ -117,7 +117,8 @@ export function mountFunnel(root, app) {
         { name: t("why.stage.signals"), color: "var(--series-1)", points: hourly.map((h) => ({ x: h.ts, y: h.signals || 0 })) },
         { name: t("why.stage.blocked"), color: "var(--series-2)", points: hourly.map((h) => ({ x: h.ts, y: h.blocked || 0 })) },
         { name: t("why.stage.orders"), color: "var(--series-3)", points: hourly.map((h) => ({ x: h.ts, y: h.orders || 0 })) }],
-      xFormat: timeOnly, yFormat: (v) => num(v, 0) }) }));
+      xFormat: (v) => axisTime(v, hourly.length ? hourly[hourly.length - 1].ts - hourly[0].ts : 0), xTip: (v) => dateTime(v),
+      yFormat: (v) => num(v, 0) }) }));
 
     const aff = ((d.affordability || {}).rows || []).filter((r) => r.tier === "T1").slice(0, 24);
     grid.append(card(t("why.afford"), t("why.afford_sub"), aff.length ? dataTable(aff.map((r) => ({

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import math
-import uuid
 from dataclasses import replace
 from decimal import ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any, Optional
@@ -48,12 +47,11 @@ def position_views(bot: "Bot", acc: Any, positions: Optional[list[Any]] = None) 
     for p in positions:
         row = bot.registry.trade_by_ticket(int(p.ticket)) if bot.registry is not None else None
         side = bot._side_of(p)
-        tick = bot.mt5.symbol_info_tick(p.symbol)
+        tick = bot.market.tick(p.symbol)
         unrealized_r = 0.0
         if tick is not None and row is not None and row.risk_money > 0:
-            order_type = bot.mt5.ORDER_TYPE_BUY if side == "BUY" else bot.mt5.ORDER_TYPE_SELL
             price = tick.bid if side == "BUY" else tick.ask
-            profit = bot.mt5.order_calc_profit(order_type, p.symbol, p.volume, p.price_open, price)
+            profit = bot.broker.calc_profit(side, p.symbol, p.volume, p.price_open, price)
             if profit is not None and math.isfinite(profit):
                 unrealized_r = float(profit) / row.risk_money
         tf = (row.timeframe if row is not None else None) or bot.cfg.timeframe
@@ -87,8 +85,8 @@ def account_view(bot: "Bot", acc: Any, positions: tuple[PositionView, ...]) -> A
 
 def decision_context(bot: "Bot", symbol: str, intent: Optional["EntryIntent"], acc: Any, closed: np.ndarray,
                      purpose: str = "entry", positions: Optional[tuple[PositionView, ...]] = None) -> DecisionContext:
-    info = bot.mt5.symbol_info(symbol)
-    tick = bot.mt5.symbol_info_tick(symbol)
+    info = bot.market.symbol_info(symbol)
+    tick = bot.market.tick(symbol)
     if info is None or tick is None or info.point <= 0:
         raise RuntimeError(f"{symbol}: no symbol info or tick for the decision context")
     spec = bot.specs.get(symbol)
@@ -128,7 +126,9 @@ def decision_context(bot: "Bot", symbol: str, intent: Optional["EntryIntent"], a
     account = account_view(bot, acc, views)
     if intent is not None and intent.risk_pct is not None:
         account = replace(account, risk_pct=float(intent.risk_pct))
-    return DecisionContext(f"{symbol}-{int(closed[-1]['time'])}-{uuid.uuid4().hex[:6]}", market, account, proposal,
+    # Deterministic, so a replay of the same bars produces the same dossier ids.
+    bot.dossier_counter += 1
+    return DecisionContext(f"{symbol}-{int(closed[-1]['time'])}-{bot.dossier_counter:06x}", market, account, proposal,
                            others, purpose=purpose)
 
 
@@ -207,8 +207,8 @@ def execute_management(bot: "Bot", action: ManagementAction) -> tuple[bool, str]
     if not positions:
         return False, "position no longer open"
     pos = positions[0]
-    info = bot.mt5.symbol_info(pos.symbol)
-    tick = bot.mt5.symbol_info_tick(pos.symbol)
+    info = bot.market.symbol_info(pos.symbol)
+    tick = bot.market.tick(pos.symbol)
     if info is None or tick is None:
         return False, "no quote"
     side = bot._side_of(pos)
@@ -227,11 +227,8 @@ def execute_management(bot: "Bot", action: ManagementAction) -> tuple[bool, str]
             return False, "new stop too close to the market"
         if bot.cfg.dry_run:
             return True, f"DRY RUN: would move SL {pos.sl} -> {new_sl}"
-        request = {"action": getattr(bot.mt5, "TRADE_ACTION_SLTP", 6), "symbol": pos.symbol, "position": pos.ticket,
-                   "sl": new_sl, "tp": pos.tp, "magic": bot.cfg.magic, "comment": "mt5_bot"}
-        result = bot.mt5.order_send(request)
-        if result is None or result.retcode not in bot._success_codes:
-            return False, f"SL modification failed ({getattr(result, 'retcode', 'none')})"
+        if not bot.engine.modify_stops(pos, new_sl, float(pos.tp), "manage"):
+            return False, "SL modification failed"
         row = bot.registry.trade_by_ticket(int(pos.ticket))
         if row is not None:
             bot.registry.update_trade_sl(row.id, new_sl, float(pos.tp))
@@ -263,7 +260,7 @@ def manage_positions(bot: "Bot", symbol: str, acc: Any, closed: np.ndarray, tf: 
     views = [p for p in position_views(bot, acc) if p.symbol == symbol and p.timeframe == tf]
     if not views:
         return
-    info = bot.mt5.symbol_info(symbol)
+    info = bot.market.symbol_info(symbol)
     news_agent = bot.team.agents.get("news_sentinel")
     minutes = None
     if news_agent is not None:

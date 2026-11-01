@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from statistics import NormalDist
-from typing import Hashable, Iterable, Mapping, Optional, Sequence
+from typing import Hashable, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -246,12 +246,3 @@ def fit(samples: Mapping[Hashable, ArmSample], families: Mapping[Hashable, str],
 def family_of(strategy: str) -> str:
     """Arms are pooled by base strategy (a volatility-filtered variant pools with its base)."""
     return strategy[len("volfilter_"):] if strategy.startswith("volfilter_") else strategy
-
-
-def summarize(posteriors: Iterable[Posterior]) -> dict[str, float]:
-    items = list(posteriors)
-    if not items:
-        return {"arms": 0}
-    ps = np.array([p.p_positive for p in items])
-    return {"arms": len(items), "p_positive_mean": float(ps.mean()), "p_positive_max": float(ps.max()),
-            "with_data": sum(1 for p in items if p.n_obs > 0)}

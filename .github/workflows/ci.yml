@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned test dependencies
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: Lint
+        run: python -m ruff check mt5bot panel tests tools
+      - name: Types of the core domain
+        run: python -m mypy
+      - name: Tests (MetaTrader5 is stubbed)
+        run: python -m pytest -q
+      - name: Dependency audit
+        run: python -m pip_audit -r requirements-dev.lock --require-hashes

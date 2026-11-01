@@ -39,6 +39,7 @@ POLICY_REFRESH_SECONDS = 900.0
 POLICY_MAX_TRADES = 300  # most recent paired trades per arm used to choose its policy
 
 MAX_CATCH_UP_BARS = 2000
+SAVE_EVERY_BARS = 64
 DAY = 86400.0
 
 
@@ -246,6 +247,8 @@ class ShadowBook:
         self.pending_regime = ""
         self.last_bar_time: Optional[int] = None
         self.track_policies = True  # replay each closed trade under every management policy
+        self._saved: Optional[tuple] = None
+        self._unsaved_bars = 0
         self._load()
 
     def _load(self) -> None:
@@ -267,10 +270,22 @@ class ShadowBook:
                                        row.risk_money)
 
     def _save(self) -> None:
+        """Written when the state changes, not on every bar: bars that changed nothing replay to
+        the same nothing after a restart, and hundreds of arms would otherwise commit per bar."""
+        state = (self.pending, self.pending_atr, self.pending_bar, self.pending_exit, self.pending_regime,
+                 self.trade_id)
+        self._unsaved_bars += 1
+        if state == self._saved and self._unsaved_bars < SAVE_EVERY_BARS:
+            return
+        self._saved, self._unsaved_bars = state, 0
         self.registry.set_kv(self.key, json.dumps({
             "pending": self.pending, "pending_atr": self.pending_atr, "pending_bar": self.pending_bar,
             "pending_exit": self.pending_exit, "pending_regime": self.pending_regime,
             "last_bar_time": self.last_bar_time}))
+
+    def flush(self) -> None:
+        self._saved, self._unsaved_bars = None, SAVE_EVERY_BARS
+        self._save()
 
     def _close(self, closed: np.ndarray, index: int, bar_time: int, price: float, reason: str, spec: SymbolSpec,
                costs: CostModel) -> TradeRow | None:
@@ -387,6 +402,7 @@ class ArmEngine:
         self.on_tier_change = on_tier_change
         self.half_life_days = half_life_days
         self.management_cfg = management_cfg
+        self.promotions_frozen: Optional[str] = None   # the reality gap monitor froze promotions
         self.update_settings(tiers_cfg, research_cfg)
         self.arms: dict[int, Arm] = {a.id: a for a in self.store.load()}
         self.books: dict[int, ShadowBook] = {}
@@ -410,6 +426,7 @@ class ArmEngine:
                                                   global_mean=tiers_cfg.global_mean)
         self.ref_equity = float(research_cfg.reference_equity)
         self.ref_risk = float(research_cfg.reference_risk_pct)
+        self.require_verdict = bool(getattr(research_cfg, "require_verdict", False))
         for book in getattr(self, "books", {}).values():
             book.equity, book.risk_pct = self.ref_equity, self.ref_risk
 
@@ -445,11 +462,14 @@ class ArmEngine:
                     created += len(self.arms) - before
         return created
 
+    def flush(self) -> None:
+        """Shutdown: every book writes its state, so the next start resumes on the exact bar."""
+        with self.registry.tx():
+            for book in self.books.values():
+                book.flush()
+
     def arms_for(self, symbol: str, timeframe: str) -> list[Arm]:
         return [a for a in self.arms.values() if a.active and a.symbol == symbol and a.timeframe == timeframe]
-
-    def symbols_timeframes(self) -> list[tuple[str, str]]:
-        return sorted({(a.symbol, a.timeframe) for a in self.arms.values() if a.active})
 
     def _book(self, arm: Arm) -> ShadowBook:
         book = self.books.get(arm.id)
@@ -591,6 +611,7 @@ class ArmEngine:
         self._last_refresh = now
         posts = self.posteriors(now)
         changes: list[tuple[Arm, TierDecision]] = []
+        verdicts = self.latest_verdicts() if self.require_verdict else {}
         for arm in self.arms.values():
             arm.posterior = posts.get(arm.id)
             if arm.posterior is None or not arm.active:
@@ -598,6 +619,8 @@ class ArmEngine:
             dd_since = self._drawdown_since(arm, arm.last_change or arm.tier_since)
             decision = decide_tier(arm.tier, arm.posterior, self.tier_settings, now, arm.last_change,
                                    arm.pinned_until, dd_since)
+            if decision.direction == "up" and self._promotion_blocked(arm, decision, verdicts):
+                continue
             if decision.changed:
                 audit_id = self.store.change_tier(arm, decision, now)
                 changes.append((arm, decision))
@@ -611,6 +634,30 @@ class ArmEngine:
         self._save_posteriors(now, force=bool(changes))
         self.refresh_policies(now)
         return changes
+
+    def latest_verdicts(self) -> dict[tuple[str, str, str], str]:
+        """Latest research verdict per symbol, timeframe and strategy family."""
+        rows = self.registry.conn.execute(
+            "SELECT symbol, timeframe, strategy, verdict FROM candidate_verdicts ORDER BY id")
+        return {(r["symbol"], r["timeframe"], r["strategy"]): r["verdict"] for r in rows}
+
+    def _promotion_blocked(self, arm: Arm, decision: TierDecision,
+                           verdicts: Mapping[tuple[str, str, str], str]) -> bool:
+        """Evidence enters trading only through the tiers, and T2 needs research to agree."""
+        if self.promotions_frozen:
+            return True
+        if not self.require_verdict or TIER_INDEX[decision.tier] < TIER_INDEX["T2"]:
+            return False
+        return verdicts.get((arm.symbol, arm.timeframe, arm.strategy)) != "edge_plausible"
+
+    def retire(self, arm: Arm, reason: str) -> int:
+        """Back to research: no shadow book, no signals, tier T0. Open positions keep their stops."""
+        audit = self.store.change_tier(arm, TierDecision("T0", arm.tier, f"retired: {reason}"), self.clock(),
+                                       action="retire")
+        self.store.set_active(arm.id, False)
+        arm.active = False
+        self.books.pop(arm.id, None)
+        return audit
 
     # --------------------------------------------------------- management
 

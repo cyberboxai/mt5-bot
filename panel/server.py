@@ -17,7 +17,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from mt5bot.db import db_path
 from mt5bot.officedb import OfficeStore
@@ -135,6 +135,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._static("img/favicon-48.png")
             elif path.startswith("/static/"):
                 self._static(path[len("/static/"):])
+            elif path == "/metrics" and self.ctx.cfg.ops.metrics_enabled:
+                body = self.ctx.data.metrics_text().encode("utf-8")
+                self._headers(200, "text/plain; version=0.0.4; charset=utf-8", len(body))
+                self.wfile.write(body)
             elif path == "/api/stream":
                 self._stream()
             elif path.startswith("/api/"):
@@ -232,6 +236,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/replay": lambda: data.replay(_num(q.get("from"), self.ctx.clock() - 86400, 0, 1e12),
                                                _num(q.get("to"), self.ctx.clock(), 0, 1e12)),
             "/api/csrf": lambda: {"csrf": self.ctx.security.csrf},
+            "/api/truth": data.truth,
+            "/api/timemachine": lambda: data.decision_log(int(_num(q.get("limit"), 200, 1, 500))),
+            "/api/project": data.project,
         }
         if path in routes:
             self._json(routes[path]())
@@ -240,6 +247,11 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             agent = data.agent(match.group(1))
             self._json(agent) if agent is not None else self._error(404, "unknown agent")
+            return
+        match = re.fullmatch(r"/api/timemachine/([A-Za-z0-9._+:\-]{1,80})", unquote(path))
+        if match:
+            replay = data.decision_replay(match.group(1))
+            self._json(replay) if replay is not None else self._error(404, "unknown decision")
             return
         match = re.fullmatch(r"/api/decisions/([A-Za-z0-9._+\-]{1,80})", path)
         if match:

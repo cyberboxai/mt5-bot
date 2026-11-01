@@ -79,12 +79,32 @@ class TestShadowBook:
         arm = engine(registry).ensure_arm("EURUSD", "H1", "donchian", PARAMS, "test")
         book = ShadowBook(registry, arm, 10_000.0, 0.5)
         feed(book, bars, 400, 650)
+        book.flush()
         restarted = ShadowBook(registry, arm, 10_000.0, 0.5)
         assert restarted.last_bar_time == book.last_bar_time
         assert (restarted.pos is None) == (book.pos is None)
         assert restarted.pending == book.pending and restarted.pending_regime == book.pending_regime
         restarted.on_bars(bars, S.get("donchian").signals(bars, arm.params), EURUSD_SPEC, TEST_COSTS)
         assert restarted.last_bar_time == int(bars["time"][-1])
+
+    def test_a_crash_between_saves_replays_to_the_same_trades(self, registry: Registry, tmp_path: Path) -> None:
+        """State is written when it changes, not every bar: a crash in between loses nothing."""
+        bars = synthetic_bars(1500, seed=12, trend=0.15)
+        arm = engine(registry).ensure_arm("EURUSD", "H1", "donchian", PARAMS, "test")
+        crashing = ShadowBook(registry, arm, 10_000.0, 0.5)
+        for stop in range(450, len(bars), 37):
+            feed(crashing, bars, stop - 37 if stop > 450 else 400, stop)
+            crashing = ShadowBook(registry, arm, 10_000.0, 0.5)      # no flush: the process died
+        crashing.on_bars(bars, S.get("donchian").signals(bars, arm.params), EURUSD_SPEC, TEST_COSTS)
+        other = Registry(tmp_path / "other.sqlite")
+        arm2 = engine(other).ensure_arm("EURUSD", "H1", "donchian", PARAMS, "test")
+        steady = ShadowBook(other, arm2, 10_000.0, 0.5)
+        feed(steady, bars, 400, len(bars))
+        key = lambda r: (r.side, r.open_bar_time, round(r.entry, 6), round(r.r, 6))  # noqa: E731
+        a = [key(t) for t in registry.trades(mode="shadow", status="closed")]
+        b = [key(t) for t in other.trades(mode="shadow", status="closed")]
+        other.close()
+        assert a == b and len(a) > 5
 
     def test_r_multiples_do_not_depend_on_the_account(self, registry: Registry, tmp_path: Path) -> None:
         bars = synthetic_bars(1200, seed=14, trend=0.15)

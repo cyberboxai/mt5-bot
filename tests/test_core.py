@@ -182,12 +182,12 @@ class TestConfig:
             Config.load(tmp_path / "missing.json")
 
     @pytest.mark.parametrize("overrides", [
-        {"symbols": []}, {"symbols": [""]}, {"symbols": ["EURUSD", "EURUSD"]}, {"timeframe": "D1"},
+        {"symbols": []}, {"symbols": [""]}, {"symbols": ["EURUSD", "EURUSD"]}, {"timeframe": "W1"},
         {"trading_hours_server": [8, 8]}, {"trading_hours_server": [-1, 10]}, {"trading_hours_server": [7]},
         {"bars": 100}, {"bars": True}, {"magic": 0}, {"magic": "123"},
         {"account_mode": "live"}, {"real_money_confirmed": "yes"}, {"real_money_confirmed": 1},
         {"risk_per_trade_pct_demo": 0}, {"max_open_positions_total": 0}, {"risk_profile": "yolo"},
-        {"tiers": {"t2_enter_p": 0.5}}, {"tiers": {"exploration_day_pct": 5.0}}, {"universe": {"timeframes": ["D1"]}},
+        {"tiers": {"t2_enter_p": 0.5}}, {"tiers": {"exploration_day_pct": 5.0}}, {"universe": {"timeframes": ["W1"]}},
         {"capital": {"lock_fraction": 0.99}}, {"universe": {"max_spread_points_by_symbol": {"EURUSD": 0}}},
         {"deviation_points": -1}, {"poll_seconds": 0}, {"heartbeat_minutes": 0}, {"kill_switch_file": ""},
         {"mt5_path": ""}, {"enabled_strategies": ["martingale"]}, {"holidays": ["2025/12/25"]},
@@ -494,7 +494,7 @@ class TestEntries:
         assert second["price"] == pytest.approx(1.10030)
         assert second["price"] - second["sl"] == pytest.approx(first["price"] - first["sl"])
         assert second["volume"] == first["volume"]
-        assert botmod.RETRY_PAUSE_SECONDS in waits
+        assert bot.cfg.execution.backoff_seconds in waits
 
     def test_gives_up_after_three_requotes(self, make_bot, fake_mt5: FakeMT5) -> None:
         bot = started(make_bot())
@@ -546,7 +546,7 @@ class TestEntries:
         forming = fake_mt5.rates["EURUSD"]["time"][-1]
         assert source.seen[-1]["time"][-1] == forming - BAR_SECONDS
         assert forming not in source.seen[-1]["time"]
-        assert len(source.seen[-1]) == bot.cfg.bars
+        assert len(source.seen[-1]) >= bot.cfg.bars   # the series grows until it is compacted
 
     def test_acts_once_per_closed_bar(self, make_bot, fake_mt5: FakeMT5) -> None:
         source = FixedSource(None)

@@ -31,7 +31,7 @@ KEY = "sk-ant-api03-AUTHORITY-TEST-0000000000"
 
 
 def claude(behaviour: Any = None, env: Any = None, delay: float = 0.0, sdk: bool = True, **cfg: Any) -> ClaudeAdvisor:
-    values = {"enabled": True, "latency_budget_ms": 300}
+    values = {"enabled": True, "latency_budget_ms": 300, "review_trades": True, "review_requires_ablation": False}
     values.update(cfg)
     client = fa.FakeClient(behaviour, delay=delay)
     return ClaudeAdvisor(Config.from_dict({"claude": values}).claude,
@@ -132,7 +132,8 @@ def test_fuzzed_advisor_never_raises_size_or_creates_trades(tmp_path: Path, seed
 
 
 def test_prompt_injection_in_headlines_cannot_raise_size(tmp_path: Path) -> None:
-    cfg = Config.from_dict({"team": {"team_mode": "full"}, "news": {"advisor_headlines": True}})
+    cfg = Config.from_dict({"team": {"team_mode": "full"}, "news": {"advisor_headlines": True},
+                            "claude": {"review_trades": True, "review_requires_ablation": False}})
     advisor = claude(fa.response(fa.review_payload("confirm", 1.0)))
     rt = runtime(tmp_path, cfg, advisor=advisor)
     try:

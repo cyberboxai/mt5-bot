@@ -46,6 +46,30 @@ About the input:
 Answer only with the JSON object required by the response schema. Keep every text field short, factual
 and in English. Reason codes must come from the enumerated list."""
 
+REPORT_SYSTEM = """You write short operating notes for the owner of an automated foreign-exchange trading system.
+The system is deterministic and complete without you. You have no authority over it: what you write is read by
+a person and never changes anything.
+
+Input: "facts" is normalised JSON produced by code (percentages, counts, tiers, a governance verdict). It never
+contains account identifiers or balances. Use only these facts. Never invent a number, a cause or a forecast, and
+never suggest that a result will continue: nothing here promises profit. When the facts are too few to conclude
+anything, say exactly that.
+
+Write in European Portuguese, in plain language, for a reader who is not a quantitative specialist. Do not use em
+dashes. Answer only with the JSON object required by the response schema: a "summary" of at most six sentences
+and at most five "highlights", each one sentence."""
+
+REPORT_FACT_KEYS = ("trades", "net_pct_of_equity", "incidents", "verdict", "progress", "trades_evaluated", "tiers",
+                    "changes", "kind", "detail")
+
+
+def report_user(kind: str, facts: Mapping[str, Any]) -> str:
+    """Only whitelisted keys reach the prompt; free text in ``detail`` is treated as untrusted."""
+    kept = {k: facts[k] for k in REPORT_FACT_KEYS if k in facts and k != "detail"}
+    body = json.dumps({"kind": kind, "facts": kept}, sort_keys=True, default=str)
+    return body + untrusted_block("report", [facts["detail"]] if facts.get("detail") else [])
+
+
 TRADE_REVIEW_SYSTEM = COMMON_RULES + """
 
 Task: pre-trade review of ONE candidate entry that the deterministic pipeline already wants to take.

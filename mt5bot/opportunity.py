@@ -87,9 +87,6 @@ class AffordabilityMap:
                 return bool(r["feasible"])
         return None
 
-    def to_list(self) -> list[dict[str, Any]]:
-        return list(self.rows)
-
 
 def affordability_rows(symbol: str, timeframe: str, atr_price: Optional[float], value_per_price: float,
                        volume_min: float, commission_per_lot: float, equity: float, tier_risk: Mapping[str, float],

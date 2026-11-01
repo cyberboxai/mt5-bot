@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: python -m ruff check
+        language: system
+        types: [python]
+      - id: mypy-core
+        name: mypy --strict (core domain)
+        entry: python -m mypy
+        language: system
+        pass_filenames: false
+        files: ^mt5bot/(core/|ports\.py|limits\.py)

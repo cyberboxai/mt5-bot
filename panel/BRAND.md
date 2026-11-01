@@ -28,7 +28,8 @@ Os ficheiros `.env` desses projectos não foram lidos.
 | `--cbx-dark` / `--cbx-darker` | `#080E1A` / `#050A10` | fundo da página e das barras |
 | `--cbx-text` / `--cbx-muted` | `#E8EDF7` / `#7A899E` | texto principal e secundário |
 | `--cbx-font-display` | Syne | títulos, rótulos em maiúsculas, botões |
-| `--cbx-font-mono` | Space Mono | corpo de texto e números (como no sítio) |
+| `--cbx-font-mono` | Space Mono | números, horas, código e registos |
+| `--cbx-font-sans` | Space Grotesk | texto da interface (frases, tabelas, rótulos longos), como nas ferramentas internas da CYBERBOX |
 
 ## Camada semântica
 
@@ -51,9 +52,23 @@ Cores por departamento (camisas das personagens e marcas na lista da equipa):
 
 ## Tipos de letra
 
-Syne e Space Mono estão em `panel/static/fonts/` (WOFF2, subconjuntos latin e latin-ext,
-que cobrem o português). Licença SIL Open Font License 1.1: `fonts/OFL-Syne.txt` e
-`fonts/OFL-SpaceMono.txt`. Nada é carregado de CDN.
+Syne, Space Grotesk e Space Mono estão em `panel/static/fonts/` (WOFF2, subconjuntos latin e
+latin-ext, que cobrem o português). Licença SIL Open Font License 1.1: `fonts/OFL-Syne.txt`,
+`fonts/OFL-SpaceGrotesk.txt` e `fonts/OFL-SpaceMono.txt`. Nada é carregado de CDN.
+
+Papéis: Syne para títulos e rótulos em maiúsculas; Space Grotesk (`--font`) para o texto;
+Space Mono (`--mono`) para valores numéricos, horas e código, sempre com algarismos tabulares.
+
+## Escalas
+
+`tokens.css` define também a escala de tipo (`--fs-xs` a `--fs-hero`), o espaçamento em passos
+de 4 px (`--space-1` a `--space-6`), os raios (`--radius`, `--radius-sm`, `--radius-xs`) e a
+elevação (`--shadow-sm` para cartões, `--shadow-pop` para painéis flutuantes). Componentes
+partilhados em `app.css`: `.card`, `.tile` (com `.hero` e `.na` para valores em falta),
+`.tile-section` (grupo de indicadores com título), `.status-chip` (estado com texto e um ponto
+de forma diferente por gravidade), `.btn`, `.mini-btn`, `.segmented`, `.empty`. Os gráficos
+desenham-se à largura real do contentor, por isso o texto dos eixos mantém o tamanho no
+telemóvel.
 
 ## Logótipo
 

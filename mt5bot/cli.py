@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -13,13 +14,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import __version__
+from . import __version__, governance
 from . import strategies as strategy_lib
-from .advisor.redact import RedactingFormatter
+from .adapters.mt5 import Mt5Adapter, load_terminal_api
+from .adapters.shadow import ShadowBroker
+from .advisor.redact import REDACTOR, RedactingFormatter
 from .backtest import compute_metrics, simulate
 from .bot import (EXIT_ERROR, EXIT_OK, EXIT_SAFETY_STOP, EXIT_STARTUP, AccountPolicyError, Bot, StartupError, mask)
 from .config import Config, apply_overrides
 from .db import DB_NAME, LEGACY_REGISTRY, db_path
+from .eventlog import EventLog
+from .observability import JsonFormatter
 from .persistence import account_state_dir
 from .registry import Registry
 from .reports import format_health
@@ -34,13 +39,22 @@ COUNTDOWN_SECONDS = 10
 HEALTH_STALE_SECONDS = 300
 
 
-def setup_logging(log_file: Optional[str]) -> None:
+class RedactingJsonFormatter(JsonFormatter):
+    """Structured logs, with the same secret redaction as the plain text format."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return REDACTOR.redact(super().format(record))
+
+
+def setup_logging(log_file: Optional[str], json_logs: bool = False) -> None:
     """Rotating UTF-8 file log (optional) plus a console handler that never crashes on encoding.
 
     Every handler redacts secrets (API keys, tokens, passwords) from the final text,
     including exception tracebacks.
     """
     formatter = RedactingFormatter("%(asctime)s %(levelname)-8s %(message)s")
+    if json_logs:
+        formatter = RedactingJsonFormatter()
     log.handlers.clear()
     if log_file:
         path = Path(log_file)
@@ -91,6 +105,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                                                  "evidence tiers, specialist team, optional Claude advisor).")
     parser.add_argument("--config", default="config.json", help="path to config.json (default: %(default)s)")
     parser.add_argument("--dry-run", action="store_true", help="run everything but never send orders")
+    parser.add_argument("--shadow", action="store_true",
+                        help="the whole kernel on live quotes with simulated fills: nothing reaches the broker")
     parser.add_argument("--confirm-real-money", action="store_true",
                         help="one-time explicit confirmation required to trade a REAL account")
     parser.add_argument("--no-countdown", action="store_true", help="skip the 10 s real-money countdown")
@@ -111,6 +127,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     actions.add_argument("--rollback", type=int, metavar="ID",
                          help="undo the tier change with audit ID (restores the previous tier, pinned 24 h)")
     actions.add_argument("--resume", action="store_true", help="clear the drawdown circuit breaker")
+    actions.add_argument("--reenable-real", action="store_true",
+                         help="lift research-only mode after reading the stop report (explicit owner decision)")
+    actions.add_argument("--board-report", action="store_true", help="write the weekly board report now")
+    actions.add_argument("--truth", action="store_true", help="print cost-to-edge, reality gap and verdict per arm")
+    actions.add_argument("--complexity-report", action="store_true",
+                         help="print the measured value of every optional component")
+    actions.add_argument("--secret-scan", action="store_true", help="scan logs, reports and databases for secrets")
     actions.add_argument("--rebase-floor", action="store_true",
                          help="start a new risk epoch: the profit floor restarts from current equity (audited)")
     actions.add_argument("--risk-report", action="store_true",
@@ -394,7 +417,7 @@ def _connect_for_data(cfg: Config, config_path: str) -> tuple[Bot, Registry]:
     bot = Bot(cfg, config_path=config_path)
     if not bot._initialize():
         raise StartupError(f"mt5.initialize() failed: {bot._last_error()}")
-    acc = bot.mt5.account_info()
+    acc = bot.broker.account()
     if acc is None:
         raise StartupError("account_info() returned nothing; log in to an account")
     bot.is_real = not bot._is_demo(acc)
@@ -404,11 +427,11 @@ def _connect_for_data(cfg: Config, config_path: str) -> tuple[Bot, Registry]:
     raw = bot.registry.get_kv("universe")
     wanted = (json.loads(raw).get("symbols") if raw else None) or list(cfg.symbols)
     for name in wanted:
-        resolved = resolve_symbol(bot.mt5, name)
+        resolved = resolve_symbol(bot.market, name)
         if resolved is None:
             log.warning("Symbol %s not found; skipped", name)
             continue
-        bot.mt5.symbol_select(resolved, True)
+        bot.market.select_symbol(resolved)
         bot.symbols[name] = resolved
     bot.universe = list(bot.symbols.values())
     bot.registry.set_kv("is_real", "1" if bot.is_real else "0")
@@ -424,6 +447,82 @@ def _open_registry(cfg: Config, args: argparse.Namespace) -> tuple[Optional[Bot]
         return None, Registry(db_path(state_dir)), state_dir
     bot, registry = _connect_for_data(cfg, args.config)
     return bot, registry, bot.state_dir  # type: ignore[return-value]
+
+
+def cmd_reenable_real(cfg: Config, args: argparse.Namespace) -> int:
+    registry = _registry(cfg, args)
+    try:
+        state = governance.research_only_state(registry)
+        if state is None:
+            print("The real account is not in research-only mode.")
+            return EXIT_OK
+        print(f"Research-only since the stop rule: {state.get('reason')}\nReport: {state.get('report')}")
+        registry.set_kv(governance.RESEARCH_ONLY_KEY, json.dumps({"active": False}))
+        EventLog(registry).append("governance.reenabled", "governance", {"by": "owner"}, durable=True)
+        print("Real trading is allowed again from the next start. Nothing here promises a profit.")
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
+def cmd_board_report(cfg: Config, args: argparse.Namespace) -> int:
+    registry = _registry(cfg, args)
+    try:
+        now = time.time()
+        verdict = governance.evaluate_account(registry.conn, cfg.governance.rules(), now)
+        out = Path(cfg.reports_dir) / registry.path.parent.name
+        path = governance.write_board_report(registry.conn, out, now - 7 * 86400, now, verdict, registry.path.parent.name)
+        print(f"Report written: {path}")
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
+def cmd_truth(cfg: Config, args: argparse.Namespace) -> int:
+    from panel import truth as views
+
+    registry = _registry(cfg, args)
+    try:
+        now = time.time()
+        data = views.truth(registry.conn, cfg, {}, now)
+        gap = data["reality_gap"]
+        print(f"Reality gap: {gap.get('gap_r')} R per trade over {gap.get('n', 0)} pairs ({gap.get('status')})")
+        print(f"Configurations ever tested: {data['trials']}")
+        print(f"{'arm':44} {'tier':4} {'E[R] interval':>22} {'cost/edge':>9} {'DSR':>6} {'PBO':>6} verdict")
+        for arm in data["arms"][:args.limit]:
+            interval = f"[{arm['lo_r']}, {arm['hi_r']}]" if arm["lo_r"] is not None else "n/a"
+            print(f"{arm['arm'][:44]:44} {arm['tier']:4} {interval:>22} {arm['cost_to_edge'] or '':>9} "
+                  f"{arm['dsr'] or '':>6} {arm['pbo'] or '':>6} {arm['verdict']}")
+        project = views.project(registry.conn, cfg, now, None)
+        print(f"Project verdict: {project['verdict_pt']} ({project['progress']:.0%} of the evaluation horizon)")
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
+def cmd_complexity(cfg: Config, args: argparse.Namespace) -> int:
+    from .services import complexity_budget
+
+    office = _office(cfg, args)
+    latest = office.latest_ablation() if office is not None else None
+    registry = _registry(cfg, args)
+    try:
+        row = registry.conn.execute("SELECT MIN(open_ts) AS t FROM trades WHERE mode = 'live'").fetchone()
+        for item in complexity_budget(latest["payload"] if latest else None, row["t"], time.time()):
+            print(f"{item['id']:26} {item['status']:15} {item['evidence']}")
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
+def cmd_secret_scan(cfg: Config, args: argparse.Namespace) -> int:
+    from .secretscan import scan_project
+
+    found = scan_project(Path(cfg.state_root), os.environ)
+    for where, hits in sorted(found.items()):
+        print(f"{where}: {', '.join(sorted(set(hits)))}")
+    print("No secrets found." if not found else f"{len(found)} location(s) to clean.")
+    return EXIT_OK if not found else EXIT_ERROR
 
 
 def cmd_research(cfg: Config, args: argparse.Namespace) -> int:
@@ -570,9 +669,17 @@ def countdown(bot: Bot, seconds: int = COUNTDOWN_SECONDS) -> bool:
     return True
 
 
+def _connected(live: Mt5Adapter, cfg: Config) -> Mt5Adapter:
+    """The shadow broker reads the real account once, so the terminal must be up first."""
+    kwargs: dict[str, Any] = {"path": cfg.mt5_path} if cfg.mt5_path else {}
+    if not live.connect(**kwargs):
+        raise StartupError(f"mt5.initialize() failed: {live.last_error()}")
+    return live
+
+
 def run_bot(cfg: Config, args: argparse.Namespace, overrides: dict[str, Any], notices: list[str],
             migrated: dict) -> int:
-    setup_logging(cfg.log_file)
+    setup_logging(cfg.log_file, cfg.ops.json_logs)
     log.info("mt5_bot %s starting%s", __version__, " in DRY RUN mode" if cfg.dry_run else "")
     if notices:
         from .config_migration import write_migrated
@@ -586,8 +693,14 @@ def run_bot(cfg: Config, args: argparse.Namespace, overrides: dict[str, Any], no
         except OSError as exc:
             log.warning("Could not write the migrated config copy: %s", exc)
     try:
+        wiring: dict[str, Any] = {}
+        if args.shadow:
+            live = Mt5Adapter(load_terminal_api())
+            wiring = {"market": ShadowBroker(live, _connected(live, cfg))}
+            wiring["broker"] = wiring["market"]
+            log.warning("SHADOW MODE: live quotes, simulated fills. Nothing reaches the broker.")
         bot = Bot(cfg, config_path=args.config, confirm_real_money=args.confirm_real_money, cli_overrides=overrides,
-                  no_claude=args.no_claude)
+                  no_claude=args.no_claude, **wiring)
     except (StartupError, ValueError) as exc:
         log.error("Startup failed: %s", exc)
         return EXIT_STARTUP
@@ -658,6 +771,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             return cmd_rollback(cfg, args)
         if args.resume:
             return cmd_resume(cfg, args)
+        if args.reenable_real:
+            return cmd_reenable_real(cfg, args)
+        if args.board_report:
+            return cmd_board_report(cfg, args)
+        if args.truth:
+            return cmd_truth(cfg, args)
+        if args.complexity_report:
+            return cmd_complexity(cfg, args)
+        if args.secret_scan:
+            return cmd_secret_scan(cfg, args)
         if args.rebase_floor:
             return cmd_rebase_floor(cfg, args)
         if args.risk_report:

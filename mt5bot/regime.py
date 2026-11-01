@@ -87,14 +87,14 @@ def regime_codes(bars: np.ndarray) -> np.ndarray:
 
     def compute() -> np.ndarray:
         close = np.asarray(bars["close"], dtype=float)
-        high = np.asarray(bars["high"], dtype=float)
-        low = np.asarray(bars["low"], dtype=float)
         er = np.nan_to_num(indicators.efficiency_ratio(close, 20), nan=0.3)
-        ad = np.nan_to_num(indicators.cached(bars, "adx14", lambda: indicators.adx(high, low, close, 14)), nan=20.0)
+        ad = np.nan_to_num(indicators.bars_adx(bars, 14), nan=20.0)
         pct = np.nan_to_num(indicators.rolling_percentile_rank(indicators.bars_atr(bars, 14), 480), nan=50.0)
         vol = np.asarray(bars["tick_volume"], dtype=float)
         with np.errstate(invalid="ignore", divide="ignore"):
-            ratio = _rolling_median(vol, 4) / np.maximum(_rolling_median(vol, 200), 1e-9)
+            ratio = (indicators.bars_rolling_median(bars, "tick_volume", 4, lambda: _rolling_median(vol, 4))
+                     / np.maximum(indicators.bars_rolling_median(bars, "tick_volume", 200,
+                                                                 lambda: _rolling_median(vol, 200)), 1e-9))
         ratio = np.nan_to_num(ratio, nan=1.0)
         scores = np.vstack([(er - 0.30) * 6.0 + (ad - 22.0) / 8.0,
                             (0.25 - er) * 6.0 + (20.0 - ad) / 8.0,

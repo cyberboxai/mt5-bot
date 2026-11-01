@@ -44,7 +44,7 @@ class Clock:
 
 
 def claude_cfg(**overrides: Any) -> Any:
-    values = {"enabled": True, "latency_budget_ms": 2000}
+    values = {"enabled": True, "latency_budget_ms": 2000, "review_trades": True, "review_requires_ablation": False}
     values.update(overrides)
     return Config.from_dict({"claude": values}).claude
 

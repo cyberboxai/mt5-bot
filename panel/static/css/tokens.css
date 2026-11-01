@@ -20,6 +20,7 @@
   --cbx-muted: #7A899E;
   --cbx-font-display: "Syne", "Segoe UI", system-ui, sans-serif;
   --cbx-font-mono: "Space Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --cbx-font-sans: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
 
   /* ---- semantic: dark (default) ---- */
   color-scheme: dark;
@@ -73,13 +74,35 @@
   --screen: var(--cbx-darker);
   --night: rgba(5, 10, 16, 0.42);
   --room-label: #8fa2bd;
-  /* shape and type */
-  --radius: 10px;
-  --radius-sm: 6px;
-  --font: var(--cbx-font-mono);
+  /* shape and type: Space Grotesk for interface text, Space Mono for numbers and code, Syne for
+     titles and uppercase labels. One type scale (px) and one spacing scale (4px steps). */
+  --radius: 12px;
+  --radius-sm: 7px;
+  --radius-xs: 4px;
+  --font: var(--cbx-font-sans);
   --font-display: var(--cbx-font-display);
   --mono: var(--cbx-font-mono);
+  --fs-xs: 10.5px;
+  --fs-sm: 12px;
+  --fs-base: 13.5px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-metric: 24px;
+  --fs-hero: 34px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --surface-hover: #15233d;
+  --surface-sunken: #0a1322;
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.015);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.5);
+  --area-top: 0.22;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --topbar-h: 64px;
   --bottombar-h: 52px;
   --roster-w: 272px;
@@ -131,7 +154,12 @@
   --screen: #0b1a33;
   --night: rgba(26, 58, 110, 0.14);
   --room-label: #33415a;
+  --surface-hover: #edf2f9;
+  --surface-sunken: #eef2f8;
   --shadow: 0 10px 30px rgba(26, 58, 110, 0.14);
+  --shadow-sm: 0 1px 2px rgba(26, 58, 110, 0.08), 0 1px 1px rgba(26, 58, 110, 0.04);
+  --shadow-pop: 0 18px 48px rgba(26, 58, 110, 0.22);
+  --area-top: 0.16;
 }
 
 /* High contrast: stronger text and borders, no translucency, status colours that pass AAA on

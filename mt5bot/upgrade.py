@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__
-from .db import DB_NAME, LEGACY_OFFICE, LEGACY_REGISTRY, ensure_schema, user_version
+from .db import DB_NAME, LEGACY_OFFICE, LEGACY_REGISTRY, SCHEMA_VERSION, connect, ensure_schema, user_version
 
 log = logging.getLogger("mt5_bot")
 
@@ -79,6 +79,18 @@ def _is_sqlite_sidecar(path: Path) -> bool:
 def needs_migration(state_dir: Path) -> bool:
     state_dir = Path(state_dir)
     return (state_dir / LEGACY_REGISTRY).exists() and not (state_dir / DB_NAME).exists()
+
+
+def needs_schema_backup(state_dir: Path) -> bool:
+    """True when this code would upgrade an existing database: back up before touching it."""
+    db = Path(state_dir) / DB_NAME
+    if not db.exists():
+        return False
+    conn = connect(db, read_only=True)
+    try:
+        return user_version(conn) < SCHEMA_VERSION
+    finally:
+        conn.close()
 
 
 def account_dirs(state_root: Path) -> list[Path]:

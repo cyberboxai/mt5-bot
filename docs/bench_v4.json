@@ -1,0 +1,62 @@
+{
+  "python": "3.12.3",
+  "platform": "linux",
+  "cpus": 4,
+  "loop": {
+    "bars": 300,
+    "warmup_bars": 3000,
+    "cycle_ms": {
+      "n": 295,
+      "p50": 220.695,
+      "p95": 483.99,
+      "p99": 643.001,
+      "max": 1224.796
+    },
+    "kernel_ms": {
+      "n": 295,
+      "p50": 219.048,
+      "p95": 482.709,
+      "p99": 641.455,
+      "max": 1223.61
+    },
+    "wall_s": 85.81,
+    "cpu_s": 83.93,
+    "db_bytes": 5591040,
+    "db_kib_per_bar": 18.2,
+    "rows": {
+      "strategies": 15,
+      "param_sets": 14,
+      "promotions": 5,
+      "trades": 415,
+      "equity_snapshots": 300,
+      "kv": 234,
+      "bars_cache": 21255,
+      "symbol_specs": 5,
+      "events": 7110,
+      "dossiers": 37,
+      "agent_state": 22,
+      "agent_weights": 12,
+      "weights_history": 300,
+      "ablation_reports": 1,
+      "metrics": 2700,
+      "arms": 210,
+      "funnel_events": 3492,
+      "policy_outcomes": 1448,
+      "ledger": 212,
+      "sqlite_sequence": 1,
+      "orders": 25,
+      "tca": 25,
+      "cost_models": 22,
+      "stress_reports": 2,
+      "reality_gap": 25
+    }
+  },
+  "optimizer": {
+    "bars": 9000,
+    "trials_per_strategy": 8,
+    "strategies": 14,
+    "seconds": 3.84,
+    "families": 14
+  },
+  "max_rss_mib": 73.3
+}
