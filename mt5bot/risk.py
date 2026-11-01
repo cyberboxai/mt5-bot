@@ -109,6 +109,7 @@ class SymbolSpec:
     swap_3day: int = 3
     currency_base: str = ""
     currency_profit: str = ""
+    volume_limit: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("point", "tick_value", "tick_size", "contract_size", "volume_min", "volume_max",
@@ -160,6 +161,7 @@ class SymbolSpec:
             swap_3day=int(getattr(info, "swap_rollover3days", 3) or 3),
             currency_base=str(getattr(info, "currency_base", "") or ""),
             currency_profit=str(getattr(info, "currency_profit", "") or ""),
+            volume_limit=float(getattr(info, "volume_limit", 0.0) or 0.0),
         )
 
     def to_json(self) -> str:
@@ -182,7 +184,7 @@ class TradePlan:
     loss_per_lot: float
     risk_money: float
     risk_pct: float
-    exception: bool = False   # minimum lot accepted above the tier risk (conscious, logged exception)
+    exception: bool = False   # MIN_VIABLE_SIZE: the minimum lot, accepted above the tier risk within the profile cap
 
     @property
     def planned_risk(self) -> float:
@@ -308,7 +310,8 @@ class EntryContext:
     allowed_risk_pct: Optional[float] = None       # from the sizer (already x the team multiplier)
     spread_limit_points: Optional[float] = None    # per symbol: absolute cap, cost-to-stop and spike filters
     spread_limit_reason: str = ""
-    exception_cap_pct: Optional[float] = None      # tier-specific cap for a minimum-lot exception (None: refuse)
+    exception_cap_pct: Optional[float] = None      # cap for a minimum-viable trade (None: refuse)
+    min_lot: bool = False                          # the plan is exactly the broker's minimum lot
 
 
 class RiskManager:
@@ -329,11 +332,13 @@ class RiskManager:
         self.max_drawdown_pct = min(self.limits.drawdown_breaker_pct, limits.MAX_DRAWDOWN_FROM_PEAK_PCT)
 
     def allowed_risk_pct(self, ctx: EntryContext) -> float:
-        """The per-trade risk this entry may use: the sizer's figure (or, for a minimum-lot
-        exception, the affordability cap), never above the profile cap or the hard ceiling."""
+        """The per-trade risk this entry may use: the sizer's figure, never above the profile cap
+        or the hard ceiling. A minimum-viable trade has its own cap, under the same hard ceiling."""
         cap = min(self.risk_pct, limits.MAX_RISK_PER_TRADE_PCT)
         if ctx.plan.exception:
-            return min(cap, ctx.exception_cap_pct) if ctx.exception_cap_pct is not None else 0.0
+            if ctx.exception_cap_pct is None:
+                return 0.0
+            return min(self.limits.min_viable_cap_pct, ctx.exception_cap_pct, limits.MAX_RISK_PER_TRADE_PCT)
         if ctx.allowed_risk_pct is not None:
             cap = min(cap, ctx.allowed_risk_pct)
         return cap
@@ -376,8 +381,10 @@ class RiskManager:
                            f"{self.max_total_open_risk_pct:.2f}% of equity ({max_total:.2f})")
         if ctx.notional_money is not None:
             exposure = ctx.notional_money / ctx.equity
-            if exposure > self.max_symbol_exposure_x:
-                return False, f"exposure {exposure:.2f}x equity > max {self.max_symbol_exposure_x:.2f}x"
+            # No smaller trade exists at the minimum lot, so it has its own cap (ADR-019).
+            ceiling = limits.MAX_MIN_LOT_EXPOSURE_X if ctx.min_lot else self.max_symbol_exposure_x
+            if exposure > ceiling:
+                return False, f"exposure {exposure:.2f}x equity > max {ceiling:.2f}x"
         return True, "ok"
 
 

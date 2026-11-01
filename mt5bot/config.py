@@ -20,18 +20,19 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from . import limits
-from .config_blocks import (BLOCKS, CapitalConfig, ClaudeConfig, CostsConfig, ExecutionConfig, GovernanceConfig,
-                            OpsConfig, PortfolioConfig, TailConfig, FlowDoctorConfig, ManagementConfig, NewsConfig,
-                            NotificationsConfig, PanelConfig, ResearchConfig, TeamConfig, TiersConfig, UniverseConfig,
-                            parse_block)
+from .config_blocks import (BLOCKS, BudgetConfig, CapacityConfig, CapitalConfig, ClaudeConfig, CostsConfig,
+                            EntryGatesConfig, ExecutionConfig, GovernanceConfig, LearningConfig, OpsConfig,
+                            PortfolioConfig, ScalingGatesConfig, SizingConfig, SloConfig, StartupConfig, TailConfig,
+                            FlowDoctorConfig, ManagementConfig, NewsConfig, NotificationsConfig, PanelConfig,
+                            ResearchConfig, TeamConfig, TiersConfig, UniverseConfig, parse_block)
 from .profiles import PROFILE_NAMES
 
 log = logging.getLogger("mt5_bot")
 
-CONFIG_VERSION = "3.1"
+CONFIG_VERSION = "4.2"
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
-ACCOUNT_MODES = ("any", "demo_only", "real_only")
+ACCOUNT_MODES = ("real", "demo", "auto")
 
 # v1 keys that no longer exist, with what replaces them. A clear message beats "unknown key".
 REMOVED_KEYS = {
@@ -49,7 +50,8 @@ REMOVED_KEYS = {
 # Keys whose change needs a restart: identity, account policy and storage locations.
 RESTART_KEYS = frozenset({
     "symbols", "timeframe", "magic", "account_mode", "real_money_confirmed", "state_root",
-    "reports_dir", "health_file", "log_file", "mt5_path", "kill_switch_file", "panel", "universe",
+    "reports_dir", "health_file", "log_file", "mt5_path", "kill_switch_file", "panel", "universe", "startup",
+    "sizing", "budget", "entry_gates", "scaling_gates", "capacity",    # risk appetite: never loosened at runtime
 })
 
 # Safety keys may be hot reloaded only in the stricter direction; loosening needs a restart.
@@ -119,7 +121,9 @@ class Config:
     magic: int = 510001
 
     # ---- account policy
-    account_mode: str = "any"
+    # ``real`` is the default. ``real_money_confirmed`` stays False here on purpose: the shipped
+    # config.json states it, so a file that never mentions real money refuses instead of trading.
+    account_mode: str = "real"
     real_money_confirmed: bool = False
 
     # ---- risk: the profile sets every number; the optional caps below can only tighten it
@@ -196,6 +200,14 @@ class Config:
     news: NewsConfig = dc_field(default_factory=NewsConfig)
     panel: PanelConfig = dc_field(default_factory=PanelConfig)
     notifications: NotificationsConfig = dc_field(default_factory=NotificationsConfig)
+    sizing: SizingConfig = dc_field(default_factory=SizingConfig)
+    budget: BudgetConfig = dc_field(default_factory=BudgetConfig)
+    startup: StartupConfig = dc_field(default_factory=StartupConfig)
+    entry_gates: EntryGatesConfig = dc_field(default_factory=EntryGatesConfig)
+    scaling_gates: ScalingGatesConfig = dc_field(default_factory=ScalingGatesConfig)
+    learning: LearningConfig = dc_field(default_factory=LearningConfig)
+    slo: SloConfig = dc_field(default_factory=SloConfig)
+    capacity: CapacityConfig = dc_field(default_factory=CapacityConfig)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Config":
@@ -221,6 +233,13 @@ class Config:
         for block in BLOCKS:
             if block in values:
                 values[block] = parse_block(block, values[block])
+        universe = values.get("universe", UniverseConfig())
+        # ``symbols`` and ``timeframe`` are deprecated in files: both derive from ``universe``.
+        if "symbols" not in values:
+            values["symbols"] = universe.always_include or tuple(
+                s for s in universe.candidates if s not in universe.exclude)[:1] or cls.symbols
+        if "timeframe" not in values and cls.timeframe not in universe.timeframes:
+            values["timeframe"] = universe.timeframes[0]
         cfg = cls(**values)
         cfg.validate()
         return cfg

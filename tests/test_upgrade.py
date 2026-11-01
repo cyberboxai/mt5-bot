@@ -71,7 +71,7 @@ class TestSingleSystem:
                         callers.setdefault(call.func.attr, set()).add(node.name)
         assert callers["_send_entry"] == {"_try_open"}
         assert callers["_try_open"] == {"_enter"}
-        assert callers["_enter"] == {"_process_bar"}
+        assert callers["_enter"] == {"_enter_ranked"}
         bridge = inspect.getsource(__import__("mt5bot.teambridge", fromlist=["x"]))
         assert bridge.count("_try_open(") == 2  # BotGateway.preview and BotGateway.submit only
 
@@ -94,7 +94,7 @@ class TestConfigMigration:
         for key in SUPERSEDED_BY_TIERS:
             if key in V30_CONFIG:
                 assert legacy[key] == V30_CONFIG[key]  # nothing silently discarded
-        assert legacy["max_spread_points"] == 20 and migrated["config_version"] == "3.1"
+        assert legacy["max_spread_points"] == 20 and migrated["config_version"] == "4.2"
         assert len(notices) >= 10 and any("POINTS" in n for n in notices)
         original = tmp_path / "config.json"
         original.write_text(json.dumps(V30_CONFIG), encoding="utf-8")

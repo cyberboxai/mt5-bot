@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__, governance
+from .account_mode import acknowledge, needs_countdown
 from . import strategies as strategy_lib
 from .adapters.mt5 import Mt5Adapter, load_terminal_api
 from .adapters.shadow import ShadowBroker
@@ -101,7 +102,7 @@ def install_signal_handlers_for(stop: Any) -> None:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MetaTrader 5 trading bot v3.1: one integrated system (arms with "
+    parser = argparse.ArgumentParser(description="MetaTrader 5 trading bot v4.2: one integrated system (arms with "
                                                  "evidence tiers, specialist team, optional Claude advisor).")
     parser.add_argument("--config", default="config.json", help="path to config.json (default: %(default)s)")
     parser.add_argument("--dry-run", action="store_true", help="run everything but never send orders")
@@ -110,6 +111,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--confirm-real-money", action="store_true",
                         help="one-time explicit confirmation required to trade a REAL account")
     parser.add_argument("--no-countdown", action="store_true", help="skip the 10 s real-money countdown")
+    parser.add_argument("--account", choices=("real", "demo", "auto"), default=None,
+                        help="which account may be used; overrides account_mode in the config")
     parser.add_argument("--bootstrap-days", type=float, default=None, help=argparse.SUPPRESS)  # deprecated
     parser.add_argument("--no-claude", action="store_true",
                         help="run without the optional Claude advisor (the bot is complete without it)")
@@ -119,6 +122,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--risk-profile", choices=("conservative", "balanced", "aggressive"), default=None,
                         help="override risk_profile for this run")
     actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--preflight", action="store_true",
+                         help="read-only check: account, permissions, symbols, what is tradable now; sends nothing")
+    actions.add_argument("--recommend-config", action="store_true",
+                         help="write config.recommended.json for the detected balance; nothing is applied")
+    actions.add_argument("--replay-day", metavar="YYYY-MM-DD",
+                         help="what this version would have done that day, from cached bars")
+    actions.add_argument("--models", action="store_true", help="list the versioned research priors")
+    actions.add_argument("--rollback-model", type=int, metavar="ID", help="restore the research priors of a version")
     actions.add_argument("--status", action="store_true", help="print health.json: equity, tiers, budgets, status")
     actions.add_argument("--diagnose", action="store_true",
                          help="why is (or isn't) the bot trading? Funnel and top blockers (PT-PT)")
@@ -169,9 +180,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sim-edge", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--offline", action="store_true", help="use only the cached data (no MT5 connection)")
     parser.add_argument("--state-dir", help="account state folder for offline commands")
-    parser.add_argument("--account", help="state folder name (<server>_<login>) for offline commands")
+    parser.add_argument("--account-dir", help="state folder name (<server>_<login>) for offline commands")
     parser.add_argument("--trigger", default="manual", help=argparse.SUPPRESS)
-    parser.add_argument("--research-mode", choices=("startup", "full"), default="full", help=argparse.SUPPRESS)
+    parser.add_argument("--research-mode", choices=("startup", "sprint", "nightly", "full"), default="full",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--workers", type=int, default=None, help="research worker processes")
     parser.add_argument("--strategy", help="with --backtest: one strategy name")
     parser.add_argument("--params", help="with --backtest --strategy: JSON parameters (default: grid middle)")
@@ -187,8 +199,8 @@ def resolve_state_dir(cfg: Config, args: argparse.Namespace) -> Path:
     if args.state_dir:
         return Path(args.state_dir)
     root = Path(cfg.state_root)
-    if args.account:
-        return root / args.account
+    if args.account_dir:
+        return root / args.account_dir
     health = Path(cfg.health_file)
     if health.exists():
         try:
@@ -204,7 +216,7 @@ def resolve_state_dir(cfg: Config, args: argparse.Namespace) -> Path:
     if not folders:
         raise ValueError(f"No account state folder in {root}. Start the bot once, or pass --state-dir.")
     names = ", ".join(p.name for p in folders)
-    raise ValueError(f"Several accounts have state in {root} ({names}). Choose one with --account <name>.")
+    raise ValueError(f"Several accounts have state in {root} ({names}). Choose one with --account-dir <name>.")
 
 
 def _ts(value: Optional[float]) -> str:
@@ -352,7 +364,7 @@ def cmd_risk_report(cfg: Config, args: argparse.Namespace) -> int:
     from .profiles import effective_limits
     from .riskreport import DEFAULT_MIX, estimate_inputs, format_report_pt, run_report
 
-    is_real, trades_per_day, mix = cfg.account_mode == "real_only", 3.0, dict(DEFAULT_MIX)
+    is_real, trades_per_day, mix = cfg.account_mode == "real", 3.0, dict(DEFAULT_MIX)
     try:
         registry = _registry(cfg, args)
         try:
@@ -389,7 +401,7 @@ def cmd_migrate(cfg: Config, args: argparse.Namespace, migrated: dict, notices: 
             print(f"  - {n}")
         print("config.json itself was NOT changed. Review the migrated file, then replace config.json with it.")
     else:
-        print("config.json is already in the v3.1 format.")
+        print("config.json is already in the current format.")
     print("Rollback, if ever needed: python mt5_bot.py --rollback-upgrade")
     return EXIT_OK
 
@@ -659,10 +671,89 @@ def cmd_reset_team_weights(cfg: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_preflight(cfg: Config, args: argparse.Namespace) -> int:
+    from .preflight import run_preflight
+
+    try:
+        bot = Bot(cfg, config_path=args.config, confirm_real_money=args.confirm_real_money, no_claude=True, team=False)
+    except (StartupError, ValueError) as exc:
+        print(f"Não foi possível preparar a verificação: {exc}")
+        return EXIT_STARTUP
+    try:
+        code, text = run_preflight(bot)
+    except StartupError as exc:
+        print(f"Verificação interrompida: {exc}")
+        return EXIT_STARTUP
+    finally:
+        bot.shutdown()
+    print(text)
+    return code
+
+
+def cmd_recommend(cfg: Config, args: argparse.Namespace) -> int:
+    from .preflight import run_preflight
+    from .recommend import recommendation, write_recommended
+
+    bot = Bot(cfg, config_path=args.config, confirm_real_money=args.confirm_real_money, no_claude=True, team=False)
+    try:
+        code, text = run_preflight(bot)
+        print(text)
+        if code != EXIT_OK:
+            return code
+        base = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+        target = write_recommended(Path(args.config), recommendation(base, bot.feasibility))
+    finally:
+        bot.shutdown()
+    print(f"\nProposta escrita em {target}. Não foi aplicada: reveja-a antes de a usar.")
+    return EXIT_OK
+
+
+def cmd_replay_day(cfg: Config, args: argparse.Namespace) -> int:
+    from datetime import date
+
+    from .arms import ArmEngine
+    from .profiles import effective_limits
+    from .replay_day import format_report, replay_day
+
+    registry = _registry(cfg, args)
+    try:
+        engine = ArmEngine(registry, cfg.tiers, cfg.research, entry_gates=cfg.entry_gates)
+        engine.refresh(force=True)
+        equity = float(registry.get_kv("equity") or 0.0)
+        if equity <= 0:
+            print("Sem capital registado: arranque o bot uma vez primeiro.")
+            return EXIT_ERROR
+        lim = effective_limits(cfg, registry.get_kv("is_real") == "1")
+        report = replay_day(cfg, registry, lim, date.fromisoformat(args.replay_day), equity,
+                            arms=[a for a in engine.arms.values() if a.active])
+        print(format_report(report))
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
+def cmd_models(cfg: Config, args: argparse.Namespace) -> int:
+    from .learning import list_models, restore_models
+
+    registry = _registry(cfg, args)
+    try:
+        if args.rollback_model is not None:
+            with registry.tx():
+                restored = restore_models(registry.conn, args.rollback_model)
+            print(f"Versão {args.rollback_model}: priores de {restored} braços repostos. Os trades observados não mudam.")
+            return EXIT_OK
+        for m in list_models(registry.conn, args.limit):
+            print(f"#{m.id:<5} {_ts(m.ts)}  {m.kind:<8} {m.arms:>5} braços  dados {m.data_ref}  código {m.code_ref[:12]}")
+        return EXIT_OK
+    finally:
+        registry.close()
+
+
 def countdown(bot: Bot, seconds: int = COUNTDOWN_SECONDS) -> bool:
     """Real-money banner. Returns False if a stop was requested during the countdown."""
     for remaining in range(seconds, 0, -1):
-        log.warning("REAL MONEY trading starts in %d s (Ctrl+C to abort; --no-countdown skips this)", remaining)
+        log.warning("DINHEIRO REAL: a negociação começa em %d s (Ctrl+C para cancelar; --no-countdown salta isto)",
+                    remaining)
         bot._wait(1)
         if bot._stop.is_set():
             return False
@@ -682,16 +773,15 @@ def run_bot(cfg: Config, args: argparse.Namespace, overrides: dict[str, Any], no
     setup_logging(cfg.log_file, cfg.ops.json_logs)
     log.info("mt5_bot %s starting%s", __version__, " in DRY RUN mode" if cfg.dry_run else "")
     if notices:
-        from .config_migration import write_migrated
+        from .config_migration import apply_migrated
 
         for notice in notices:
             log.warning("Config migration: %s", notice)
         try:
-            target = write_migrated(Path(args.config), migrated)
-            log.warning("config.json uses older keys; they were mapped in memory and a migrated copy was written to "
-                        "%s (config.json itself is unchanged)", target)
+            backup = apply_migrated(Path(args.config), migrated)
+            log.warning("%s was migrated to the current format; the previous file is saved as %s", args.config, backup)
         except OSError as exc:
-            log.warning("Could not write the migrated config copy: %s", exc)
+            log.warning("Could not rewrite the config (it keeps working, mapped in memory): %s", exc)
     try:
         wiring: dict[str, Any] = {}
         if args.shadow:
@@ -709,14 +799,19 @@ def run_bot(cfg: Config, args: argparse.Namespace, overrides: dict[str, Any], no
         try:
             bot.startup()
         except AccountPolicyError as exc:
-            log.critical("Account not allowed: %s", exc)
+            log.critical("Conta recusada: %s", exc)
+            print(str(exc))
             return EXIT_SAFETY_STOP
         except (StartupError, ValueError) as exc:
             log.error("Startup failed: %s", exc)
             return EXIT_STARTUP
-        if bot.is_real and not args.no_countdown and not countdown(bot):
+        now = time.time()
+        wait = bot.is_real and not args.no_countdown and needs_countdown(bot.state_dir, now,
+                                                                         cfg.startup.ack_max_age_days)
+        if wait and not countdown(bot):
             log.info("Countdown aborted; no trading happened.")
             return EXIT_OK
+        acknowledge(bot.state_dir, bot._login, str(bot.banner_info.get("server", "")), now)
         try:
             return bot.run()
         except Exception:  # noqa: BLE001 - last-resort log before exit
@@ -752,6 +847,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         overrides["team.team_mode"] = args.team_mode
     if args.risk_profile is not None:
         overrides["risk_profile"] = args.risk_profile
+    if args.account is not None:
+        overrides["account_mode"] = args.account
     if overrides:
         try:
             cfg = apply_overrides(cfg, overrides)
@@ -759,6 +856,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return EXIT_STARTUP
     try:
+        if args.preflight:
+            return cmd_preflight(cfg, args)
+        if args.recommend_config:
+            return cmd_recommend(cfg, args)
+        if args.replay_day:
+            return cmd_replay_day(cfg, args)
+        if args.models or args.rollback_model is not None:
+            return cmd_models(cfg, args)
         if args.status:
             return cmd_status(cfg, args)
         if args.diagnose:

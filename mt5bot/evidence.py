@@ -244,5 +244,8 @@ def fit(samples: Mapping[Hashable, ArmSample], families: Mapping[Hashable, str],
 
 
 def family_of(strategy: str) -> str:
-    """Arms are pooled by base strategy (a volatility-filtered variant pools with its base)."""
-    return strategy[len("volfilter_"):] if strategy.startswith("volfilter_") else strategy
+    """Arms are pooled by base strategy (a wrapped variant pools with its base)."""
+    for prefix in ("volfilter_", "structstop_"):
+        if strategy.startswith(prefix):
+            return strategy[len(prefix):]
+    return strategy

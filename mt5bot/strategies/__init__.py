@@ -16,7 +16,7 @@ from .base import Param, Params, Signal, SignalArrays, Strategy, canonical_param
 from .notrade import NO_TRADE, NOTRADE
 from .registry import registered
 
-_INTERNAL = {"base", "registry", "notrade", "regime_filter"}
+_INTERNAL = {"base", "registry", "notrade", "regime_filter", "structure_stop"}
 
 for _module in sorted(m.name for m in pkgutil.iter_modules(__path__)):
     if _module not in _INTERNAL:
@@ -24,7 +24,10 @@ for _module in sorted(m.name for m in pkgutil.iter_modules(__path__)):
 
 from .regime_filter import register_filtered  # noqa: E402
 
+from .structure_stop import register_structure  # noqa: E402
+
 register_filtered("ema_cross", "donchian")
+register_structure("ema_cross", "donchian")
 
 
 def library() -> dict[str, Strategy]:

@@ -113,7 +113,8 @@ def test_gap_allowance_comes_from_observed_breaks() -> None:
 
 
 def test_sizing_shrinks_for_positions_that_can_cross_a_break(make_bot, fake_mt5: FakeMT5) -> None:
-    bot = make_bot()
+    # Pinned to the morning: late in the server day the 5 h "day trade" would cross the break too.
+    bot = make_bot(utc_now=lambda: 1_760_000_000.0)
     bot.startup()
     rates = fake_mt5.rates["EURUSD"].copy()
     rates["time"][-100:] += 400_000                     # a weekend-like hole with a real gap

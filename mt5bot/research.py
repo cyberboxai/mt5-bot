@@ -11,8 +11,10 @@ family (``optimizer``) and writes, through the registry:
 * one ``research_results`` row per family with the quality flags (deflated Sharpe, profit
   factor, window stability, neighbour robustness...). Flags are information, not gates.
 
-Research runs at startup (quick mode) so priors exist within minutes, then weekly, and on
-demand. A failed run is retried after ``research.retry_minutes`` (v3.0 waited a full week).
+Research runs at startup as a time-boxed sprint over the available history so priors exist
+within minutes, then every night, deeply at the weekend, and on demand. A failed run is retried
+after ``research.retry_minutes``. Results persist, so a restart does not repeat the sprint unless
+the code, the universe or the week's data changed.
 """
 
 from __future__ import annotations
@@ -37,9 +39,12 @@ from .datastore import DataStore
 from .limits import WIDEST_TRADING_HOURS
 from .optimizer import OptimizerSettings, hypothesis_params, optimize_symbol
 from .registry import Registry, _json
+from .learning import snapshot_models
 from .rigor import NO_EDGE, TrialLedger, evaluate_family, sample_params
 from .risk import SymbolSpec
 from .tca import TcaStore
+from .shared import SharedMarket
+from .stamping import source_hash
 from .tiers import TierDecision
 
 log = logging.getLogger("mt5_bot")
@@ -113,7 +118,12 @@ def universe_from_registry(cfg: Any, registry: Registry) -> tuple[list[str], lis
 
 
 def research_settings(cfg: Any, timeframe: str, mode: str) -> OptimizerSettings:
-    trials = cfg.research.startup_trials if mode == "startup" else cfg.trials_per_strategy
+    if mode == "sprint":
+        trials = cfg.startup.sprint_trials
+    elif mode in ("startup", "nightly"):
+        trials = cfg.research.startup_trials
+    else:
+        trials = cfg.trials_per_strategy
     return OptimizerSettings(cfg.wf_train_months, cfg.wf_test_months, cfg.wf_step_months, trials,
                              cfg.max_trials_per_cycle, cfg.optimizer_seed, cfg.research.reference_risk_pct,
                              cfg.research.reference_equity, TIMEFRAME_SECONDS[timeframe])
@@ -150,39 +160,46 @@ def run_research(cfg: Any, registry: Registry, trigger: str, mode: str = "full",
     months = cfg.research.startup_history_months if mode == "startup" else cfg.history_months
     out: list[dict[str, Any]] = []
     ok = 0
-    for symbol in symbols:
+    deadline = None
+    if mode in ("sprint", "nightly"):
+        deadline = clock() + cfg.startup.research_sprint_minutes * 60.0
+    for symbol, tf in research_order(symbols, timeframes, registry):
+        if deadline is not None and clock() >= deadline:
+            out.append({"symbol": symbol, "timeframe": tf, "run_id": 0, "status": "failed",
+                        "error": "time box reached; this pair waits for the next cycle"})
+            continue
         spec_row = registry.load_spec(symbol)
-        for tf in timeframes:
-            run_id = registry.start_run(f"{symbol} {tf}", trigger)
-            try:
-                if spec_row is None:
-                    raise RuntimeError(f"no cached symbol specification for {symbol}; the live bot stores it")
-                spec = SymbolSpec.from_json(spec_row[0])
-                bars = registry.load_bars(symbol, tf)
-                if len(bars):
-                    bars = bars[bars["time"] >= int(bars["time"][-1]) - months * MONTH]
-                if len(bars) < MIN_RESEARCH_BARS:
-                    raise RuntimeError(f"only {len(bars)} cached {tf} bars for {symbol} (need {MIN_RESEARCH_BARS}); "
-                                       "check Tools > Options > Charts > Max bars in chart")
-                slippage = TcaStore(registry, clock).slippage_points(symbol, cfg.backtest_slippage_points)
-                costs = cost_model(cfg, spec_row[1], symbol, slippage)
-                settings = research_settings(cfg, tf, mode)
-                result = optimize_symbol(symbol, bars, spec, costs, settings, cfg.strategy_names(),
-                                         workers or cfg.optimizer_workers, lower_priority, extra_params=extra)
-                registry.finish_run(run_id, result)
-                arms = apply_priors(registry, store, symbol, tf, result, bars, spec, costs, settings, run_id, clock)
-                verdicts = apply_rigor(cfg, registry, store, symbol, tf, bars, spec, costs, settings, run_id, mode, clock)
-                ok += 1
-                out.append({"symbol": symbol, "timeframe": tf, "run_id": run_id, "status": "done",
-                            "families": len(result.candidates), "arms_with_prior": arms,
-                            "seconds": round(result.seconds, 1), "verdicts": verdicts})
-                log.info("%s %s: research run %d finished in %.0fs (%d families, %d arm priors)", symbol, tf, run_id,
-                         result.seconds, len(result.candidates), arms)
-            except Exception as exc:  # noqa: BLE001 - record and continue with the other pairs
-                log.warning("%s %s: research run %d failed: %s", symbol, tf, run_id, exc)
-                registry.fail_run(run_id, f"{type(exc).__name__}: {exc}")
-                out.append({"symbol": symbol, "timeframe": tf, "run_id": run_id, "status": "failed",
-                            "error": str(exc)[:300]})
+        run_id = registry.start_run(f"{symbol} {tf}", trigger)
+        try:
+            if spec_row is None:
+                raise RuntimeError(f"no cached symbol specification for {symbol}; the live bot stores it")
+            spec = SymbolSpec.from_json(spec_row[0])
+            bars = registry.load_bars(symbol, tf)
+            if len(bars):
+                bars = bars[bars["time"] >= int(bars["time"][-1]) - months * MONTH]
+            if len(bars) < MIN_RESEARCH_BARS:
+                raise RuntimeError(f"only {len(bars)} cached {tf} bars for {symbol} (need {MIN_RESEARCH_BARS}); "
+                                   "check Tools > Options > Charts > Max bars in chart")
+            slippage = TcaStore(registry, clock).slippage_points(symbol, cfg.backtest_slippage_points)
+            costs = cost_model(cfg, spec_row[1], symbol, slippage)
+            settings = research_settings(cfg, tf, mode)
+            result = optimize_symbol(symbol, bars, spec, costs, settings, cfg.strategy_names(),
+                                     workers or cfg.optimizer_workers, lower_priority, extra_params=extra)
+            registry.finish_run(run_id, result)
+            arms = apply_priors(registry, store, symbol, tf, result, bars, spec, costs, settings, run_id, clock)
+            verdicts = apply_rigor(cfg, registry, store, symbol, tf, bars, spec, costs, settings, run_id, mode,
+                                   clock, deadline)
+            ok += 1
+            out.append({"symbol": symbol, "timeframe": tf, "run_id": run_id, "status": "done",
+                        "families": len(result.candidates), "arms_with_prior": arms,
+                        "seconds": round(result.seconds, 1), "verdicts": verdicts})
+            log.info("%s %s: research run %d finished in %.0fs (%d families, %d arm priors)", symbol, tf, run_id,
+                     result.seconds, len(result.candidates), arms)
+        except Exception as exc:  # noqa: BLE001 - record and continue with the other pairs
+            log.warning("%s %s: research run %d failed: %s", symbol, tf, run_id, exc)
+            registry.fail_run(run_id, f"{type(exc).__name__}: {exc}")
+            out.append({"symbol": symbol, "timeframe": tf, "run_id": run_id, "status": "failed",
+                        "error": str(exc)[:300]})
     if hypotheses:
         registry.set_kv("research_hypotheses", "[]")
         registry.log_event("*", "research", f"{len(hypotheses)} research hypothesis(es) evaluated through the normal "
@@ -195,7 +212,34 @@ def run_research(cfg: Any, registry: Registry, trigger: str, mode: str = "full",
         registry.set_kv("last_research_finished", str(now))
         if mode == "full":
             registry.set_kv("last_full_research", str(now))
+        if mode == "nightly":
+            registry.set_kv("last_nightly_research", str(now))
+        if mode == "sprint":
+            registry.set_kv("sprint_key", sprint_key(symbols, now))
+        snapshot_models(registry.conn, mode, _data_ref(registry, symbols), source_hash(), trigger[:200], clock)
     return out
+
+
+def research_order(symbols: Sequence[str], timeframes: Sequence[str], registry: Registry) -> list[tuple[str, str]]:
+    """Feasible pairs first, so a time box spends itself where trades can actually happen."""
+    pairs = [(s, tf) for s in symbols for tf in timeframes]
+    try:
+        rows = json.loads(registry.get_kv("affordability") or "{}").get("rows") or []
+    except ValueError:
+        rows = []
+    feasible = {(r.get("symbol"), r.get("timeframe")) for r in rows if r.get("feasible")}
+    return sorted(pairs, key=lambda p: p not in feasible)
+
+
+def sprint_key(symbols: Sequence[str], now: float) -> str:
+    """Changes with the code, the universe or the ISO week: a restart inside it reuses the results."""
+    week = time.strftime("%G-%V", time.gmtime(now))
+    return f"{source_hash()}|{','.join(sorted(symbols))}|{week}"
+
+
+def _data_ref(registry: Registry, symbols: Sequence[str]) -> str:
+    row = registry.conn.execute("SELECT id FROM data_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+    return f"snapshot:{row['id']}" if row is not None else f"symbols:{','.join(sorted(symbols))}"
 
 
 def apply_priors(registry: Registry, store: Any, symbol: str, timeframe: str, result: Any, bars: np.ndarray,
@@ -227,12 +271,25 @@ def apply_priors(registry: Registry, store: Any, symbol: str, timeframe: str, re
         if row is not None and n_d > 0 and mean_d is not None:
             store.set_prior(int(row["id"]), n_d, mean_d, var_d)
             count += 1
+        # Stop variants are fixed parameters too: each gets its own honest out-of-sample prior.
+        variants = registry.conn.execute("SELECT id, param_set_id FROM arms WHERE symbol = ? AND timeframe = ? AND"
+                                         " strategy = ? AND source = 'default' AND active = 1",
+                                         (symbol, timeframe, cand.strategy)).fetchall()
+        for arm_row in variants:
+            if row is not None and int(arm_row["id"]) == int(row["id"]):
+                continue
+            _name, params = registry.param_set(int(arm_row["param_set_id"]))
+            n_v, mean_v, var_v = fixed_params_prior(bars, cand.strategy, params, spec, costs, settings.equity,
+                                                    settings.risk_pct, m.get("oos_start_time"))
+            if n_v > 0 and mean_v is not None:
+                store.set_prior(int(arm_row["id"]), n_v, mean_v, var_v)
+                count += 1
     return count
 
 
 def apply_rigor(cfg: Any, registry: Registry, store: Any, symbol: str, timeframe: str, bars: np.ndarray,
                 spec: SymbolSpec, costs: CostModel, settings: OptimizerSettings, run_id: int, mode: str,
-                clock: Callable[[], float]) -> dict[str, int]:
+                clock: Callable[[], float], deadline: Optional[float] = None) -> dict[str, int]:
     """Snapshot the data, judge every family with the CPCV pipeline and act on the verdicts:
     priors come from the out-of-sample distribution, and arms without an edge go back to research."""
     data = DataStore(registry.path.parent, registry, clock)
@@ -241,10 +298,15 @@ def apply_rigor(cfg: Any, registry: Registry, store: Any, symbol: str, timeframe
         log.warning("%s %s: data quality issues in %s: %s", symbol, timeframe, snapshot, "; ".join(quality.issues))
     ledger = TrialLedger(registry, clock)
     rigor = cfg.research.rigor(cfg.costs.k)
+    shared = SharedMarket(Path(registry.path).parent.parent)
+    account = Path(registry.path).parent.name
     tally: dict[str, int] = {}
     seconds = TIMEFRAME_SECONDS[timeframe]
     nights = cfg.costs.expected_hold_bars * seconds / 86400.0
     for name in cfg.strategy_names():
+        if deadline is not None and clock() >= deadline:
+            log.info("%s %s: time box reached; the remaining verdicts wait for the next cycle", symbol, timeframe)
+            break
         params = sample_params(name, settings.trials_per_strategy, cfg.optimizer_seed + run_id)
 
         def count(p: Any, stats: Any, strategy: str = name) -> None:
@@ -252,7 +314,7 @@ def apply_rigor(cfg: Any, registry: Registry, store: Any, symbol: str, timeframe
 
         try:
             verdict = evaluate_family(bars, name, params, spec, costs, settings.equity, settings.risk_pct, rigor,
-                                      ledger.count(), count, nights)
+                                      ledger.count() + shared.other_trials(account), count, nights)
         except Exception as exc:  # noqa: BLE001 - one family must not stop the others
             log.warning("%s %s %s: rigor evaluation failed: %s", symbol, timeframe, name, exc)
             continue
@@ -276,6 +338,7 @@ def apply_rigor(cfg: Any, registry: Registry, store: Any, symbol: str, timeframe
                 store.change_tier(arm, TierDecision("T0", arm.tier, f"retired by research: {reason}"), clock(),
                                   action="retire")
                 store.set_active(arm.id, False)
+    shared.publish_trials(account, ledger.count())
     return tally
 
 
@@ -295,12 +358,14 @@ class ResearchScheduler:
         self.script = script or str(Path(__file__).resolve().parent.parent / "mt5_bot.py")
         self.process: Any = None
         self.demand: Optional[str] = None
+        self.demand_mode = "full"
         self._log_handle: Any = None
         self._last_attempt = -math.inf
         self.last_reason: Optional[str] = None
 
-    def request(self, symbol: str, reason: str) -> None:
+    def request(self, symbol: str, reason: str, mode: str = "full") -> None:
         self.demand = f"{symbol}: {reason}"
+        self.demand_mode = mode
 
     def running(self) -> bool:
         if self.process is None:
@@ -315,10 +380,22 @@ class ResearchScheduler:
             self._log_handle = None
         return False
 
-    def due(self, weekend: bool) -> Optional[tuple[str, str]]:
+    def _nightly_due(self, now: float, server_now: Optional[float]) -> bool:
+        learning = getattr(self.cfg, "learning", None)
+        if learning is None or not learning.nightly_research or server_now is None:
+            return False
+        hour = int((server_now % 86400) // 3600)
+        day = int(server_now // 86400)
+        last = self.registry.get_kv("last_nightly_day")
+        if hour < learning.nightly_hour_server or last == str(day):
+            return False
+        self.registry.set_kv("last_nightly_day", str(day))
+        return True
+
+    def due(self, weekend: bool, server_now: Optional[float] = None) -> Optional[tuple[str, str]]:
         """(reason, mode) to start research now, or None."""
         if self.demand:
-            return self.demand, "full"
+            return self.demand, self.demand_mode
         now = self.clock()
         finished = self.registry.get_kv("last_research_finished")
         attempt = self.registry.get_kv("last_research_attempt")
@@ -327,7 +404,7 @@ class ResearchScheduler:
             if attempt is not None and now - float(attempt) < retry:
                 return None
             return ("cold start: no research results yet" if attempt is None
-                    else "retry: the previous research run produced no result"), "startup"
+                    else "retry: the previous research run produced no result"), "sprint"
         full = self.registry.get_kv("last_full_research")
         age_days = (now - float(full if full is not None else finished)) / 86400
         if full is None and age_days >= 1.0 and weekend:
@@ -336,12 +413,14 @@ class ResearchScheduler:
             return "weekly research (market closed)", "full"
         if age_days >= self.cfg.reoptimize_every_days + 3:
             return "weekly research overdue (no weekend window seen)", "full"
+        if self._nightly_due(now, server_now):
+            return "nightly research on the grown dataset", "nightly"
         return None
 
-    def maybe_launch(self, weekend: bool) -> Optional[str]:
+    def maybe_launch(self, weekend: bool, server_now: Optional[float] = None) -> Optional[str]:
         if self.running():
             return None
-        due = self.due(weekend)
+        due = self.due(weekend, server_now)
         if due is None or self.clock() - self._last_attempt < 600:
             return None
         reason, mode = due

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from conftest import EURUSD_SPEC, TEST_COSTS, synthetic_bars
+from mt5bot.evidence import family_of
 from mt5bot import strategies as S
 from mt5bot.optimizer import (MONTH_SECONDS, Gates, OptimizerSettings, evaluate_strategy, optimize_symbol,
                               trial_plan, walk_forward_windows)
@@ -61,7 +62,7 @@ def test_random_walk_with_costs_returns_notrade(random_walk_results: list[dict])
 def test_injected_edge_is_found() -> None:
     results = _pool_map([(seed, 0.15, False) for seed in range(3)])
     for r in results:
-        assert r["best"] in ("donchian", "volfilter_donchian", "ema_cross", "volfilter_ema_cross"), r
+        assert family_of(r["best"]) in ("donchian", "ema_cross"), r   # wrapped variants share their base's edge
 
 
 def test_deterministic_for_a_seed() -> None:

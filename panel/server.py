@@ -225,6 +225,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/arms": data.strategies,
             "/api/funnel": lambda: data.funnel(_num(q.get("hours"), 24.0, 1.0, 24.0 * 30)),
             "/api/flow": data.flow,
+            "/api/learning": data.learning,
             "/api/risk": data.risk,
             "/api/markets": data.markets,
             "/api/advisor": data.advisor,

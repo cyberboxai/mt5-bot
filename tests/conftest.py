@@ -394,6 +394,7 @@ def make_cfg(tmp_path: Path):
         # The v3.0 risk numbers as explicit user caps: tests of the risk layer keep their
         # meaning (0.5% per trade on demo), and caps can only tighten the balanced profile.
         values: dict[str, Any] = {
+            "account_mode": "auto",     # the fake terminal is a demo account
             "state_root": str(tmp_path / "state"),
             "reports_dir": str(tmp_path / "reports"),
             "health_file": str(tmp_path / "health.json"),

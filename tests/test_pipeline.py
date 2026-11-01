@@ -149,7 +149,7 @@ def test_every_order_has_sl_and_tp_on_the_right_side(make_bot, fake_mt5: FakeMT5
 
 def test_large_orders_are_split_and_count_as_one_position(make_bot, fake_mt5: FakeMT5) -> None:
     fake_mt5.symbols["EURUSD"].volume_max = 0.1
-    bot = started(make_bot, FixedSource("BUY"), commission_per_lot=0.0)
+    bot = started(make_bot, FixedSource("BUY"), commission_per_lot=0.0, capacity={"child_interval_seconds": 0.0})
     next_bar(bot, fake_mt5)
     sends = opening_sends(fake_mt5)
     assert len(sends) == 3 and [s["volume"] for s in sends] == [0.1, 0.1, 0.03]  # 0.23 lots in 3 orders
@@ -170,7 +170,7 @@ def test_spent_exploration_budget_blocks_exploration(make_bot, fake_mt5: FakeMT5
     now = bot._utc_now()
     trade_id = bot.registry.open_trade("live", "EURUSD", None, "BUY", 1.1, 1.09, 1.12, 0.1, 50.0, ticket=77,
                                        open_ts=now - 600, tier="T1", extra={"exploration": True})
-    bot.registry.close_trade(trade_id, 1.09, -60.0, -1.2, "sl", close_ts=now - 300)  # beyond the 0.2%/day budget
+    bot.registry.close_trade(trade_id, 1.09, -80.0, -1.2, "sl", close_ts=now - 300)  # beyond 3 T1 trades of 25
     next_bar(bot, fake_mt5)
     assert "EXPLORATION_BUDGET_SPENT" in reasons(bot) and opening_sends(fake_mt5) == []
     bot.close()
@@ -186,15 +186,15 @@ def test_exploration_trades_at_micro_risk(make_bot, fake_mt5: FakeMT5) -> None:
     bot.close()
 
 
-def test_minimum_lot_exception_on_a_small_account(make_bot, fake_mt5: FakeMT5) -> None:
+def test_minimum_lot_fits_the_tier_on_a_small_account(make_bot, fake_mt5: FakeMT5) -> None:
     fake_mt5.account.balance = fake_mt5.account.equity = 1_500.0
     bot = started(make_bot, Scripted(lambda n: intent(tier="T1", exploration=True)), commission_per_lot=0.0)
     lim = bot.risk.limits
     next_bar(bot, fake_mt5)
     [row] = bot.registry.trades(mode="live")
     # 0.01 lot to a 200-point stop risks ~0.14% of 1500: above the T1 tier, within the exploration cap.
-    assert row.volume == 0.01 and lim.t1_risk_pct < row.risk_pct <= lim.explore_trade_pct
-    assert row.extra["min_lot_exception"] and "MIN_LOT_EXCEPTION" in reasons(bot)
+    assert row.volume == 0.01 and lim.t1_risk_pct > row.risk_pct
+    assert not row.extra["min_lot_exception"]   # 0.14% fits the 0.25% T1 risk: no exception needed
     bot.close()
 
 

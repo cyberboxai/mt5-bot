@@ -97,6 +97,7 @@ def test_lifecycle_exploration_research_promotion_and_demotion(tmp_path: Path) -
     history = synthetic_bars(24 * 200, seed=201, trend=0.15)
     cfg = Config.from_dict({
         "symbols": ["EURUSD"], "timeframe": "H1", "bars": 600, "trading_hours_server": [0, 24],
+        "account_mode": "auto", "learning": {"stop_variants": False},
         "state_root": str(tmp_path / "state"), "reports_dir": str(tmp_path / "reports"),
         "health_file": str(tmp_path / "health.json"), "kill_switch_file": str(tmp_path / "KILL"),
         "log_file": str(tmp_path / "bot.log"), "enabled_strategies": ["donchian", "ema_cross"],

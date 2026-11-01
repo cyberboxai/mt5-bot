@@ -44,13 +44,16 @@ class ScenarioResult:
 
 
 def simulate(lim: EffectiveLimits, edge_r: float, days: int = 250, paths: int = 2000, trades_per_day: float = 3.0,
-             mix: Optional[Mapping[str, float]] = None, payoff: float = 1.5, seed: int = 7) -> dict[str, np.ndarray]:
+             mix: Optional[Mapping[str, float]] = None, payoff: float = 1.5, seed: int = 7,
+             min_risk_pct: float = 0.0) -> dict[str, np.ndarray]:
+    """``min_risk_pct``: the smallest risk a trade can have at this balance. On a small account lot
+    granularity, not the tier, sets the size, and the simulation must pay that."""
     rng = np.random.default_rng(seed)
     mix = dict(mix or DEFAULT_MIX)
     tiers = list(mix)
     probs = np.array([mix[t] for t in tiers], dtype=float)
     probs = probs / probs.sum()
-    tier_risk = np.array([lim.tier_risk_pct(t) / 100.0 for t in tiers])
+    tier_risk = np.array([max(lim.tier_risk_pct(t), min_risk_pct) / 100.0 for t in tiers])
     is_t1 = np.array([t == "T1" for t in tiers])
     p_win = min(max((edge_r + 1.0) / (payoff + 1.0), 0.0), 1.0)
     equity = np.ones(paths)
@@ -81,8 +84,10 @@ def simulate(lim: EffectiveLimits, edge_r: float, days: int = 250, paths: int = 
             active &= cushion > 0
             idx = rng.choice(len(tiers), size=paths, p=probs)
             risk = tier_risk[idx] * np.where(is_t1[idx], 1.0, factor)
-            budget_day = lim.explore_day_pct / 100.0 - day_used
-            budget_week = lim.explore_week_pct / 100.0 - week_used
+            budget_day = max(lim.explore_day_pct, lim.explore_trades_day * tier_risk[is_t1].max(initial=0.0) * 100.0)
+            budget_day = min(budget_day, lim.daily_loss_pct) / 100.0 - day_used
+            budget_week = max(lim.explore_week_pct, lim.explore_trades_week * tier_risk[is_t1].max(initial=0.0) * 100.0)
+            budget_week = min(budget_week, lim.weekly_loss_pct) / 100.0 - week_used
             t1_ok = np.minimum(budget_day, budget_week) >= risk
             active &= ~is_t1[idx] | t1_ok
             risk = np.minimum(risk, cushion / np.maximum(equity, 1e-12))
@@ -147,6 +152,29 @@ def format_report_pt(lim: EffectiveLimits, results: Sequence[ScenarioResult], da
     lines.append("Sem vantagem real, o resultado esperado é uma pequena perda limitada pelo orçamento de exploração e "
                  "pelos custos. O bot não pode garantir lucro.")
     return "\n".join(lines)
+
+
+def money_view(lim: EffectiveLimits, equity: float, currency: str, trades_per_day: float,
+               mix: Optional[Mapping[str, float]], edge_r: Optional[float] = None, min_risk_pct: float = 0.0,
+               paths: int = 400) -> dict[str, Any]:
+    """What this profile and mode can cost, in account money: the panel's risk view.
+
+    Always includes a zero-edge scenario, because that is what a strategy without proven edge is."""
+    scenarios: list[tuple[str, float]] = [("sem vantagem", 0.0)]
+    if edge_r is not None:
+        scenarios.append(("posteriores actuais", float(edge_r)))
+    out: list[dict[str, Any]] = []
+    for name, edge in scenarios:
+        quarter = simulate(lim, edge, 63, paths, trades_per_day, mix, min_risk_pct=min_risk_pct)
+        week = simulate(lim, edge, 5, paths, trades_per_day, mix, min_risk_pct=min_risk_pct)
+        loss = 1.0 - quarter["equity"]
+        weekly = (week["equity"] - 1.0) * equity
+        out.append({"name": name, "edge_r": round(edge, 4),
+                    "p_lose_10": round(float((loss >= 0.10).mean()), 4), "p_lose_20": round(float((loss >= 0.20).mean()), 4),
+                    "p_lose_50": round(float((loss >= 0.50).mean()), 4), "weekly_median": round(float(np.median(weekly)), 2),
+                    "weekly_worst": round(float(weekly.min()), 2), "horizon_days": 63})
+    return {"profile": lim.profile, "equity": round(equity, 2), "currency": currency, "scenarios": out,
+            "note": "Estimativas de um modelo simplificado. Não são previsão nem garantia."}
 
 
 def estimate_inputs(registry: Any) -> tuple[float, dict[str, float]]:

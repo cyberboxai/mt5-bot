@@ -56,6 +56,35 @@ export function mountFunnel(root, app) {
     }
   }
 
+  function affordCard(d) {
+    const fz = d.feasibility || {};
+    const cur = d.currency || "";
+    const groups = new Map();
+    for (const r of (d.affordability || {}).rows || []) {
+      const key = `${r.symbol} ${r.timeframe}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    const rows = [...groups.entries()].map(([key, list]) => {
+      const good = list.filter((r) => r.feasible);
+      const best = (good.length ? good : list).reduce((a, b) => ((a.min_lot_risk ?? 1e18) <= (b.min_lot_risk ?? 1e18) ? a : b));
+      const floor = Math.min(...list.map((r) => r.floor_equity ?? Infinity));
+      return { par: key, stops: good.map((r) => r.stop_policy).join(", ") || "-",
+        risco: `${num(best.min_lot_risk, 2)} ${cur} (${num(best.min_lot_risk_pct, 2)}%)`,
+        piso: Number.isFinite(floor) ? `${num(floor, 2)} ${cur}` : "n/d",
+        agora: good.length ? t("why.afford_now") : best.reason_pt || t("common.no") };
+    });
+    const sub = fz.floor === undefined || fz.floor === null ? t("why.afford_sub")
+      : t("why.afford_floor", { floor: num(fz.floor, 2), ceiling: fz.ceiling ? num(fz.ceiling, 0) : "n/d", cur });
+    const box = card(t("why.afford"), sub, rows.length ? dataTable(rows, [
+      { key: "par", label: t("why.afford_col.pair") }, { key: "stops", label: t("why.afford_col.stops"), wrap: true },
+      { key: "risco", label: t("why.afford_col.risk") }, { key: "piso", label: t("why.afford_col.floor") },
+      { key: "agora", label: t("why.afford_col.now"), wrap: true }]) : empty(t("common.nodata")));
+    if (fz.undeployed_text) box.append(el("p", { class: "small muted", text: fz.undeployed_text }));
+    if (fz.below_floor) box.append(el("p", { class: "small", text: t("why.afford_shadow") }));
+    return box;
+  }
+
   function render(d) {
     clear(body);
     const rep = d.report || {};
@@ -65,6 +94,10 @@ export function mountFunnel(root, app) {
       el("h3", { class: "why-headline", text: headline(d) }),
       el("p", { class: "why-status", text: reasonText(d.status_line) || t("why.status_unknown") }),
       d.entry_block ? el("p", { class: "why-block", text: t("why.entry_block", { reason: reasonText(d.entry_block) }) }) : null,
+      (d.feasibility || {}).message ? el("p", { class: "why-block", text: d.feasibility.message }) : null,
+      (d.why || {}).top ? el("p", { class: "why-status", text: t("why.top_blocker", { what: d.why.top.description, n: d.why.top.count }) }) : null,
+      (d.why || {}).top ? el("p", { class: "why-status", text: d.why.action
+        ? t("why.action_taken", { what: reasonText(d.why.action.reason) }) : t("why.action_none") }) : null,
       el("p", { class: "small muted", text: t("why.cli") }));
     body.append(hero);
     if (!rep.available) { body.append(empty(t("why.no_data_detail"))); return; }
@@ -120,10 +153,7 @@ export function mountFunnel(root, app) {
       xFormat: (v) => axisTime(v, hourly.length ? hourly[hourly.length - 1].ts - hourly[0].ts : 0), xTip: (v) => dateTime(v),
       yFormat: (v) => num(v, 0) }) }));
 
-    const aff = ((d.affordability || {}).rows || []).filter((r) => r.tier === "T1").slice(0, 24);
-    grid.append(card(t("why.afford"), t("why.afford_sub"), aff.length ? dataTable(aff.map((r) => ({
-      símbolo: r.symbol, tf: r.timeframe, "lote mín. arrisca": `${num(r.min_lot_risk_pct, 3)}%`,
-      viável: r.feasible ? t("common.yes") : t("common.no"), "capital mínimo": num(r.min_equity, 0) }))) : empty(t("common.nodata"))));
+    grid.append(affordCard(d));
     body.append(grid);
   }
 

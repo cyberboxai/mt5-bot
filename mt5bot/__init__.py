@@ -7,4 +7,4 @@ Nothing in this package can guarantee profit. The bot sizes risk by the evidence
 and stands aside when the evidence turns against an arm.
 """
 
-__version__ = "4.0.0"
+__version__ = "4.2.0"

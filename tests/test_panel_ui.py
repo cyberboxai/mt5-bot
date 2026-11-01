@@ -161,3 +161,31 @@ def test_funnel_api_reports_counterfactuals(tmp_path: Path) -> None:
         assert "counterfactuals" in body and body["hours"] == 24 and "flow" in body
     finally:
         stop_server(ctx, server)
+
+
+def test_top_bar_shows_the_mode_and_the_tab_title_carries_it() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    main = (STATIC / "js" / "main.js").read_text(encoding="utf-8")
+    for node in ("ops-mode", "ops-budget", "ops-slo", "ops-uptime"):
+        assert f'id="{node}"' in html
+    assert '"[REAL] "' in main and '"[DEMO] "' in main and "document.title = `${tag}${base}`" in main
+
+
+def test_panel_has_no_way_to_change_the_account_mode() -> None:
+    server = (PROJECT / "panel" / "server.py").read_text(encoding="utf-8")
+    assert "account_mode" not in server and "real_money_confirmed" not in server
+
+
+def test_new_strings_exist_in_both_languages() -> None:
+    text = (STATIC / "js" / "i18n.js").read_text(encoding="utf-8")
+    pt, en = text.split("const EN = {", 1)
+    for key in ("tab.learning", "ops.slo.left", "why.action_taken", "learn.models", "risk.price"):
+        assert f'"{key}"' in pt and f'"{key}"' in en
+
+
+def test_status_chips_live_outside_the_top_bar() -> None:
+    """Regression: inside the bar they pushed out the account KPIs, the clocks and the tool buttons."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    header = html[html.index('<header class="topbar"'):html.index("</header>")]
+    assert 'id="kpi-equity"' in header and "ops-chip" not in header
+    assert html.index('id="ops-strip"') > html.index("</header>")

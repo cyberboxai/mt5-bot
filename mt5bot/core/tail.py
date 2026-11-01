@@ -20,7 +20,6 @@ class TailRules:
     margin_call_multiple: float = 1.5
     gap_quantile: float = 0.99
     overnight_hours: float = 6.0
-    small_account_equity: float = 25_000.0
     ladder_steps: tuple[tuple[float, float], ...] = ((3.0, 0.75), (6.0, 0.5), (10.0, 0.25))
     ladder_recovery_days: float = 3.0
     cvar_alpha: float = 0.95

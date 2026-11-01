@@ -308,7 +308,54 @@ export function mountStrategies(root) {
   }, 30000);
 }
 
+// ------------------------------------------------------------------ learning
+
+export function mountLearning(root) {
+  return view(root, t("tab.learning"), t("learn.sub"), () => getJSON("/api/learning"), (body, d) => {
+    const week = d.week || [];
+    const live = week.reduce((a, i) => a + i.live, 0);
+    const shadow = week.reduce((a, i) => a + i.shadow, 0);
+    body.append(el("div", { class: "grid tiles" }, [
+      tile(t("learn.live"), num(live, 0), t("learn.week")), tile(t("learn.shadow"), num(shadow, 0), t("learn.week")),
+      tile(t("learn.half_life"), `${num(d.half_life_days, 0)} d`, t("learn.half_life_note")),
+      tile(t("learn.drift"), num((d.drift || []).length, 0), t("learn.drift_note"))]));
+    const grid = el("div", { class: "grid cols-2" });
+    grid.append(card(t("learn.evidence"), t("learn.evidence_sub"), week.length ? dataTable(week.map((i) => ({
+      braço: i.arm, reais: i.live, sombra: i.shadow, "R médio": signed(i.mean_r, 3) }))) : empty(t("learn.none"))));
+    const series = Object.entries(d.history || {}).slice(0, 4);
+    const colors = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)"];
+    if (series.length) {
+      const span = Math.max(...series.map(([, h]) => h[h.length - 1].ts - h[0].ts), 0);
+      grid.append(chartCard({ title: t("learn.intervals"), rows: series.flatMap(([id, h]) => h.map((p) => ({ braço: id,
+        data: dateTime(p.ts), média: p.mean, inferior: p.lo, superior: p.hi }))), csvName: "posteriors.csv",
+      n: series.length, render: (n) => lineChart(n, { series: series.flatMap(([id, h], i) => [
+        { name: `#${id}`, color: colors[i], points: h.map((p) => ({ x: p.ts, y: p.mean })) }]),
+      xFormat: (v) => axisTime(v, span), xTip: (v) => dateTime(v), yFormat: (v) => signed(v, 2) }) }));
+    } else grid.append(card(t("learn.intervals"), t("learn.intervals_sub"), empty(t("learn.none"))));
+    grid.append(card(t("learn.movers"), t("learn.movers_sub"), (d.movers || []).length ? dataTable(d.movers.map((m) => ({
+      braço: m.arm, de: m.from, para: m.to, "média antes": signed(m.mean_from, 3), "média agora": signed(m.mean_to, 3) })))
+      : empty(t("learn.none"))));
+    grid.append(card(t("learn.drift"), t("learn.drift_note"), (d.drift || []).length ? dataTable(d.drift.map((e) => ({
+      data: dateTime(e.ts), braço: e.arm_id, detalhe: e.detail }))) : empty(t("learn.no_drift"))));
+    grid.append(card(t("learn.models"), t("learn.models_sub"), (d.models || []).length ? dataTable(d.models.map((m) => ({
+      "#": m.id, data: dateTime(m.ts), ciclo: m.kind, braços: m.arms, dados: m.data, código: m.code }))) : empty(t("learn.none"))));
+    body.append(grid);
+  }, 30000);
+}
+
 // ---------------------------------------------------------------------- risk
+
+function riskPriceCard(data) {
+  const view = (data || {}).risk_view || {};
+  const list = view.scenarios || [];
+  if (!list.length) return null;
+  const cur = view.currency || "";
+  return card(t("risk.price"), t("risk.price_sub", { profile: view.profile || "", equity: num(view.equity, 2), cur }),
+    dataTable(list.map((s) => ({ cenário: s.name, "perder 10%": pct(s.p_lose_10, 1), "perder 20%": pct(s.p_lose_20, 1),
+      "perder 50%": pct(s.p_lose_50, 1), "semana mediana": `${signed(s.weekly_median, 2)} ${cur}`,
+      "pior semana": `${signed(s.weekly_worst, 2)} ${cur}` }))),
+    el("p", { class: "small muted", text: view.note || "" }));
+}
 
 export function mountRisk(root) {
   return view(root, t("tab.risk"), "Limites rígidos no código; o painel não os pode relaxar.", () => getJSON("/api/risk"), (body, d) => {
@@ -318,6 +365,8 @@ export function mountRisk(root) {
       tile(t("risk.var"), v.var_pct === null || v.var_pct === undefined ? "n/d" : `${num(v.var_pct, 2)}%`, v.label || v.note),
       tile(t("risk.worst"), w.pct === null || w.pct === undefined ? "0%" : `${num(w.pct, 2)}%`, w.note),
       tile("Drawdown", `${num(d.drawdown_pct, 2)}%`, d.halted || d.entry_block || "sem bloqueios")));
+    const price = riskPriceCard(d);
+    if (price) body.append(price);
     const grid = el("div", { class: "grid cols-2" });
     const bySym = Object.entries(d.by_symbol || {}).map(([s, x]) => ({ símbolo: s, posições: x.positions, risco_pct: x.risk_pct }));
     grid.append(chartCard({ title: t("risk.by_symbol"), sub: "risco até ao SL em % do capital", rows: bySym, csvName: "exposure_symbol.csv",

@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 
 from mt5bot import limits
-from mt5bot.capital import (CapitalState, SizingInputs, affordability, anti_martingale_cap, large_account_factor,
-                            size_risk, split_volume)
+from mt5bot.capital import CapitalState, SizingInputs, affordability, anti_martingale_cap, size_risk
 from mt5bot.config import Config
+from mt5bot.feasibility import plan_slices
 from mt5bot.profiles import effective_limits
 from mt5bot.risk import SymbolSpec, plan_trade
 
@@ -75,28 +75,24 @@ class TestAccountSizeMatrix:
         spec, stop, commission = SPECS["EURUSD"]
         a = affordability("EURUSD", "M15", stop, spec.value_per_price, spec.volume_min, commission, 50.0,
                           LIM.t1_risk_pct, LIM.explore_trade_pct)
-        assert not a.feasible and a.min_equity > 1000  # 0.01 lot at 20 pips: ~2 USD at risk
+        assert a.min_equity > 500 and a.min_lot_risk_pct > LIM.t1_risk_pct  # 0.01 lot at 20 pips: ~2 USD at risk
         tighter = affordability("EURUSD", "M5", stop / 4, spec.value_per_price, spec.volume_min, commission, 500.0,
                                 LIM.t1_risk_pct, LIM.explore_trade_pct)
         assert tighter.min_lot_risk_pct < a.min_lot_risk_pct  # shorter stops make small accounts feasible sooner
 
-    def test_large_accounts_split_orders_and_damp(self) -> None:
+    def test_large_accounts_split_orders(self) -> None:
         spec, stop, commission = SPECS["US30"]
         result = plan_for(spec, stop, commission, 1_000_000, 1.0, None)
         assert result.plan is not None and result.plan.volume > spec.volume_max
-        parts = split_volume(result.plan.volume, spec.volume_max, spec.volume_step, spec.volume_min)
+        parts, _left = plan_slices(result.plan.volume, 1e12, spec.volume_min, spec.volume_max, spec.volume_step,
+                                   limits.MAX_SPLIT_ORDERS)
         assert 1 < len(parts) <= limits.MAX_SPLIT_ORDERS and all(p <= spec.volume_max for p in parts)
         assert sum(parts) <= result.plan.volume + 1e-9
-        assert large_account_factor(1_000_000) == pytest.approx(0.85)
-        assert large_account_factor(50_000) == 1.0
-        t3_small = size_risk(SizingInputs("T3", 10_000), LIM, fresh(10_000)).risk_pct
-        t3_large = size_risk(SizingInputs("T3", 1_000_000), LIM, fresh(1_000_000)).risk_pct
-        assert t3_large < t3_small
 
     @pytest.mark.parametrize("volume,vmax,expected", [(10.0, 50.0, [10.0]), (120.0, 50.0, [50.0, 50.0, 20.0]),
                                                        (500.0, 50.0, [50.0] * 4), (0.004, 50.0, [])])
     def test_split_volume(self, volume: float, vmax: float, expected: list[float]) -> None:
-        assert split_volume(volume, vmax, 0.01, 0.01) == expected
+        assert plan_slices(volume, 1e12, 0.01, vmax, 0.01, limits.MAX_SPLIT_ORDERS)[0] == expected
 
 
 class TestCashFlows:
@@ -178,7 +174,7 @@ class TestProfitRatchet:
         assert not spent.ok and spent.blocked == "EXPLORATION_BUDGET_SPENT"
 
     def test_real_account_profile_is_stricter(self) -> None:
-        assert LIM_REAL.t1_risk_pct < LIM.t1_risk_pct and LIM_REAL.explore_day_pct < LIM.explore_day_pct
+        assert LIM_REAL.explore_day_pct < LIM.explore_day_pct and LIM_REAL.explore_week_pct < LIM.explore_week_pct
 
 
 class TestAntiMartingale:

@@ -30,9 +30,6 @@ from typing import Any, Optional, Sequence
 from . import limits
 from .profiles import EffectiveLimits
 
-LARGE_ACCOUNT_REF = 100_000.0   # account-currency units above which aggressiveness is damped
-LARGE_ACCOUNT_DAMPING = 0.15    # per decade above the reference
-
 
 @dataclass
 class CapitalState:
@@ -156,13 +153,6 @@ class SizingDecision:
         return self.blocked is None and self.risk_pct > 0
 
 
-def large_account_factor(equity: float) -> float:
-    """Lower aggressiveness as size grows: 1 below the reference, -15% per decade above it."""
-    if equity <= LARGE_ACCOUNT_REF:
-        return 1.0
-    return max(0.5, 1.0 - LARGE_ACCOUNT_DAMPING * math.log10(equity / LARGE_ACCOUNT_REF))
-
-
 def size_risk(inp: SizingInputs, lim: EffectiveLimits, capital: CapitalState) -> SizingDecision:
     """Risk percent for one entry: the MINIMUM of every constraint, all under the hard ceiling.
 
@@ -181,7 +171,7 @@ def size_risk(inp: SizingInputs, lim: EffectiveLimits, capital: CapitalState) ->
             c["exploration_budget"] = max(inp.budget_room_money, 0.0) / equity * 100.0
     elif inp.tier in ("T2", "T3"):
         base = lim.t2_risk_pct if inp.tier == "T2" else lim.t3_risk_pct
-        c["tier"] = base * factor * large_account_factor(equity)
+        c["tier"] = base * factor
         if inp.kelly_fraction_full is not None:
             c["kelly"] = max(inp.kelly_fraction_full, 0.0) * lim.kelly_fraction * 100.0
     elif inp.tier == "EXT":
@@ -269,24 +259,12 @@ def affordability(symbol: str, timeframe: str, stop_distance: float, value_per_p
                          min_equity, "MIN_LOT_EXCEEDS_RISK")
 
 
-def split_volume(volume: float, volume_max: float, volume_step: float, volume_min: float,
-                 max_parts: int = limits.MAX_SPLIT_ORDERS) -> list[float]:
-    """Split ``volume`` into at most ``max_parts`` orders of at most ``volume_max`` each.
-
-    The total never exceeds ``volume`` (anything that cannot be placed is dropped, never
-    rounded up). Returns [] when not even one valid order fits."""
-    if volume <= 0 or volume_max <= 0:
-        return []
-    cap = floor_volume(volume_max, volume_step)
-    parts: list[float] = []
-    remaining = Decimal(str(volume))
-    while remaining > 0 and len(parts) < max(1, max_parts):
-        part = floor_volume(min(float(remaining), cap), volume_step)
-        if part < volume_min - 1e-12:
-            break
-        parts.append(part)
-        remaining -= Decimal(str(part))
-    return parts
+def _last_loss(arm_trades: Sequence[Any]) -> Optional[Any]:
+    closed = [r for r in arm_trades if getattr(r, "status", None) == "closed" and getattr(r, "pnl", None) is not None]
+    if not closed:
+        return None
+    last = max(closed, key=lambda r: float(r.close_ts or 0.0))
+    return last if float(last.pnl) < 0 else None
 
 
 def anti_martingale_cap(arm_trades: Sequence[Any]) -> Optional[float]:
@@ -294,11 +272,17 @@ def anti_martingale_cap(arm_trades: Sequence[Any]) -> Optional[float]:
 
     After a loss the next trade of the same arm may risk at most what the losing trade risked;
     the cap lifts after a winning trade. Rows need ``status``, ``pnl`` and ``extra['risk_pct']``."""
-    closed = [r for r in arm_trades if getattr(r, "status", None) == "closed" and getattr(r, "pnl", None) is not None]
-    if not closed:
-        return None
-    last = max(closed, key=lambda r: float(r.close_ts or 0.0))
-    if float(last.pnl) >= 0:
-        return None
-    risk_pct = (getattr(last, "extra", None) or {}).get("risk_pct")
+    last = _last_loss(arm_trades)
+    risk_pct = (getattr(last, "extra", None) or {}).get("risk_pct") if last is not None else None
     return float(risk_pct) if risk_pct is not None else None
+
+
+def anti_martingale_money(arm_trades: Sequence[Any]) -> Optional[float]:
+    """The same rule in money, for a trade at the minimum lot.
+
+    A percent cap cannot work there: after a loss the equity is smaller, so the SAME size is a
+    larger percentage and the arm would be blocked for ever. Size has not grown, so what must
+    not grow is the money at risk."""
+    last = _last_loss(arm_trades)
+    money = getattr(last, "risk_money", None) if last is not None else None
+    return float(money) if money is not None and float(money) > 0 else None

@@ -27,11 +27,26 @@ MAX_TP_ATR_MULT = 10.0
 MAX_POSITIONS_PER_SYMBOL = 1
 MAX_SPLIT_ORDERS = 4
 
+# Notional cap for a trade at exactly the broker's minimum lot, as a multiple of equity. Above the
+# minimum lot MAX_SYMBOL_EXPOSURE_X applies. Without this separate cap no account below roughly
+# 12 times the minimum lot's notional could trade at all (ADR-019). It is a ratio derived from
+# broker specifications, not a balance; the margin guard and the risk ceilings still apply.
+MAX_MIN_LOT_EXPOSURE_X = 30.0
+
 # ---- v3.1: evidence-scaled risk. Exploration (tier T1) is the explicit price of
-# information; its loss budget can never exceed these ceilings, whatever the config says.
+# information; its percent budget can never exceed these ceilings, whatever the config says.
+# v4.2: the budget is also measured in trades (tiers.exploration_room), and that part is
+# bounded by the daily loss limit and the weekly soft limit of the profile.
 MAX_EXPLORATION_DAY_PCT = 0.5
 MAX_EXPLORATION_WEEK_PCT = 1.5
-MAX_EXPLORATION_TRADE_PCT = 0.25
+MAX_EXPLORATION_TRADE_PCT = 0.5
+MAX_WEEKLY_SOFT_LOSS_PCT = 10.0
+MAX_EXPLORATION_TRADES_PER_DAY = 20
+MAX_EXPLORATION_TRADES_PER_WEEK = 60
+# Fixed floors of the entry gates: the Flow Doctor may lower the gates down to these, never below.
+ENTRY_MIN_P_FLOOR = 0.52
+ENTRY_MIN_COST_TO_EDGE_FLOOR = 1.0
+ENTRY_MIN_OOS_TRADES_FLOOR = 20
 # The profit ratchet locks at least nothing and at most 90 percent of new highs.
 MAX_LOCK_FRACTION = 0.9
 MAX_HOUSE_MONEY = 1.5

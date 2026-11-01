@@ -148,12 +148,21 @@ def test_gate_passes_a_strong_arm(make_bot) -> None:
     assert out.risk_allowed and out.reason == "ok"
 
 
-def test_exploration_exemption_is_demo_only_by_default(make_bot) -> None:
+def test_exploration_is_exempt_on_both_account_types_by_default(make_bot) -> None:
+    """v4.2: the prior threshold and the trade budget bound exploration, not the cost ratio (ADR-022)."""
     bot = make_bot()
     bot.startup()
     acc = SimpleNamespace(equity=10_000.0, leverage=100, margin=0.0)
     assert bot._try_open("EURUSD", intent("T1", -0.1, True), acc, preview=True).code != "COST_TO_EDGE"
     bot.is_real = True
+    assert bot._try_open("EURUSD", intent("T1", -0.1, True), acc, preview=True).code != "COST_TO_EDGE"
+
+
+def test_the_exemption_can_be_switched_off_for_a_real_account(make_bot) -> None:
+    bot = make_bot(costs={"exploration_exempt_real": False})
+    bot.startup()
+    bot.is_real = True
+    acc = SimpleNamespace(equity=10_000.0, leverage=100, margin=0.0)
     assert bot._try_open("EURUSD", intent("T1", -0.1, True), acc, preview=True).code == "COST_TO_EDGE"
 
 

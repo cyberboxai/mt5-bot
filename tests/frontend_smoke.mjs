@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 const [url, outDir, chromeBin = "google-chrome"] = process.argv.slice(2);
 mkdirSync(outDir, { recursive: true });
-const TABS = ["office", "why", "truth", "timemachine", "overview", "performance", "trades", "team", "strategies", "risk", "markets", "advisor", "health",
+const TABS = ["office", "why", "learning", "truth", "timemachine", "overview", "performance", "trades", "team", "strategies", "risk", "markets", "advisor", "health",
   "decisions"];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const step = (text) => process.stderr.write(`[smoke] ${text}\n`);
